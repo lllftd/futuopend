@@ -1,0 +1,5 @@
+futu-api
+pandas
+numpy
+matplotlib
+tqdm
