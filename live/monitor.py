@@ -27,7 +27,9 @@ import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import matplotlib
 import numpy as np
@@ -48,12 +50,14 @@ from core.optimize_ce_zlsma_kama_rule import (
 )
 
 try:
-    from futu import KLType, OpenQuoteContext, RET_OK, SubType
+    from futu import CurKlineHandlerBase, KLType, OpenQuoteContext, RET_OK, SubType, TickerHandlerBase
 except ImportError:
+    CurKlineHandlerBase = None
     OpenQuoteContext = None
     KLType = None
     RET_OK = None
     SubType = None
+    TickerHandlerBase = None
 
 # Keep runtime output concise for long-running monitor.
 warnings.filterwarnings(
@@ -88,6 +92,7 @@ PERFORMANCE_REVIEW_EVERY_N_TRADES = 20
 MONITOR_SYMBOLS = ("SPY", "QQQ")
 FUTU_SYMBOLS = {symbol: f"US.{symbol}" for symbol in MONITOR_SYMBOLS}
 DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/9680c1bd-2a17-43e7-bde7-ff2bb74dcd74"
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 def _date_tag(d: date) -> str:
@@ -96,6 +101,15 @@ def _date_tag(d: date) -> str:
 
 def _day_folder_name(d: date) -> str:
     return d.strftime("%Y-%m-%d")
+
+
+def _now_et() -> datetime:
+    return datetime.now(US_EASTERN)
+
+
+def _is_after_market_close_et(now_et: datetime) -> bool:
+    # US market regular close + small buffer at 16:05 ET.
+    return now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 5)
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +503,35 @@ class SymbolMonitor:
         if is_session_end and self.position is not None:
             self._force_close(bar, bar_time, "end_of_day", snapshot, bar_event)
 
+        self._log_minute_status(bar_time, snapshot)
         self._append_minute_signal_row(bar, bar_time, snapshot, bar_event)
+
+    def _log_minute_status(self, bar_time: pd.Timestamp, snapshot: dict[str, object]) -> None:
+        if not snapshot:
+            return
+
+        close_px = float(snapshot.get("close", np.nan))
+        l_en = int(bool(snapshot.get("long_entry_signal", False)))
+        s_en = int(bool(snapshot.get("short_entry_signal", False)))
+        l_ex = int(bool(snapshot.get("long_exit_cond", False)))
+        s_ex = int(bool(snapshot.get("short_exit_cond", False)))
+
+        if self.position is None:
+            pos_str = "flat"
+        else:
+            side = "long" if self.position.direction == 1 else "short"
+            pos_str = (
+                f"{side}@{self.position.entry_price:.2f} "
+                f"tp={self.position.take_profit:.2f} "
+                f"sl={self.position.stop_price:.2f} "
+                f"ts={pd.Timestamp(self.position.time_stop_deadline).strftime('%H:%M')}"
+            )
+
+        _log_info(
+            f"[BAR] {self.symbol} {pd.Timestamp(bar_time).strftime('%Y-%m-%d %H:%M')} "
+            f"close={close_px:.2f} | sig(en L/S={l_en}/{s_en}, ex L/S={l_ex}/{s_ex}) | "
+            f"pos={pos_str}"
+        )
 
     def _build_signal_snapshot(self, bar_time: pd.Timestamp) -> dict[str, object]:
         if self.featured.empty:
@@ -1182,7 +1224,7 @@ def fetch_latest_tickers(
 # Main monitor loop
 # ---------------------------------------------------------------------------
 
-def run_live(host: str, port: int, feishu_webhook: str) -> int:
+def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> int:
     if OpenQuoteContext is None:
         _log_error("futu-api not installed. Run: pip install futu-api")
         return 1
@@ -1191,9 +1233,38 @@ def run_live(host: str, port: int, feishu_webhook: str) -> int:
     ctx = OpenQuoteContext(host=host, port=port)
 
     monitors: dict[str, SymbolMonitor] = {}
+    code_to_symbol = {v: k for k, v in FUTU_SYMBOLS.items()}
     ticker_enabled = False
-    run_date = datetime.now().date()
+    run_date = _now_et().date()
     notifier = FeishuNotifier(feishu_webhook)
+    poll_seconds = max(1, int(poll_seconds))
+    event_queue: Queue[tuple[str, pd.DataFrame]] = Queue()
+    use_push_stream = False
+
+    def _extract_bars_from_push(df: pd.DataFrame, futu_code: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        sub = df.copy()
+        if "code" in sub.columns:
+            sub = sub.loc[sub["code"] == futu_code].copy()
+        if sub.empty:
+            return pd.DataFrame()
+        required = ["time_key", "open", "high", "low", "close", "volume"]
+        if any(c not in sub.columns for c in required):
+            return pd.DataFrame()
+        sub["time_key"] = pd.to_datetime(sub["time_key"], errors="coerce")
+        sub = sub.dropna(subset=["time_key"]).sort_values("time_key")
+        return sub[required].copy()
+
+    def _extract_tickers_from_push(df: pd.DataFrame, futu_code: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        sub = df.copy()
+        if "code" in sub.columns:
+            sub = sub.loc[sub["code"] == futu_code].copy()
+        if sub.empty:
+            return pd.DataFrame()
+        return sub.reset_index(drop=True)
 
     try:
         futu_codes = list(FUTU_SYMBOLS.values())
@@ -1205,6 +1276,25 @@ def run_live(host: str, port: int, feishu_webhook: str) -> int:
         ticker_enabled = ret_t == RET_OK
         if not ticker_enabled:
             _log_warn("Ticker subscription unavailable; cvd_real will be empty/flat.")
+        if CurKlineHandlerBase is not None and hasattr(ctx, "set_handler"):
+            class _KlinePushHandler(CurKlineHandlerBase):
+                def on_recv_rsp(self, rsp_pb):
+                    ret_h, data_h = super().on_recv_rsp(rsp_pb)
+                    if ret_h == RET_OK and data_h is not None and not data_h.empty:
+                        event_queue.put(("kline", data_h.copy()))
+                    return ret_h, data_h
+
+            ctx.set_handler(_KlinePushHandler())
+            if ticker_enabled and TickerHandlerBase is not None:
+                class _TickerPushHandler(TickerHandlerBase):
+                    def on_recv_rsp(self, rsp_pb):
+                        ret_h, data_h = super().on_recv_rsp(rsp_pb)
+                        if ret_h == RET_OK and data_h is not None and not data_h.empty:
+                            event_queue.put(("ticker", data_h.copy()))
+                        return ret_h, data_h
+
+                ctx.set_handler(_TickerPushHandler())
+            use_push_stream = True
 
         for symbol, futu_code in FUTU_SYMBOLS.items():
             params = V3_BEST_PARAMS[symbol]
@@ -1222,36 +1312,95 @@ def run_live(host: str, port: int, feishu_webhook: str) -> int:
             monitors[symbol] = mon
 
         _log_info(
-            f"Ready | symbols={','.join(futu_codes)} | poll={POLL_INTERVAL_SECONDS}s | "
+            f"Ready | symbols={','.join(futu_codes)} | poll={poll_seconds}s | "
             f"session=before_1230 | ticker={'on' if ticker_enabled else 'off'}"
         )
+        _log_info(f"Data mode: {'push-stream' if use_push_stream else 'polling-fallback'}")
         _log_info(f"Feishu webhook: {'on' if notifier.enabled else 'off'}")
         _log_info(f"Output: {MONITOR_DIR.as_posix()}/daily/YYYY-MM-DD/(spy|qqq)_*.{{csv,png}}")
 
         while True:
-            for symbol, futu_code in FUTU_SYMBOLS.items():
-                new_bars = fetch_latest_bars(ctx, futu_code, count=5)
-                ticker_df = fetch_latest_tickers(ctx, futu_code, count=1000) if ticker_enabled else pd.DataFrame()
-                if not new_bars.empty:
-                    mon = monitors[symbol]
-                    if mon.last_processed_time is not None:
-                        new_bars = new_bars[new_bars["time_key"] > mon.last_processed_time]
-                    if not new_bars.empty:
-                        mon.process_new_bars(new_bars, ticker_df=ticker_df)
+            pushed_kline_by_symbol: dict[str, pd.DataFrame] = {}
+            pushed_ticker_by_symbol: dict[str, pd.DataFrame] = {}
 
-            now = datetime.now()
-            if now.hour >= 16 and now.minute >= 5:
+            if use_push_stream:
+                try:
+                    ev_name, ev_data = event_queue.get(timeout=poll_seconds)
+                    if isinstance(ev_data, pd.DataFrame):
+                        if ev_name == "kline":
+                            for code, chunk in ev_data.groupby("code") if "code" in ev_data.columns else []:
+                                sym = code_to_symbol.get(str(code))
+                                if sym is not None:
+                                    pushed_kline_by_symbol[sym] = pd.concat(
+                                        [pushed_kline_by_symbol.get(sym, pd.DataFrame()), chunk],
+                                        ignore_index=True,
+                                    )
+                        elif ev_name == "ticker":
+                            for code, chunk in ev_data.groupby("code") if "code" in ev_data.columns else []:
+                                sym = code_to_symbol.get(str(code))
+                                if sym is not None:
+                                    pushed_ticker_by_symbol[sym] = pd.concat(
+                                        [pushed_ticker_by_symbol.get(sym, pd.DataFrame()), chunk],
+                                        ignore_index=True,
+                                    )
+                except Empty:
+                    pass
+
+                while True:
+                    try:
+                        ev_name, ev_data = event_queue.get_nowait()
+                    except Empty:
+                        break
+                    if not isinstance(ev_data, pd.DataFrame) or ev_data.empty:
+                        continue
+                    if ev_name == "kline" and "code" in ev_data.columns:
+                        for code, chunk in ev_data.groupby("code"):
+                            sym = code_to_symbol.get(str(code))
+                            if sym is not None:
+                                pushed_kline_by_symbol[sym] = pd.concat(
+                                    [pushed_kline_by_symbol.get(sym, pd.DataFrame()), chunk],
+                                    ignore_index=True,
+                                )
+                    elif ev_name == "ticker" and "code" in ev_data.columns:
+                        for code, chunk in ev_data.groupby("code"):
+                            sym = code_to_symbol.get(str(code))
+                            if sym is not None:
+                                pushed_ticker_by_symbol[sym] = pd.concat(
+                                    [pushed_ticker_by_symbol.get(sym, pd.DataFrame()), chunk],
+                                    ignore_index=True,
+                                )
+
+            for symbol, futu_code in FUTU_SYMBOLS.items():
+                if use_push_stream:
+                    new_bars = _extract_bars_from_push(pushed_kline_by_symbol.get(symbol, pd.DataFrame()), futu_code)
+                    ticker_df = _extract_tickers_from_push(
+                        pushed_ticker_by_symbol.get(symbol, pd.DataFrame()), futu_code
+                    ) if ticker_enabled else pd.DataFrame()
+                else:
+                    new_bars = fetch_latest_bars(ctx, futu_code, count=5)
+                    ticker_df = fetch_latest_tickers(ctx, futu_code, count=1000) if ticker_enabled else pd.DataFrame()
+                if new_bars.empty:
+                    continue
+                mon = monitors[symbol]
+                if mon.last_processed_time is not None:
+                    new_bars = new_bars[new_bars["time_key"] > mon.last_processed_time]
+                if not new_bars.empty:
+                    mon.process_new_bars(new_bars, ticker_df=ticker_df)
+
+            now_et = _now_et()
+            if _is_after_market_close_et(now_et):
                 _log_info("\nMarket closed — printing daily summaries")
                 for mon in monitors.values():
-                    mon.end_of_day_summary(trading_day=now.date())
+                    mon.end_of_day_summary(trading_day=now_et.date())
                 _log_info("Waiting for next session...\n")
                 time_mod.sleep(3600)
             else:
-                time_mod.sleep(POLL_INTERVAL_SECONDS)
+                if not use_push_stream:
+                    time_mod.sleep(poll_seconds)
 
     except KeyboardInterrupt:
         _log_info("\nShutting down...")
-        today = datetime.now().date()
+        today = _now_et().date()
         for mon in monitors.values():
             mon.end_of_day_summary(trading_day=today)
     finally:
@@ -1315,6 +1464,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_FEISHU_WEBHOOK,
         help="Feishu bot webhook URL for ENTRY/EXIT notifications",
     )
+    parser.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=1,
+        help="Polling interval in seconds for fetching latest 1-min bars (default: 1)",
+    )
     return parser.parse_args()
 
 
@@ -1328,6 +1483,7 @@ def main() -> int:
         host=args.host,
         port=args.port,
         feishu_webhook=args.feishu_webhook,
+        poll_seconds=args.poll_seconds,
     )
 
 
