@@ -93,6 +93,7 @@ MONITOR_SYMBOLS = ("SPY", "QQQ")
 FUTU_SYMBOLS = {symbol: f"US.{symbol}" for symbol in MONITOR_SYMBOLS}
 DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/9680c1bd-2a17-43e7-bde7-ff2bb74dcd74"
 US_EASTERN = ZoneInfo("America/New_York")
+CE_SIGNAL_VALID_BARS = 5
 
 
 def _date_tag(d: date) -> str:
@@ -110,6 +111,26 @@ def _now_et() -> datetime:
 def _is_after_market_close_et(now_et: datetime) -> bool:
     # US market regular close + small buffer at 16:05 ET.
     return now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 5)
+
+
+def _expand_signal_same_day(sig: pd.Series, times: pd.Series, keep_bars: int) -> pd.Series:
+    s = sig.fillna(False).astype(bool)
+    if keep_bars <= 0:
+        return s
+
+    out = pd.Series(False, index=s.index)
+    by_day = times.dt.date
+    for day in by_day.unique():
+        idx = s.index[by_day == day]
+        arr = s.loc[idx].to_numpy(dtype=bool)
+        n = len(arr)
+        ext = np.zeros(n, dtype=bool)
+        true_pos = np.where(arr)[0]
+        for pos in true_pos:
+            end = min(n, pos + keep_bars + 1)
+            ext[pos:end] = True
+        out.loc[idx] = ext
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +432,17 @@ class SymbolMonitor:
             cvd_slope_lookback=self.params.cvd_slope_lookback,
         )
         self.featured = apply_ce_features(base, self.params.ce_length, self.params.ce_multiplier)
+        # Keep CE trigger valid for a short window to reduce missed entries.
+        self.featured["ce_buy_signal"] = _expand_signal_same_day(
+            self.featured["ce_buy_signal"],
+            self.featured["time_key"],
+            CE_SIGNAL_VALID_BARS,
+        )
+        self.featured["ce_sell_signal"] = _expand_signal_same_day(
+            self.featured["ce_sell_signal"],
+            self.featured["time_key"],
+            CE_SIGNAL_VALID_BARS,
+        )
 
     def ingest_ticker(self, ticker_df: pd.DataFrame) -> None:
         if ticker_df is None or ticker_df.empty:
@@ -1315,6 +1347,7 @@ def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> in
             f"Ready | symbols={','.join(futu_codes)} | poll={poll_seconds}s | "
             f"session=before_1230 | ticker={'on' if ticker_enabled else 'off'}"
         )
+        _log_info(f"CE validity window: {CE_SIGNAL_VALID_BARS} bars (~{CE_SIGNAL_VALID_BARS} min)")
         _log_info(f"Data mode: {'push-stream' if use_push_stream else 'polling-fallback'}")
         _log_info(f"Feishu webhook: {'on' if notifier.enabled else 'off'}")
         _log_info(f"Output: {MONITOR_DIR.as_posix()}/daily/YYYY-MM-DD/(spy|qqq)_*.{{csv,png}}")
