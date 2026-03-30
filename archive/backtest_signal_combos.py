@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from indicators import add_chandelier_exit, kama, zlsma
+from core.indicators import add_chandelier_exit, kama, zlsma
 from smc import add_smc_signals
 
 

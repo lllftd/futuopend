@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from backtest_signal_combos import MINUTES_PER_YEAR, calculate_max_drawdown, load_price_data
-from indicators import add_chandelier_exit, kama, zlsma
+from core.indicators import add_chandelier_exit, kama, zlsma
 
 
 RESULTS_DIR = Path("results")

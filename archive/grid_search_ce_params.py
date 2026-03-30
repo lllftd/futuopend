@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from itertools import product
 from pathlib import Path
 
@@ -12,7 +18,7 @@ matplotlib.use("Agg")
 import pandas as pd
 from tqdm import tqdm
 
-from optimize_ce_zlsma_kama_rule import (
+from core.optimize_ce_zlsma_kama_rule import (
     CE_LENGTHS,
     CE_MULTIPLIERS,
     RESULTS_DIR,
@@ -22,7 +28,7 @@ from optimize_ce_zlsma_kama_rule import (
     load_price_data,
     run_intraday_rule,
 )
-from refine_ce_zlsma_kama_rule import _refine_base_params
+from research.refine_ce_zlsma_kama_rule import _refine_base_params
 
 OUTPUT_DIR = RESULTS_DIR / "ce_param_grid"
 
