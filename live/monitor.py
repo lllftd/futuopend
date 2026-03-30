@@ -19,7 +19,10 @@ if __package__ is None or __package__ == "":
 
 import argparse
 import csv
+import json
 import time as time_mod
+import urllib.error
+import urllib.request
 import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -84,6 +87,7 @@ MAX_BARS_KEPT = 5000
 PERFORMANCE_REVIEW_EVERY_N_TRADES = 20
 MONITOR_SYMBOLS = ("SPY", "QQQ")
 FUTU_SYMBOLS = {symbol: f"US.{symbol}" for symbol in MONITOR_SYMBOLS}
+DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/9680c1bd-2a17-43e7-bde7-ff2bb74dcd74"
 
 
 def _date_tag(d: date) -> str:
@@ -222,6 +226,41 @@ class PerformanceTracker:
         return pd.DataFrame(rows)
 
 
+class FeishuNotifier:
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url.strip()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.webhook_url)
+
+    def send_text(self, text: str) -> None:
+        if not self.enabled:
+            return
+        payload = {
+            "msg_type": "text",
+            "content": {"text": text},
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=self.webhook_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                try:
+                    parsed = json.loads(body)
+                    if int(parsed.get("code", -1)) != 0:
+                        _log_warn(f"Feishu webhook returned code={parsed.get('code')} msg={parsed.get('msg')}")
+                except json.JSONDecodeError:
+                    _log_warn("Feishu webhook returned non-JSON response.")
+        except urllib.error.URLError as exc:
+            _log_warn(f"Feishu webhook send failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Symbol monitor — per-symbol state
 # ---------------------------------------------------------------------------
@@ -233,6 +272,7 @@ class SymbolMonitor:
         params: RuleParams,
         benchmark: dict[str, float],
         run_date: date,
+        notifier: Optional[FeishuNotifier] = None,
     ):
         self.symbol = symbol
         self.params = params
@@ -242,6 +282,7 @@ class SymbolMonitor:
         self.position: Optional[PositionState] = None
         self.last_processed_time: Optional[pd.Timestamp] = None
         self.run_date = run_date
+        self.notifier = notifier
         self.daily_output_dir = MONITOR_DIR / "daily" / _day_folder_name(run_date)
         self.daily_output_dir.mkdir(parents=True, exist_ok=True)
         self.minute_signal_path = self.daily_output_dir / f"{symbol.lower()}_minute_signals.csv"
@@ -656,6 +697,14 @@ class SymbolMonitor:
             f"TP {take_profit:.2f} | SL {stop_price:.2f} | "
             f"TimeStop {deadline.strftime('%H:%M')}"
         )
+        if self.notifier is not None and self.notifier.enabled:
+            self.notifier.send_text(
+                f"[ENTRY] {self.symbol} {side} | price={entry_price:.2f} | "
+                f"tp={take_profit:.2f} sl={stop_price:.2f} | "
+                f"time_stop={deadline.strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"signal(L/S)={int(bool(snapshot.get('long_entry_signal', False)))}/"
+                f"{int(bool(snapshot.get('short_entry_signal', False)))}"
+            )
 
     def _check_exit(
         self,
@@ -770,6 +819,14 @@ class SymbolMonitor:
             f"{pnl_color}{trade_return:+.3%}{_C.RESET} | "
             f"{held_minutes:.0f}min | {reason}"
         )
+        if self.notifier is not None and self.notifier.enabled:
+            self.notifier.send_text(
+                f"[EXIT] {self.symbol} {side_str.upper()} | entry={pos.entry_price:.2f} "
+                f"exit={exit_price:.2f} | ret={trade_return:+.3%} | "
+                f"hold={held_minutes:.0f}m | reason={reason} | "
+                f"signal(exit L/S)={int(bool(snapshot.get('long_exit_cond', False)))}/"
+                f"{int(bool(snapshot.get('short_exit_cond', False)))}"
+            )
 
         if self.tracker is not None and len(self.tracker.trades) % PERFORMANCE_REVIEW_EVERY_N_TRADES == 0:
             self._print_performance_review()
@@ -1125,7 +1182,7 @@ def fetch_latest_tickers(
 # Main monitor loop
 # ---------------------------------------------------------------------------
 
-def run_live(host: str, port: int) -> int:
+def run_live(host: str, port: int, feishu_webhook: str) -> int:
     if OpenQuoteContext is None:
         _log_error("futu-api not installed. Run: pip install futu-api")
         return 1
@@ -1136,6 +1193,7 @@ def run_live(host: str, port: int) -> int:
     monitors: dict[str, SymbolMonitor] = {}
     ticker_enabled = False
     run_date = datetime.now().date()
+    notifier = FeishuNotifier(feishu_webhook)
 
     try:
         futu_codes = list(FUTU_SYMBOLS.values())
@@ -1156,6 +1214,7 @@ def run_live(host: str, port: int) -> int:
                 params,
                 benchmark,
                 run_date=run_date,
+                notifier=notifier,
             )
 
             history = fetch_recent_history(ctx, futu_code, days=WARMUP_DAYS)
@@ -1166,6 +1225,7 @@ def run_live(host: str, port: int) -> int:
             f"Ready | symbols={','.join(futu_codes)} | poll={POLL_INTERVAL_SECONDS}s | "
             f"session=before_1230 | ticker={'on' if ticker_enabled else 'off'}"
         )
+        _log_info(f"Feishu webhook: {'on' if notifier.enabled else 'off'}")
         _log_info(f"Output: {MONITOR_DIR.as_posix()}/daily/YYYY-MM-DD/(spy|qqq)_*.{{csv,png}}")
 
         while True:
@@ -1250,6 +1310,11 @@ def parse_args() -> argparse.Namespace:
         "--port", type=int, default=11111,
         help="Futu OpenD port (default: 11111)",
     )
+    parser.add_argument(
+        "--feishu-webhook",
+        default=DEFAULT_FEISHU_WEBHOOK,
+        help="Feishu bot webhook URL for ENTRY/EXIT notifications",
+    )
     return parser.parse_args()
 
 
@@ -1262,6 +1327,7 @@ def main() -> int:
     return run_live(
         host=args.host,
         port=args.port,
+        feishu_webhook=args.feishu_webhook,
     )
 
 
