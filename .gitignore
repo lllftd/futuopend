@@ -10,8 +10,5 @@ env/
 # Local outputs and runtime artifacts
 results/
 
-# Minute OHLC dumps (use data_tools/download_futu_us_1m.py)
-data/*.csv
-
 # IDE/runtime local folders
 .cursor/
