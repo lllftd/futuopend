@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 from core.config import V3_BENCHMARKS, V3_BEST_PARAMS
+from core.v3_data_utils import expand_signal_same_day
 from core.optimize_ce_zlsma_kama_rule import (
     RuleParams,
     apply_ce_features,
@@ -111,26 +112,6 @@ def _now_et() -> datetime:
 def _is_after_market_close_et(now_et: datetime) -> bool:
     # US market regular close + small buffer at 16:05 ET.
     return now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 5)
-
-
-def _expand_signal_same_day(sig: pd.Series, times: pd.Series, keep_bars: int) -> pd.Series:
-    s = sig.fillna(False).astype(bool)
-    if keep_bars <= 0:
-        return s
-
-    out = pd.Series(False, index=s.index)
-    by_day = times.dt.date
-    for day in by_day.unique():
-        idx = s.index[by_day == day]
-        arr = s.loc[idx].to_numpy(dtype=bool)
-        n = len(arr)
-        ext = np.zeros(n, dtype=bool)
-        true_pos = np.where(arr)[0]
-        for pos in true_pos:
-            end = min(n, pos + keep_bars + 1)
-            ext[pos:end] = True
-        out.loc[idx] = ext
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +414,12 @@ class SymbolMonitor:
         )
         self.featured = apply_ce_features(base, self.params.ce_length, self.params.ce_multiplier)
         # Keep CE trigger valid for a short window to reduce missed entries.
-        self.featured["ce_buy_signal"] = _expand_signal_same_day(
+        self.featured["ce_buy_signal"] = expand_signal_same_day(
             self.featured["ce_buy_signal"],
             self.featured["time_key"],
             CE_SIGNAL_VALID_BARS,
         )
-        self.featured["ce_sell_signal"] = _expand_signal_same_day(
+        self.featured["ce_sell_signal"] = expand_signal_same_day(
             self.featured["ce_sell_signal"],
             self.featured["time_key"],
             CE_SIGNAL_VALID_BARS,

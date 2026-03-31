@@ -44,6 +44,7 @@ class DownloadConfig:
     max_count: int
     autype: object
     extended_time: bool
+    merge: bool
 
 
 def parse_args() -> DownloadConfig:
@@ -103,6 +104,11 @@ def parse_args() -> DownloadConfig:
         action="store_true",
         help="Include pre-market and after-hours bars for US symbols.",
     )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Append/merge into existing data/{TICKER}.csv (dedupe by time_key, keep last).",
+    )
 
     args = parser.parse_args()
     end_date = parse_date(args.end) if args.end else date.today()
@@ -122,6 +128,7 @@ def parse_args() -> DownloadConfig:
         max_count=args.max_count,
         autype=getattr(AuType, args.autype),
         extended_time=args.extended_time,
+        merge=bool(args.merge),
     )
 
 
@@ -209,12 +216,24 @@ def preferred_column_order(columns: Iterable[str]) -> list[str]:
     return ordered
 
 
-def write_symbol_csv(frame, output_dir: Path, symbol: str) -> Path:
+def write_symbol_csv(frame, output_dir: Path, symbol: str, merge: bool = False) -> tuple[Path, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     ticker = symbol.split(".", 1)[1]
     output_path = output_dir / f"{ticker}.csv"
+
+    if merge and output_path.exists():
+        old = pd.read_csv(output_path)
+        frame = pd.concat([old, frame], ignore_index=True)
+
+    if "time_key" in frame.columns:
+        frame["time_key"] = frame["time_key"].astype(str)
+    frame = frame.sort_values("time_key", kind="mergesort").drop_duplicates(subset=["time_key"], keep="last")
+    frame = frame.reset_index(drop=True)
+
+    ordered = preferred_column_order(frame.columns)
+    frame = frame[[c for c in ordered if c in frame.columns]]
     frame.to_csv(output_path, index=False, encoding="utf-8")
-    return output_path
+    return output_path, len(frame)
 
 
 def main() -> int:
@@ -229,7 +248,7 @@ def main() -> int:
     config = parse_args()
     print(
         f"Connecting to OpenD at {config.host}:{config.port} | "
-        f"range={config.start}..{config.end} | extended_time={config.extended_time}"
+        f"range={config.start}..{config.end} | extended_time={config.extended_time} | merge={config.merge}"
     )
 
     ctx = OpenQuoteContext(host=config.host, port=config.port)
@@ -237,8 +256,9 @@ def main() -> int:
         for symbol in config.symbols:
             print(f"Starting download for {symbol}")
             frame = fetch_symbol_bars(ctx, config, symbol)
-            output_path = write_symbol_csv(frame, config.output_dir, symbol)
-            print(f"[{symbol}] wrote {len(frame)} rows to {output_path}")
+            output_path, nrows = write_symbol_csv(frame, config.output_dir, symbol, merge=config.merge)
+            action = "merged into" if config.merge else "wrote"
+            print(f"[{symbol}] {action} {nrows} total rows -> {output_path}")
     except Exception as exc:
         print(f"Download failed: {exc}", file=sys.stderr)
         return 1

@@ -30,7 +30,7 @@ import pandas as pd
 
 from core.config import V3_BEST_PARAMS
 from core.optimize_ce_zlsma_kama_rule import run_intraday_rule
-from core.v3_data_utils import prepare_featured
+from core.v3_data_utils import expand_signal_same_day, prepare_featured
 
 
 OUT_DIR = Path("results") / "ce_validity_backtest"
@@ -65,36 +65,12 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _expand_signal_same_day(sig: pd.Series, times: pd.Series, keep_bars: int) -> pd.Series:
-    """
-    Keep a CE signal valid for keep_bars after trigger, within the same day.
-    keep_bars=0 returns original signal.
-    """
-    s = sig.fillna(False).astype(bool)
-    if keep_bars <= 0:
-        return s
-
-    out = pd.Series(False, index=s.index)
-    by_day = times.dt.date
-    for day in by_day.unique():
-        idx = s.index[by_day == day]
-        arr = s.loc[idx].to_numpy(dtype=bool)
-        n = len(arr)
-        ext = np.zeros(n, dtype=bool)
-        true_pos = np.where(arr)[0]
-        for pos in true_pos:
-            end = min(n, pos + keep_bars + 1)
-            ext[pos:end] = True
-        out.loc[idx] = ext
-    return out
-
-
 def _apply_ce_validity_window(featured: pd.DataFrame, keep_bars: int) -> pd.DataFrame:
     df = featured.copy()
     if keep_bars <= 0:
         return df
-    df["ce_buy_signal"] = _expand_signal_same_day(df["ce_buy_signal"], df["time_key"], keep_bars)
-    df["ce_sell_signal"] = _expand_signal_same_day(df["ce_sell_signal"], df["time_key"], keep_bars)
+    df["ce_buy_signal"] = expand_signal_same_day(df["ce_buy_signal"], df["time_key"], keep_bars)
+    df["ce_sell_signal"] = expand_signal_same_day(df["ce_sell_signal"], df["time_key"], keep_bars)
     return df
 
 
