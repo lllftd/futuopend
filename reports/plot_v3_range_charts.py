@@ -93,7 +93,7 @@ def plot_one(
     ax_p.set_ylabel(f"{symbol.upper()} price", color="#0f172a")
     ax_p.tick_params(axis="y", labelcolor="#0f172a")
     ax_p.grid(True, alpha=0.25)
-    ax_p.set_title(f"{symbol.upper()} — minute OHLC + V3 cumulative return  ({start} ~ {end})")
+    ax_p.set_title(f"{symbol.upper()} — minute OHLC + V3.5 cumulative return  ({start} ~ {end})")
 
     ax_r = ax_p.twinx()
     ax_r.plot(mdates.date2num(pd.to_datetime(eq.index)), cum_pct.to_numpy(dtype=float), color="#16a34a", linewidth=0.85, label="Cum. return %")

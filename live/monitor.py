@@ -40,7 +40,6 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 from core.config import V3_BENCHMARKS, V3_BEST_PARAMS
-from core.v3_data_utils import expand_signal_same_day
 from core.optimize_ce_zlsma_kama_rule import (
     RuleParams,
     apply_ce_features,
@@ -94,6 +93,7 @@ MONITOR_SYMBOLS = ("SPY", "QQQ")
 FUTU_SYMBOLS = {symbol: f"US.{symbol}" for symbol in MONITOR_SYMBOLS}
 DEFAULT_FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/9680c1bd-2a17-43e7-bde7-ff2bb74dcd74"
 US_EASTERN = ZoneInfo("America/New_York")
+CE_VALIDITY_MODE = "5m"
 CE_SIGNAL_VALID_BARS = 5
 
 
@@ -112,6 +112,83 @@ def _now_et() -> datetime:
 def _is_after_market_close_et(now_et: datetime) -> bool:
     # US market regular close + small buffer at 16:05 ET.
     return now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 5)
+
+
+def _expand_signal_same_day(sig: pd.Series, times: pd.Series, keep_bars: int) -> pd.Series:
+    s = sig.fillna(False).astype(bool)
+    if keep_bars <= 0:
+        return s
+
+    out = pd.Series(False, index=s.index)
+    by_day = times.dt.date
+    for day in by_day.unique():
+        idx = s.index[by_day == day]
+        arr = s.loc[idx].to_numpy(dtype=bool)
+        n = len(arr)
+        ext = np.zeros(n, dtype=bool)
+        true_pos = np.where(arr)[0]
+        for pos in true_pos:
+            end = min(n, pos + keep_bars + 1)
+            ext[pos:end] = True
+        out.loc[idx] = ext
+    return out
+
+
+def _add_session_poc_factors(
+    df: pd.DataFrame,
+    tick_size: float = 0.01,
+    acceptance_window: int = 20,
+    acceptance_band_atr: float = 0.2,
+) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+
+    times = pd.to_datetime(out["time_key"], errors="coerce")
+    close = pd.to_numeric(out.get("close"), errors="coerce")
+    high = pd.to_numeric(out.get("high"), errors="coerce")
+    low = pd.to_numeric(out.get("low"), errors="coerce")
+    volume = pd.to_numeric(out.get("volume"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    typical = (high + low + close) / 3.0
+    price_bucket = np.round(typical / tick_size) * tick_size
+
+    session_poc = np.full(len(out), np.nan, dtype=float)
+    hist: dict[float, float] = {}
+    current_day = None
+    close_arr = close.to_numpy(dtype=float)
+
+    for i in range(len(out)):
+        ts = times.iloc[i]
+        day = ts.date() if pd.notna(ts) else None
+        if day != current_day:
+            hist = {}
+            current_day = day
+
+        px = float(price_bucket.iloc[i]) if np.isfinite(price_bucket.iloc[i]) else np.nan
+        vol = float(volume.iloc[i])
+        if np.isfinite(px) and vol > 0:
+            hist[px] = hist.get(px, 0.0) + vol
+
+        if hist:
+            close_i = close_arr[i] if i < len(close_arr) else np.nan
+            session_poc[i] = max(hist.items(), key=lambda kv: (kv[1], -abs(kv[0] - close_i)))[0]
+
+    out["session_poc"] = session_poc
+    dist = close - out["session_poc"]
+    atr = pd.to_numeric(out.get("ce_atr", out.get("atr_raw")), errors="coerce")
+    atr = atr.where(atr > 0)
+    out["poc_dist_atr"] = dist / atr
+    out["poc_slope"] = out["session_poc"].diff()
+
+    band = atr * float(max(0.0, acceptance_band_atr))
+    near = (dist.abs() <= band) & np.isfinite(dist) & np.isfinite(band)
+    out["poc_acceptance"] = near.astype(float).rolling(window=max(2, int(acceptance_window)), min_periods=1).mean()
+
+    dist_component = -(out["poc_dist_atr"].abs().clip(upper=3.0) / 3.0).fillna(0.0)
+    acceptance_component = (out["poc_acceptance"].fillna(0.0) * 2.0) - 1.0
+    slope_component = np.sign(out["poc_slope"].fillna(0.0))
+    out["poc_factor"] = (0.5 * dist_component) + (0.3 * acceptance_component) + (0.2 * slope_component)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -313,24 +390,6 @@ class SymbolMonitor:
         return [
             "time_key",
             "symbol",
-            "ce_length",
-            "ce_multiplier",
-            "trend_mode",
-            "session_filter",
-            "exit_model",
-            "tp_atr_multiple",
-            "tp_pct",
-            "sl_pct",
-            "time_stop_minutes",
-            "force_time_stop",
-            "zlsma_length",
-            "kama_er_length",
-            "kama_fast_length",
-            "kama_slow_length",
-            "pa_require_signal_bar",
-            "pa_use_pa_stops",
-            "pa_regime_filter",
-            "pa_position_sizing_mode",
             "open",
             "high",
             "low",
@@ -340,6 +399,15 @@ class SymbolMonitor:
             "cvd_real",
             "session_allowed",
             "atr_valid",
+            "zlsma_slope",
+            "ce_long_stop",
+            "ce_short_stop",
+            "ce_dir",
+            "session_poc",
+            "poc_dist_atr",
+            "poc_slope",
+            "poc_acceptance",
+            "poc_factor",
             "long_entry_signal",
             "short_entry_signal",
             "long_exit_cond",
@@ -415,13 +483,14 @@ class SymbolMonitor:
             real_cvd_session=real_cvd_series,
         )
         self.featured = apply_ce_features(base, self.params.ce_length, self.params.ce_multiplier)
-        # Keep CE trigger valid for a short window to reduce missed entries.
-        self.featured["ce_buy_signal"] = expand_signal_same_day(
+        self.featured = _add_session_poc_factors(self.featured)
+        # Keep CE trigger valid for a short post-trigger window (same day).
+        self.featured["ce_buy_signal"] = _expand_signal_same_day(
             self.featured["ce_buy_signal"],
             self.featured["time_key"],
             CE_SIGNAL_VALID_BARS,
         )
-        self.featured["ce_sell_signal"] = expand_signal_same_day(
+        self.featured["ce_sell_signal"] = _expand_signal_same_day(
             self.featured["ce_sell_signal"],
             self.featured["time_key"],
             CE_SIGNAL_VALID_BARS,
@@ -540,6 +609,13 @@ class SymbolMonitor:
         s_en = int(bool(snapshot.get("short_entry_signal", False)))
         l_ex = int(bool(snapshot.get("long_exit_cond", False)))
         s_ex = int(bool(snapshot.get("short_exit_cond", False)))
+        z_slope = float(snapshot.get("zlsma_slope", np.nan))
+        ce_long_stop = float(snapshot.get("ce_long_stop", np.nan))
+        ce_short_stop = float(snapshot.get("ce_short_stop", np.nan))
+        ce_dir = str(snapshot.get("ce_dir", ""))
+        session_poc = float(snapshot.get("session_poc", np.nan))
+        poc_dist_atr = float(snapshot.get("poc_dist_atr", np.nan))
+        poc_factor = float(snapshot.get("poc_factor", np.nan))
 
         if self.position is None:
             pos_str = "flat"
@@ -554,7 +630,10 @@ class SymbolMonitor:
 
         _log_info(
             f"[BAR] {self.symbol} {pd.Timestamp(bar_time).strftime('%Y-%m-%d %H:%M')} "
-            f"close={close_px:.2f} | sig(en L/S={l_en}/{s_en}, ex L/S={l_ex}/{s_ex}) | "
+            f"close={close_px:.2f} | slope={z_slope:+.6f} | "
+            f"ceStop(L/S)={ce_long_stop:.2f}/{ce_short_stop:.2f} dir={ce_dir} | "
+            f"poc={session_poc:.2f} dATR={poc_dist_atr:+.3f} f={poc_factor:+.3f} | "
+            f"sig(en L/S={l_en}/{s_en}, ex L/S={l_ex}/{s_ex}) | "
             f"pos={pos_str}"
         )
 
@@ -574,6 +653,19 @@ class SymbolMonitor:
 
         atr_val = row.get("ce_atr", np.nan)
         atr_valid = bool(np.isfinite(atr_val) and atr_val > 0)
+        zlsma_slope = float(row.get("zlsma_slope", np.nan))
+        ce_long_stop = float(row.get("ce_long_stop", np.nan))
+        ce_short_stop = float(row.get("ce_short_stop", np.nan))
+        ce_dir_val = row.get("ce_dir", np.nan)
+        if pd.isna(ce_dir_val):
+            ce_dir = ""
+        else:
+            ce_dir = str(int(ce_dir_val))
+        session_poc = float(row.get("session_poc", np.nan))
+        poc_dist_atr = float(row.get("poc_dist_atr", np.nan))
+        poc_slope = float(row.get("poc_slope", np.nan))
+        poc_acceptance = float(row.get("poc_acceptance", np.nan))
+        poc_factor = float(row.get("poc_factor", np.nan))
         session_allowed = bool(allowed.iloc[pos_in_df])
         long_entry = bool(long_sig.iloc[pos_in_df]) and atr_valid and session_allowed
         short_entry = bool(short_sig.iloc[pos_in_df]) and atr_valid and session_allowed
@@ -592,6 +684,15 @@ class SymbolMonitor:
             "cvd_real": cvd_real,
             "session_allowed": session_allowed,
             "atr_valid": atr_valid,
+            "zlsma_slope": zlsma_slope,
+            "ce_long_stop": ce_long_stop,
+            "ce_short_stop": ce_short_stop,
+            "ce_dir": ce_dir,
+            "session_poc": session_poc,
+            "poc_dist_atr": poc_dist_atr,
+            "poc_slope": poc_slope,
+            "poc_acceptance": poc_acceptance,
+            "poc_factor": poc_factor,
             "long_entry_signal": long_entry,
             "short_entry_signal": short_entry,
             "long_exit_cond": ce_sell,
@@ -626,24 +727,6 @@ class SymbolMonitor:
                 [
                     pd.Timestamp(bar_time).strftime("%Y-%m-%d %H:%M:%S"),
                     self.symbol,
-                    int(self.params.ce_length),
-                    float(self.params.ce_multiplier),
-                    str(self.params.trend_mode),
-                    str(self.params.session_filter),
-                    str(self.params.exit_model),
-                    float(self.params.tp_atr_multiple),
-                    float(self.params.tp_pct),
-                    float(self.params.sl_pct),
-                    int(self.params.time_stop_minutes),
-                    int(bool(self.params.force_time_stop)),
-                    int(self.params.zlsma_length),
-                    int(self.params.kama_er_length),
-                    int(self.params.kama_fast_length),
-                    int(self.params.kama_slow_length),
-                    int(bool(self.params.pa_require_signal_bar)),
-                    int(bool(self.params.pa_use_pa_stops)),
-                    int(bool(self.params.pa_regime_filter)),
-                    str(self.params.pa_position_sizing_mode),
                     float(bar.get("open", np.nan)),
                     float(bar.get("high", np.nan)),
                     float(bar.get("low", np.nan)),
@@ -653,6 +736,15 @@ class SymbolMonitor:
                     float(snapshot.get("cvd_real", np.nan)),
                     int(bool(snapshot.get("session_allowed", False))),
                     int(bool(snapshot.get("atr_valid", False))),
+                    float(snapshot.get("zlsma_slope", np.nan)),
+                    float(snapshot.get("ce_long_stop", np.nan)),
+                    float(snapshot.get("ce_short_stop", np.nan)),
+                    str(snapshot.get("ce_dir", "")),
+                    float(snapshot.get("session_poc", np.nan)),
+                    float(snapshot.get("poc_dist_atr", np.nan)),
+                    float(snapshot.get("poc_slope", np.nan)),
+                    float(snapshot.get("poc_acceptance", np.nan)),
+                    float(snapshot.get("poc_factor", np.nan)),
                     int(bool(snapshot.get("long_entry_signal", False))),
                     int(bool(snapshot.get("short_entry_signal", False))),
                     int(bool(snapshot.get("long_exit_cond", False))),
@@ -1340,7 +1432,7 @@ def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> in
             f"Ready | symbols={','.join(futu_codes)} | poll={poll_seconds}s | "
             f"session=before_1230 | ticker={'on' if ticker_enabled else 'off'}"
         )
-        _log_info(f"CE validity window: {CE_SIGNAL_VALID_BARS} bars (~{CE_SIGNAL_VALID_BARS} min)")
+        _log_info(f"CE validity mode: {CE_VALIDITY_MODE} ({CE_SIGNAL_VALID_BARS} bars)")
         _log_info(f"Data mode: {'push-stream' if use_push_stream else 'polling-fallback'}")
         _log_info(f"Feishu webhook: {'on' if notifier.enabled else 'off'}")
         _log_info(f"Output: {MONITOR_DIR.as_posix()}/daily/YYYY-MM-DD/(spy|qqq)_*.{{csv,png}}")

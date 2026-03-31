@@ -110,6 +110,7 @@ def build_base_features(
         slow_length=kama_slow_length,
         source="hlc3",
     )
+    result["kama_slope"] = result["kama"].pct_change()
     result["zlsma_slope"] = result["zlsma"].pct_change()
     result["atr_raw"] = atr(result, length=RAW_ATR_LENGTH)
     result["atr_percentile"] = rolling_percentile_rank(result["atr_raw"], window=atr_percentile_lookback)
@@ -183,6 +184,32 @@ def build_exit_prices(entry_price: float, atr_now: float, direction: int, params
 
 
 def build_entry_signals(df: pd.DataFrame, params: RuleParams) -> tuple[pd.Series, pd.Series]:
+    def _ce_long_active_until_reverse(ce_buy: pd.Series, ce_sell: pd.Series) -> pd.Series:
+        ce_buy_b = ce_buy.fillna(False).astype(bool).to_numpy()
+        ce_sell_b = ce_sell.fillna(False).astype(bool).to_numpy()
+        active = np.zeros(len(ce_buy_b), dtype=bool)
+        long_active = False
+        for i in range(len(ce_buy_b)):
+            if ce_sell_b[i]:
+                long_active = False
+            if ce_buy_b[i]:
+                long_active = True
+            active[i] = long_active
+        return pd.Series(active, index=ce_buy.index)
+
+    def _ce_short_active_until_reverse(ce_sell: pd.Series, ce_buy: pd.Series) -> pd.Series:
+        ce_sell_b = ce_sell.fillna(False).astype(bool).to_numpy()
+        ce_buy_b = ce_buy.fillna(False).astype(bool).to_numpy()
+        active = np.zeros(len(ce_sell_b), dtype=bool)
+        short_active = False
+        for i in range(len(ce_sell_b)):
+            if ce_buy_b[i]:
+                short_active = False
+            if ce_sell_b[i]:
+                short_active = True
+            active[i] = short_active
+        return pd.Series(active, index=ce_sell.index)
+
     long_condition = (df["close"] > df["zlsma"]) & (df["close"] > df["kama"])
     short_condition = (df["close"] < df["zlsma"]) & (df["close"] < df["kama"])
 
@@ -205,6 +232,22 @@ def build_entry_signals(df: pd.DataFrame, params: RuleParams) -> tuple[pd.Series
 
     raw_long = df["ce_buy_signal"].fillna(False) & long_condition.fillna(False) & long_allowed & atr_allowed
     raw_short = df["ce_sell_signal"].fillna(False) & short_condition.fillna(False) & short_allowed & atr_allowed
+
+    kama_slope = df.get("kama_slope", df["kama"].pct_change()).fillna(0.0)
+    kama_above_zlsma = df["kama"].gt(df["zlsma"]).fillna(False)
+    kama_below_zlsma = df["kama"].lt(df["zlsma"]).fillna(False)
+    ce_long_active = _ce_long_active_until_reverse(df["ce_buy_signal"], df["ce_sell_signal"])
+    ce_short_active = _ce_short_active_until_reverse(df["ce_sell_signal"], df["ce_buy_signal"])
+    if params.zlsma_slope_threshold > 0:
+        kama_slope_long_ok = kama_slope.ge(params.zlsma_slope_threshold)
+        kama_slope_short_ok = kama_slope.le(-params.zlsma_slope_threshold)
+    else:
+        kama_slope_long_ok = kama_slope.gt(0.0)
+        kama_slope_short_ok = kama_slope.lt(0.0)
+    long_persist_condition = ce_long_active & kama_above_zlsma & kama_slope_long_ok & atr_allowed
+    short_persist_condition = ce_short_active & kama_below_zlsma & kama_slope_short_ok & atr_allowed
+    raw_long = raw_long | long_persist_condition
+    raw_short = raw_short | short_persist_condition
 
     if params.cvd_classic_divergence:
         raw_long = raw_long & df["cvd_classic_long_ok"].fillna(True)
