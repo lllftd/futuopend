@@ -400,6 +400,7 @@ class SymbolMonitor:
     def _rebuild_features(self) -> None:
         if self.bars.empty:
             return
+        real_cvd_series = self._build_real_cvd_series()
         base = build_base_features(
             self.bars,
             zlsma_length=self.params.zlsma_length,
@@ -411,6 +412,7 @@ class SymbolMonitor:
             pseudo_cvd_method=self.params.pseudo_cvd_method,
             cvd_lookback=self.params.cvd_lookback,
             cvd_slope_lookback=self.params.cvd_slope_lookback,
+            real_cvd_session=real_cvd_series,
         )
         self.featured = apply_ce_features(base, self.params.ce_length, self.params.ce_multiplier)
         # Keep CE trigger valid for a short window to reduce missed entries.
@@ -424,6 +426,16 @@ class SymbolMonitor:
             self.featured["time_key"],
             CE_SIGNAL_VALID_BARS,
         )
+
+    def _build_real_cvd_series(self) -> pd.Series:
+        if self.bars.empty:
+            return pd.Series(dtype=float)
+        minute_keys = pd.to_datetime(self.bars["time_key"], errors="coerce").dt.floor("min")
+        mapped = minute_keys.map(lambda ts: self.real_cvd_minute_value.get(pd.Timestamp(ts), np.nan))
+        series = pd.to_numeric(mapped, errors="coerce").astype(float)
+        series = pd.Series(series, index=self.bars.index, dtype=float).ffill()
+        fallback_value = float(self.real_cvd_value) if np.isfinite(self.real_cvd_value) else 0.0
+        return series.fillna(fallback_value)
 
     def ingest_ticker(self, ticker_df: pd.DataFrame) -> None:
         if ticker_df is None or ticker_df.empty:

@@ -99,6 +99,7 @@ def build_base_features(
     pseudo_cvd_method: str = "clv_body_volume",
     cvd_lookback: int = 20,
     cvd_slope_lookback: int = 3,
+    real_cvd_session: pd.Series | None = None,
 ) -> pd.DataFrame:
     result = df.copy()
     result["zlsma"] = zlsma(result, length=zlsma_length, offset=zlsma_offset, source="hlc3")
@@ -112,7 +113,19 @@ def build_base_features(
     result["zlsma_slope"] = result["zlsma"].pct_change()
     result["atr_raw"] = atr(result, length=RAW_ATR_LENGTH)
     result["atr_percentile"] = rolling_percentile_rank(result["atr_raw"], window=atr_percentile_lookback)
-    result = result.join(add_pseudo_cvd(result, method=pseudo_cvd_method)[["cvd_pressure", "cvd_delta_proxy", "cvd_session"]])
+    if real_cvd_session is None:
+        cvd_frame = add_pseudo_cvd(result, method=pseudo_cvd_method)[["cvd_pressure", "cvd_delta_proxy", "cvd_session"]]
+    else:
+        cvd_values = pd.to_numeric(real_cvd_session, errors="coerce").reindex(result.index)
+        cvd_frame = pd.DataFrame(
+            {
+                "cvd_pressure": np.nan,
+                "cvd_delta_proxy": np.nan,
+                "cvd_session": cvd_values,
+            },
+            index=result.index,
+        )
+    result = result.join(cvd_frame)
     result = result.join(
         cvd_divergence_features(
             result,
