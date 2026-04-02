@@ -50,6 +50,9 @@ V3_BEST_PARAMS: dict[str, RuleParams] = {
         pa_20bar_neutral=False,
         pa_ii_breakout_entry=False,
         pa_position_sizing_mode="fixed",
+        pa_use_env_execution=False,
+        pa_mtf_trend_filter=False,
+        pa_mtf_min_rr=0.0,
     ),
     # QQQ: Sharpe 7.04, Return 42.2%, Win 64.9%, 906 trades, DD -1.04%
     "QQQ": RuleParams(
@@ -94,6 +97,9 @@ V3_BEST_PARAMS: dict[str, RuleParams] = {
         pa_20bar_neutral=False,
         pa_ii_breakout_entry=False,
         pa_position_sizing_mode="risk_based",
+        pa_use_env_execution=False,
+        pa_mtf_trend_filter=False,
+        pa_mtf_min_rr=0.0,
     ),
 }
 

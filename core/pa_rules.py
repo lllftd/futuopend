@@ -279,26 +279,294 @@ def _inside_bars_5m(bars: pd.DataFrame) -> pd.DataFrame:
 
 def _market_regime_5m(bars: pd.DataFrame) -> pd.DataFrame:
     close = bars["close"].astype(float)
-    rng = (bars["high"] - bars["low"]).replace(0, np.nan)
+    opn = bars["open"].astype(float)
+    high = bars["high"].astype(float)
+    low = bars["low"].astype(float)
+    rng = (high - low).replace(0, np.nan)
+    atr1 = (high - low).fillna(0.0)
+    atr20 = atr1.rolling(20, min_periods=5).mean()
 
-    atr_short = rng.ewm(span=20, min_periods=10).mean()
-    atr_long = rng.ewm(span=50, min_periods=20).mean()
-    atr_ratio = (atr_short / atr_long.replace(0, np.nan)).fillna(1)
+    ema20 = _ema(close, 20)
+    ema_slope = ema20.diff()
+    ema_slope_abs_ma40 = ema_slope.abs().rolling(40, min_periods=10).mean().replace(0, np.nan)
+    body = (close - opn).abs()
+    body_ratio = (body / rng).fillna(0.0)
+    upper_wick = high - pd.concat([opn, close], axis=1).max(axis=1)
+    lower_wick = pd.concat([opn, close], axis=1).min(axis=1) - low
+    wick_ratio = ((upper_wick + lower_wick) / rng).fillna(1.0)
 
-    body = (close - bars["open"].astype(float))
-    direction_consistency = body.rolling(10, min_periods=5).apply(
-        lambda x: abs(np.sum(np.sign(x))) / len(x), raw=True
-    ).fillna(0)
+    above_ema = close > ema20
+    below_ema = close < ema20
 
-    is_trend = (atr_ratio > 1.05) & (direction_consistency > 0.5)
-    is_range = (atr_ratio < 0.95) | (direction_consistency < 0.3)
+    n = len(bars)
+    above_run = np.zeros(n, dtype=int)
+    below_run = np.zeros(n, dtype=int)
+    same_color_run = np.zeros(n, dtype=int)
+    body_overlap = np.zeros(n, dtype=float)
+    cross = np.zeros(n, dtype=int)
+    for i in range(n):
+        above_run[i] = above_run[i - 1] + 1 if i > 0 and above_ema.iloc[i] else (1 if above_ema.iloc[i] else 0)
+        below_run[i] = below_run[i - 1] + 1 if i > 0 and below_ema.iloc[i] else (1 if below_ema.iloc[i] else 0)
+        dir_i = np.sign(close.iloc[i] - opn.iloc[i])
+        if i == 0:
+            same_color_run[i] = 1
+        else:
+            dir_prev = np.sign(close.iloc[i - 1] - opn.iloc[i - 1])
+            same_color_run[i] = same_color_run[i - 1] + 1 if dir_i != 0 and dir_i == dir_prev else 1
+            prev_low_body = min(opn.iloc[i - 1], close.iloc[i - 1])
+            prev_high_body = max(opn.iloc[i - 1], close.iloc[i - 1])
+            cur_low_body = min(opn.iloc[i], close.iloc[i])
+            cur_high_body = max(opn.iloc[i], close.iloc[i])
+            overlap = max(0.0, min(prev_high_body, cur_high_body) - max(prev_low_body, cur_low_body))
+            prev_body = max(prev_high_body - prev_low_body, 1e-12)
+            cur_body = max(cur_high_body - cur_low_body, 1e-12)
+            body_overlap[i] = overlap / max(prev_body, cur_body)
+            prev_side = np.sign(close.iloc[i - 1] - ema20.iloc[i - 1]) if np.isfinite(ema20.iloc[i - 1]) else 0
+            cur_side = np.sign(close.iloc[i] - ema20.iloc[i]) if np.isfinite(ema20.iloc[i]) else 0
+            cross[i] = 1 if prev_side != 0 and cur_side != 0 and prev_side != cur_side else 0
+
+    hh_hl = (high.diff() > 0) & (low.diff() > 0)
+    lh_ll = (high.diff() < 0) & (low.diff() < 0)
+    avg_body20 = body.rolling(20, min_periods=5).mean()
+    bull_close_extreme_q = close >= (high - 0.25 * (high - low))
+    bear_close_extreme_q = close <= (low + 0.25 * (high - low))
+    breakout_bull = (body_ratio >= 0.6) & (body > 1.5 * avg_body20) & (close > high.shift(1)) & bull_close_extreme_q
+    breakout_bear = (body_ratio >= 0.6) & (body > 1.5 * avg_body20) & (close < low.shift(1)) & bear_close_extreme_q
+
+    # Pullback depth/time metrics.
+    leg_hi10 = high.rolling(10, min_periods=3).max()
+    leg_lo10 = low.rolling(10, min_periods=3).min()
+    leg_span10 = (leg_hi10 - leg_lo10).replace(0, np.nan)
+    pullback_up = (leg_hi10 - close) / leg_span10
+    pullback_down = (close - leg_lo10) / leg_span10
+    counter_run = np.zeros(n, dtype=int)
+    for i in range(1, n):
+        if close.iloc[i] < opn.iloc[i]:
+            counter_run[i] = counter_run[i - 1] + 1
+        elif close.iloc[i] > opn.iloc[i]:
+            counter_run[i] = 0
+
+    # Trend majority conditions T1..T7 (long/short side).
+    t1_long = (ema_slope > 0) & (pd.Series(above_ema, index=bars.index).rolling(20, min_periods=5).mean() >= 0.6)
+    t1_short = (ema_slope < 0) & (pd.Series(below_ema, index=bars.index).rolling(20, min_periods=5).mean() >= 0.6)
+    t2_long = pd.Series(above_run, index=bars.index) >= 5
+    t2_short = pd.Series(below_run, index=bars.index) >= 5
+    t3_long = (pd.Series(same_color_run, index=bars.index) >= 3) & (close > opn) & (body_ratio >= 0.6)
+    t3_short = (pd.Series(same_color_run, index=bars.index) >= 3) & (close < opn) & (body_ratio >= 0.6)
+    t4_long = pullback_up < 0.5
+    t4_short = pullback_down < 0.5
+    t5_long = pd.Series(counter_run, index=bars.index) <= 5
+    t5_short = pd.Series(counter_run, index=bars.index) <= 5
+    t6_long = hh_hl.rolling(5, min_periods=2).sum() >= 3
+    t6_short = lh_ll.rolling(5, min_periods=2).sum() >= 3
+    t7_long = breakout_bull.rolling(20, min_periods=5).max().fillna(False)
+    t7_short = breakout_bear.rolling(20, min_periods=5).max().fillna(False)
+
+    trend_long_count = (
+        t1_long.astype(int)
+        + t2_long.astype(int)
+        + t3_long.astype(int)
+        + t4_long.astype(int)
+        + t5_long.astype(int)
+        + t6_long.astype(int)
+        + t7_long.astype(int)
+    )
+    trend_short_count = (
+        t1_short.astype(int)
+        + t2_short.astype(int)
+        + t3_short.astype(int)
+        + t4_short.astype(int)
+        + t5_short.astype(int)
+        + t6_short.astype(int)
+        + t7_short.astype(int)
+    )
+    trend_count = np.maximum(trend_long_count.to_numpy(dtype=float), trend_short_count.to_numpy(dtype=float))
+    trend_score_ratio = trend_count / 7.0
+    trend_dir = np.where(trend_long_count > trend_short_count, 1, np.where(trend_short_count > trend_long_count, -1, 0))
+    trend_dir_s = pd.Series(trend_dir, index=bars.index)
+
+    # 20-bar inertia counter (reset on new trend extreme).
+    bars_since_extreme = np.zeros(n, dtype=int)
+    inertia_prob = np.full(n, 0.50, dtype=float)
+    inertia_bucket = np.array(["neutral_50_50"] * n, dtype=object)
+    last_dir = 0
+    cur_count = 0
+    last_extreme = np.nan
+    highs = high.to_numpy(dtype=float)
+    lows = low.to_numpy(dtype=float)
+    for i in range(n):
+        d = int(trend_dir[i])
+        if d == 1:
+            if last_dir != 1:
+                cur_count = 0
+                last_extreme = highs[i]
+            elif np.isfinite(last_extreme) and highs[i] >= last_extreme:
+                cur_count = 0
+                last_extreme = highs[i]
+            else:
+                cur_count += 1
+        elif d == -1:
+            if last_dir != -1:
+                cur_count = 0
+                last_extreme = lows[i]
+            elif np.isfinite(last_extreme) and lows[i] <= last_extreme:
+                cur_count = 0
+                last_extreme = lows[i]
+            else:
+                cur_count += 1
+        else:
+            cur_count += 1
+            last_extreme = np.nan
+        bars_since_extreme[i] = cur_count
+        last_dir = d
+        if cur_count <= 5:
+            inertia_prob[i] = 0.90
+            inertia_bucket[i] = "bars_0_5"
+        elif cur_count <= 10:
+            inertia_prob[i] = 0.75
+            inertia_bucket[i] = "bars_6_10"
+        elif cur_count <= 15:
+            inertia_prob[i] = 0.60
+            inertia_bucket[i] = "bars_11_15"
+        elif cur_count <= 19:
+            inertia_prob[i] = 0.55
+            inertia_bucket[i] = "bars_16_19"
+        else:
+            inertia_prob[i] = 0.50
+            inertia_bucket[i] = "bars_ge_20"
+
+    # Range conditions R1..R6
+    prev_leg_h = (high.rolling(40, min_periods=10).max() - low.rolling(40, min_periods=10).min()).shift(20).replace(0, np.nan)
+    range_h20 = (high.rolling(20, min_periods=5).max() - low.rolling(20, min_periods=5).min())
+    r1 = range_h20 < (0.5 * prev_leg_h)
+    r2 = ema_slope.abs() < (ema_slope_abs_ma40 / 3.0)
+    r3 = pd.Series(cross, index=bars.index).rolling(10, min_periods=5).sum() >= 3
+    failed_up = (high >= high.rolling(20, min_periods=5).max().shift(1)) & (close < high.rolling(20, min_periods=5).max().shift(1))
+    failed_dn = (low <= low.rolling(20, min_periods=5).min().shift(1)) & (close > low.rolling(20, min_periods=5).min().shift(1))
+    r4 = (failed_up | failed_dn).rolling(5, min_periods=3).sum() >= 4
+    alt = (np.sign(close - opn).diff().abs() > 0).astype(float)
+    r5 = (alt.rolling(10, min_periods=5).mean() >= 0.6) & (pd.Series(same_color_run, index=bars.index) < 3)
+    r6 = (((upper_wick > body / 3.0) & (lower_wick > body / 3.0)).astype(float).rolling(10, min_periods=5).mean() >= 0.6)
+    range_count = r1.astype(int) + r2.astype(int) + r3.astype(int) + r4.astype(int) + r5.astype(int) + r6.astype(int)
+    range_score_ratio = range_count / 6.0
+
+    # Tight channel / broad channel / TTR thresholds.
+    pullback_len_ok = pd.Series(counter_run, index=bars.index).between(1, 3)
+    pullback_amp_ok = (leg_span10 * pullback_up.fillna(0.0) < 2.0 * atr1) | (leg_span10 * pullback_down.fillna(0.0) < 2.0 * atr1)
+    gap_unfilled = np.where(trend_dir == 1, low > opn.shift(1), np.where(trend_dir == -1, high < opn.shift(1), False))
+    overlap_low = pd.Series(body_overlap, index=bars.index) < 0.3
+    close_extreme = np.where(
+        trend_dir == 1,
+        close >= (low + (2.0 / 3.0) * (high - low)),
+        np.where(trend_dir == -1, close <= (low + (1.0 / 3.0) * (high - low)), False),
+    )
+    close_extreme_ratio = pd.Series(close_extreme, index=bars.index).rolling(10, min_periods=5).mean() >= 0.7
+    tight_channel_all = pullback_len_ok & pullback_amp_ok & pd.Series(gap_unfilled, index=bars.index).fillna(False) & overlap_low & close_extreme_ratio
+
+    broad_1 = (pullback_up > 0.5) | (pullback_down > 0.5)
+    broad_2 = pd.Series(same_color_run, index=bars.index).rolling(10, min_periods=5).mean() >= 5
+    broad_3 = (hh_hl.rolling(10, min_periods=5).sum() >= 2) & (lh_ll.rolling(10, min_periods=5).sum() >= 2)
+    broad_4 = ((low <= ema20) | (high >= ema20)).rolling(10, min_periods=5).mean() >= 0.6
+    broad_majority = (broad_1.astype(int) + broad_2.astype(int) + broad_3.astype(int) + broad_4.astype(int)) >= 2
+
+    ttr_1 = range_h20 < (3.0 * atr20)
+    ttr_2 = pd.Series(body_overlap, index=bars.index).rolling(10, min_periods=5).mean() > 0.5
+    ttr_3 = (((upper_wick > 0) & (lower_wick > 0)).astype(float).rolling(10, min_periods=5).mean() >= 0.6)
+    ttr_4 = pd.Series(same_color_run, index=bars.index) <= 2
+    ttr_5 = (range_score_ratio.rolling(5, min_periods=3).mean() >= 0.6)
+    ttr_all = ttr_1 & ttr_2 & ttr_3 & ttr_4 & ttr_5
+
+    # Scorecard (section 6).
+    ema_dir_score = np.where(ema_slope > 0, 1, np.where(ema_slope < 0, -1, 0))
+    price_vs_ema_score = np.where(above_run >= 5, 1, np.where(below_run >= 5, -1, 0))
+    hh_hl_score = np.where(hh_hl.rolling(4, min_periods=2).sum() >= 3, 1, np.where(lh_ll.rolling(4, min_periods=2).sum() >= 3, -1, 0))
+    breakout_score = np.where(breakout_bull, 1, np.where(breakout_bear, -1, 0))
+    pb_depth_score = np.where((trend_dir_s == 1) & (pullback_up < 0.38), 1, np.where((trend_dir_s == -1) & (pullback_down < 0.38), -1, 0))
+    pb_duration_score = np.where((trend_dir_s == 1) & (pd.Series(counter_run, index=bars.index) <= 3), 1, np.where((trend_dir_s == -1) & (pd.Series(counter_run, index=bars.index) <= 3), -1, 0))
+    twenty_bar_score = np.where(bars_since_extreme < 10, trend_dir, 0)
+    bar_quality_score = np.where((body_ratio >= 0.6) & (wick_ratio < 0.4) & (close > opn), 1, np.where((body_ratio >= 0.6) & (wick_ratio < 0.4) & (close < opn), -1, 0))
+    total_score = ema_dir_score + price_vs_ema_score + hh_hl_score + breakout_score + pb_depth_score + pb_duration_score + twenty_bar_score + bar_quality_score
+
+    # Final state mapping: scorecard bins follow Brooks-style quick template.
+    state = np.array(["wide_tr"] * n, dtype=object)
+    state = np.where(total_score >= 6, "tight_bull_channel", state)
+    state = np.where((total_score >= 3) & (total_score <= 5), "wide_bull_channel", state)
+    state = np.where((total_score >= -5) & (total_score <= -3), "wide_bear_channel", state)
+    state = np.where(total_score <= -6, "tight_bear_channel", state)
+    state = np.where((total_score >= -2) & (total_score <= 2), "wide_tr", state)
+
+    # Tight channel must pass strict pullback/gap constraints.
+    state = np.where((state == "tight_bull_channel") & (~tight_channel_all.to_numpy(dtype=bool)), "wide_bull_channel", state)
+    state = np.where((state == "tight_bear_channel") & (~tight_channel_all.to_numpy(dtype=bool)), "wide_bear_channel", state)
+
+    # EMA flat / repeated crossing + overlap compression => TTR.
+    state = np.where((state == "wide_tr") & ttr_all.to_numpy(dtype=bool), "ttr", state)
+    # 20-bar inertia exhausted -> neutral 50/50.
+    state = np.where((bars_since_extreme >= 20) & (np.abs(total_score) <= 2), "neutral_50_50", state)
+
+    order_type = np.array(["limit"] * n, dtype=object)
+    entry_style = np.array(["range_thirds"] * n, dtype=object)
+    stop_style = np.array(["range_plus_1atr"] * n, dtype=object)
+    tp_style = np.array(["to_opposite_or_midline"] * n, dtype=object)
+    position_size = np.array(["0.50_to_0.75x"] * n, dtype=object)
+    tight = np.isin(state, ["tight_bull_channel", "tight_bear_channel"])
+    wide_channel = np.isin(state, ["wide_bull_channel", "wide_bear_channel"])
+    ttr = state == "ttr"
+    neutral = state == "neutral_50_50"
+    order_type[tight] = "stop"
+    entry_style[tight] = "h1_h2_or_l1_l2_breakout"
+    stop_style[tight] = "leg_extreme_or_ema_other_side"
+    tp_style[tight] = "hold_until_trend_exhaustion"
+    position_size[tight] = "1.00x"
+    order_type[wide_channel] = "stop_plus_limit"
+    entry_style[wide_channel] = "trend_pullback_or_boundary_reversal"
+    stop_style[wide_channel] = "outside_recent_swing"
+    tp_style[wide_channel] = "channel_opposite_or_mm_target"
+    position_size[wide_channel] = "1.00x"
+    order_type[ttr] = "none"
+    entry_style[ttr] = "no_trade_wait_breakout_confirm"
+    stop_style[ttr] = "n_a"
+    tp_style[ttr] = "n_a"
+    position_size[ttr] = "n_a"
+    order_type[neutral] = "wait"
+    entry_style[neutral] = "strong_breakout_plus_follow_through"
+    stop_style[neutral] = "below_breakout_midpoint"
+    tp_style[neutral] = "conservative_1r"
+    position_size[neutral] = "0.50x"
+
+    is_trend = np.isin(state, ["tight_bull_channel", "wide_bull_channel", "tight_bear_channel", "wide_bear_channel"])
+    is_range = np.isin(state, ["wide_tr", "ttr", "neutral_50_50"])
 
     out = pd.DataFrame(index=bars.index)
     out["time_key"] = bars["time_key"].values
-    out["pa_regime_trend"] = is_trend.values
-    out["pa_regime_range"] = is_range.values
-    out["pa_reversal_likely_fail"] = is_trend.values
-    out["pa_breakout_likely_fail"] = is_range.values
+    out["pa_env_trend_dir"] = trend_dir
+    out["pa_env_bars_since_extreme"] = bars_since_extreme
+    out["pa_env_trend_inertia"] = inertia_prob
+    out["pa_env_inertia_bucket"] = inertia_bucket
+    out["pa_env_trend_score_ratio"] = trend_score_ratio
+    out["pa_env_range_score_ratio"] = range_score_ratio.to_numpy(dtype=float)
+    out["pa_env_score_ema_dir"] = ema_dir_score
+    out["pa_env_score_price_vs_ema"] = price_vs_ema_score
+    out["pa_env_score_hh_hl"] = hh_hl_score
+    out["pa_env_score_breakout_bar"] = breakout_score
+    out["pa_env_score_pullback_depth"] = pb_depth_score
+    out["pa_env_score_pullback_duration"] = pb_duration_score
+    out["pa_env_score_twenty_bar"] = twenty_bar_score
+    out["pa_env_score_bar_quality"] = bar_quality_score
+    out["pa_env_score_total"] = total_score
+    out["pa_env_state"] = state
+    out["pa_env_order_type"] = order_type
+    out["pa_env_entry_style"] = entry_style
+    out["pa_env_stop_style"] = stop_style
+    out["pa_env_take_profit_style"] = tp_style
+    out["pa_env_position_size"] = position_size
+    out["pa_regime_trend"] = is_trend
+    out["pa_regime_range"] = is_range
+    out["pa_reversal_likely_fail"] = is_trend
+    out["pa_breakout_likely_fail"] = np.isin(state, ["wide_tr", "ttr"])
+    out["pa_is_tight_channel"] = tight_channel_all.to_numpy(dtype=bool)
+    out["pa_is_broad_channel"] = broad_majority.to_numpy(dtype=bool)
+    out["pa_is_ttr"] = ttr_all.to_numpy(dtype=bool)
     return out
 
 
@@ -310,35 +578,39 @@ def _twenty_bar_rule_5m(bars: pd.DataFrame, direction: np.ndarray) -> pd.DataFra
     n = len(bars)
     bars_since_change = np.zeros(n, dtype=int)
     trend_weakened = np.zeros(n, dtype=bool)
+    highs = bars["high"].to_numpy(dtype=float)
+    lows = bars["low"].to_numpy(dtype=float)
 
-    count = 0
     prev_dir = 0
+    cur_count = 0
+    last_extreme = np.nan
     for i in range(n):
-        d = direction[i]
-        if d != prev_dir and d != 0:
-            count = 0
-            prev_dir = d
-        else:
-            count += 1
-        bars_since_change[i] = count
-
-    in_pullback = np.zeros(n, dtype=int)
-    pb_count = 0
-    for i in range(1, n):
-        if direction[i] == direction[i - 1] and direction[i] != 0:
-            close_val = bars["close"].iloc[i]
-            open_val = bars["open"].iloc[i]
-            if direction[i] == 1 and close_val < open_val:
-                pb_count += 1
-            elif direction[i] == -1 and close_val > open_val:
-                pb_count += 1
+        d = int(direction[i])
+        if d == 1:
+            if prev_dir != 1:
+                cur_count = 0
+                last_extreme = highs[i]
+            elif np.isfinite(last_extreme) and highs[i] >= last_extreme:
+                cur_count = 0
+                last_extreme = highs[i]
             else:
-                pb_count = 0
+                cur_count += 1
+        elif d == -1:
+            if prev_dir != -1:
+                cur_count = 0
+                last_extreme = lows[i]
+            elif np.isfinite(last_extreme) and lows[i] <= last_extreme:
+                cur_count = 0
+                last_extreme = lows[i]
+            else:
+                cur_count += 1
         else:
-            pb_count = 0
-        in_pullback[i] = pb_count
-        if pb_count > 20:
-            trend_weakened[i] = True
+            cur_count += 1
+            last_extreme = np.nan
+
+        bars_since_change[i] = cur_count
+        trend_weakened[i] = cur_count >= 20
+        prev_dir = d
 
     out = pd.DataFrame(index=bars.index)
     out["time_key"] = bars["time_key"].values
@@ -432,17 +704,26 @@ def _measured_move_5m(bars: pd.DataFrame, pivot_len: int = 5) -> pd.DataFrame:
         if lows[i] == window_l.min():
             swing_lows.append((i, lows[i]))
 
-    # Leg1=Leg2: for upward MM, find last swing_low → swing_high → swing_low pattern
+    swing_lows_arr = np.array(swing_lows) if swing_lows else np.empty((0, 2))
+    swing_highs_arr = np.array(swing_highs) if swing_highs else np.empty((0, 2))
+
     for i in range(n):
+        if len(swing_lows_arr) < 2 or len(swing_highs_arr) < 1:
+            continue
+
+        idx_l = np.searchsorted(swing_lows_arr[:, 0], i, side='right')
+        idx_h = np.searchsorted(swing_highs_arr[:, 0], i, side='right')
+        
+        relevant_lows = swing_lows_arr[:idx_l]
+        relevant_highs = swing_highs_arr[:idx_h]
+
         # upward MM target
-        relevant_lows = [(idx, v) for idx, v in swing_lows if idx <= i]
-        relevant_highs = [(idx, v) for idx, v in swing_highs if idx <= i]
         if len(relevant_lows) >= 2 and len(relevant_highs) >= 1:
             sl1 = relevant_lows[-2]
             sh = None
-            for idx_h, v_h in reversed(relevant_highs):
-                if idx_h > sl1[0]:
-                    sh = (idx_h, v_h)
+            for j in range(len(relevant_highs)-1, -1, -1):
+                if relevant_highs[j, 0] > sl1[0]:
+                    sh = relevant_highs[j]
                     break
             sl2 = relevant_lows[-1]
             if sh is not None and sl2[0] > sh[0]:
@@ -454,9 +735,9 @@ def _measured_move_5m(bars: pd.DataFrame, pivot_len: int = 5) -> pd.DataFrame:
         if len(relevant_highs) >= 2 and len(relevant_lows) >= 1:
             sh1 = relevant_highs[-2]
             sl = None
-            for idx_l, v_l in reversed(relevant_lows):
-                if idx_l > sh1[0]:
-                    sl = (idx_l, v_l)
+            for j in range(len(relevant_lows)-1, -1, -1):
+                if relevant_lows[j, 0] > sh1[0]:
+                    sl = relevant_lows[j]
                     break
             sh2 = relevant_highs[-1]
             if sl is not None and sh2[0] > sl[0]:
@@ -563,16 +844,23 @@ def _pa_stops(bars_5m: pd.DataFrame, pivot_len: int = 5) -> pd.DataFrame:
         if lows[i] == wl.min():
             swing_lows.append((i, lows[i]))
 
+    swing_high_idx = np.array([idx for idx, _ in swing_highs], dtype=int) if swing_highs else np.array([], dtype=int)
+    swing_high_val = np.array([v for _, v in swing_highs], dtype=float) if swing_highs else np.array([], dtype=float)
+    swing_low_idx = np.array([idx for idx, _ in swing_lows], dtype=int) if swing_lows else np.array([], dtype=int)
+    swing_low_val = np.array([v for _, v in swing_lows], dtype=float) if swing_lows else np.array([], dtype=float)
+
     for i in range(n):
         # Recent higher-low for long stops
-        candidate_lows = [v for idx, v in swing_lows if idx < i and idx >= i - 40]
-        if candidate_lows:
-            recent_hl[i] = candidate_lows[-1]
+        if len(swing_low_idx) > 0:
+            right_idx = np.searchsorted(swing_low_idx, i) - 1
+            if right_idx >= 0 and swing_low_idx[right_idx] >= i - 40:
+                recent_hl[i] = swing_low_val[right_idx]
 
         # Recent lower-high for short stops
-        candidate_highs = [v for idx, v in swing_highs if idx < i and idx >= i - 40]
-        if candidate_highs:
-            recent_lh[i] = candidate_highs[-1]
+        if len(swing_high_idx) > 0:
+            right_idx = np.searchsorted(swing_high_idx, i) - 1
+            if right_idx >= 0 and swing_high_idx[right_idx] >= i - 40:
+                recent_lh[i] = swing_high_val[right_idx]
 
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
@@ -582,10 +870,175 @@ def _pa_stops(bars_5m: pd.DataFrame, pivot_len: int = 5) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 1k. Orchestrator: add_all_pa_features
+# 1k. Advanced PA triggers (5-min)
 # ---------------------------------------------------------------------------
 
-def add_all_pa_features(df: pd.DataFrame, atr_series: pd.Series) -> pd.DataFrame:
+def _advanced_pa_triggers_5m(
+    bars: pd.DataFrame,
+    regime: pd.DataFrame,
+    mag: pd.DataFrame,
+) -> pd.DataFrame:
+    n = len(bars)
+    opn = bars["open"].to_numpy(dtype=float)
+    close = bars["close"].to_numpy(dtype=float)
+    high = bars["high"].to_numpy(dtype=float)
+    low = bars["low"].to_numpy(dtype=float)
+    rng = np.maximum(high - low, 1e-12)
+    body = np.abs(close - opn)
+    body_ratio = body / rng
+    avg_body20 = pd.Series(body).rolling(20, min_periods=5).mean().to_numpy(dtype=float)
+
+    env_state = regime["pa_env_state"].astype(str).to_numpy()
+    env_dir = regime["pa_env_trend_dir"].to_numpy(dtype=int)
+    bars_since_extreme = regime["pa_env_bars_since_extreme"].to_numpy(dtype=int)
+
+    mag_base = mag["pa_is_mag_bar"].to_numpy(dtype=bool)
+    ema20 = _ema(bars["close"], 20).to_numpy(dtype=float)
+    mag_bull = mag_base & (low > ema20) & (close > opn) & (body_ratio > 0.6)
+    mag_bear = mag_base & (high < ema20) & (close < opn) & (body_ratio > 0.6)
+
+    # Wedge third push with momentum decay (third leg bars < 70% first leg bars).
+    wedge_rev_up = np.zeros(n, dtype=bool)
+    wedge_rev_down = np.zeros(n, dtype=bool)
+    swing_low_idx: list[int] = []
+    swing_high_idx: list[int] = []
+    pivot_len = 3
+    for i in range(pivot_len, n - pivot_len):
+        wl = low[i - pivot_len: i + pivot_len + 1]
+        wh = high[i - pivot_len: i + pivot_len + 1]
+        if low[i] == wl.min():
+            swing_low_idx.append(i)
+            if len(swing_low_idx) >= 3:
+                a, b, c = swing_low_idx[-3], swing_low_idx[-2], swing_low_idx[-1]
+                leg1_bars = max(1, b - a)
+                leg3_bars = max(1, c - b)
+                if leg3_bars <= 0.7 * leg1_bars and low[c] <= low[b] <= low[a]:
+                    wedge_rev_up[c] = True
+        if high[i] == wh.max():
+            swing_high_idx.append(i)
+            if len(swing_high_idx) >= 3:
+                a, b, c = swing_high_idx[-3], swing_high_idx[-2], swing_high_idx[-1]
+                leg1_bars = max(1, b - a)
+                leg3_bars = max(1, c - b)
+                if leg3_bars <= 0.7 * leg1_bars and high[c] >= high[b] >= high[a]:
+                    wedge_rev_down[c] = True
+
+    # Channel overshoot then back inside within 5 bars.
+    overshoot_revert_up = np.zeros(n, dtype=bool)
+    overshoot_revert_down = np.zeros(n, dtype=bool)
+    pending_up: list[tuple[int, float]] = []
+    pending_down: list[tuple[int, float]] = []
+    roll_hi = pd.Series(high).rolling(20, min_periods=5).max().shift(1).to_numpy(dtype=float)
+    roll_lo = pd.Series(low).rolling(20, min_periods=5).min().shift(1).to_numpy(dtype=float)
+    for i in range(n):
+        if np.isfinite(roll_hi[i]) and close[i] > roll_hi[i]:
+            pending_up.append((i, roll_hi[i]))
+        if np.isfinite(roll_lo[i]) and close[i] < roll_lo[i]:
+            pending_down.append((i, roll_lo[i]))
+
+        pending_up = [(idx0, lvl) for idx0, lvl in pending_up if i - idx0 <= 5]
+        pending_down = [(idx0, lvl) for idx0, lvl in pending_down if i - idx0 <= 5]
+
+        if any(close[i] < lvl for _, lvl in pending_up):
+            overshoot_revert_up[i] = True
+            pending_up = []
+        if any(close[i] > lvl for _, lvl in pending_down):
+            overshoot_revert_down[i] = True
+            pending_down = []
+
+    # Channel probability trigger: channel runs >=20 bars, prep reversal logic.
+    channel_state = np.isin(env_state, ["tight_bull_channel", "wide_bull_channel", "tight_bear_channel", "wide_bear_channel"])
+    channel_reversal_ready = channel_state & (bars_since_extreme >= 20)
+
+    # TR -> trend breakout success / failure checks.
+    tr_state = np.isin(env_state, ["wide_tr", "ttr", "neutral_50_50"])
+    breakout_success_up = np.zeros(n, dtype=bool)
+    breakout_success_down = np.zeros(n, dtype=bool)
+    breakout_fail_up = np.zeros(n, dtype=bool)
+    breakout_fail_down = np.zeros(n, dtype=bool)
+    measured_gap_up = np.zeros(n, dtype=bool)
+    measured_gap_down = np.zeros(n, dtype=bool)
+    exhaustion_gap_up = np.zeros(n, dtype=bool)
+    exhaustion_gap_down = np.zeros(n, dtype=bool)
+
+    for i in range(21, n - 2):
+        if not tr_state[i]:
+            continue
+        prev_hi = np.max(high[i - 20: i])
+        prev_lo = np.min(low[i - 20: i])
+        prev_span = max(prev_hi - prev_lo, 1e-12)
+
+        strong_body = (
+            body_ratio[i] > 0.6
+            and body[i] > 1.5 * (avg_body20[i] if np.isfinite(avg_body20[i]) else body[i])
+        )
+
+        # Breakout up candidate
+        if close[i] > prev_hi and strong_body and (close[i] >= high[i] - 0.25 * rng[i]):
+            # Follow-through rule: bar+1 must not retrace >50% of breakout body.
+            breakout_mid_body = opn[i] + 0.5 * (close[i] - opn[i])
+            follow_ok = close[i + 1] >= breakout_mid_body
+            gap = low[i] > prev_hi
+            gap_hold3 = gap and np.min(low[i: min(n, i + 3)]) > prev_hi
+            gap_fill_3_5 = gap and np.min(low[i + 3: min(n, i + 6)]) <= prev_hi
+            leg = max(close[i] - prev_hi, 1e-12)
+            pb_min = np.min(low[i + 1: min(n, i + 4)])
+            depth = (close[i] - pb_min) / leg
+            pb_depth_ok = depth < 0.382
+            pb_len_ok = (min(n, i + 4) - (i + 1)) <= 3
+
+            if follow_ok and gap_hold3 and pb_depth_ok and pb_len_ok:
+                breakout_success_up[i] = True
+                measured_gap_up[i] = True
+            elif gap_fill_3_5:
+                breakout_fail_up[i] = True
+                exhaustion_gap_up[i] = True
+
+        # Breakout down candidate
+        if close[i] < prev_lo and strong_body and (close[i] <= low[i] + 0.25 * rng[i]):
+            breakout_mid_body = opn[i] - 0.5 * (opn[i] - close[i])
+            follow_ok = close[i + 1] <= breakout_mid_body
+            gap = high[i] < prev_lo
+            gap_hold3 = gap and np.max(high[i: min(n, i + 3)]) < prev_lo
+            gap_fill_3_5 = gap and np.max(high[i + 3: min(n, i + 6)]) >= prev_lo
+            leg = max(prev_lo - close[i], 1e-12)
+            pb_max = np.max(high[i + 1: min(n, i + 4)])
+            depth = (pb_max - close[i]) / leg
+            pb_depth_ok = depth < 0.382
+            pb_len_ok = (min(n, i + 4) - (i + 1)) <= 3
+
+            if follow_ok and gap_hold3 and pb_depth_ok and pb_len_ok:
+                breakout_success_down[i] = True
+                measured_gap_down[i] = True
+            elif gap_fill_3_5:
+                breakout_fail_down[i] = True
+                exhaustion_gap_down[i] = True
+
+    out = pd.DataFrame(index=bars.index)
+    out["time_key"] = bars["time_key"].values
+    out["pa_mag20_bull"] = mag_bull
+    out["pa_mag20_bear"] = mag_bear
+    out["pa_wedge_third_push_up"] = wedge_rev_up
+    out["pa_wedge_third_push_down"] = wedge_rev_down
+    out["pa_channel_overshoot_revert_up"] = overshoot_revert_up
+    out["pa_channel_overshoot_revert_down"] = overshoot_revert_down
+    out["pa_channel_reversal_ready"] = channel_reversal_ready
+    out["pa_breakout_success_up"] = breakout_success_up
+    out["pa_breakout_success_down"] = breakout_success_down
+    out["pa_breakout_fail_up"] = breakout_fail_up
+    out["pa_breakout_fail_down"] = breakout_fail_down
+    out["pa_measured_gap_up"] = measured_gap_up
+    out["pa_measured_gap_down"] = measured_gap_down
+    out["pa_exhaustion_gap_up"] = exhaustion_gap_up
+    out["pa_exhaustion_gap_down"] = exhaustion_gap_down
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1l. Orchestrator: add_all_pa_features
+# ---------------------------------------------------------------------------
+
+def add_all_pa_features(df: pd.DataFrame, atr_series: pd.Series, timeframe: str = "5min") -> pd.DataFrame:
     """
     Compute all PA features and merge them onto the 1-min DataFrame.
 
@@ -593,6 +1046,7 @@ def add_all_pa_features(df: pd.DataFrame, atr_series: pd.Series) -> pd.DataFrame
     ----------
     df : DataFrame with columns time_key, open, high, low, close, volume
     atr_series : pre-computed ATR on 1-min data (used for OR ratio)
+    timeframe : "5min" or "1min". If "1min", PA features are computed directly on df without resampling.
 
     Returns
     -------
@@ -606,8 +1060,11 @@ def add_all_pa_features(df: pd.DataFrame, atr_series: pd.Series) -> pd.DataFrame
     for col in or_df.columns:
         result[col] = or_df[col].values
 
-    # --- Resample to 5-min for bar-level PA features ---
-    bars_5m = _resample_5min(result)
+    # --- Resample to desired timeframe for bar-level PA features ---
+    if timeframe == "1min":
+        bars_5m = result.copy()
+    else:
+        bars_5m = _resample_5min(result)
     if bars_5m.empty:
         # Fallback: add empty PA columns
         pa_cols = [
@@ -618,6 +1075,23 @@ def add_all_pa_features(df: pd.DataFrame, atr_series: pd.Series) -> pd.DataFrame
             "pa_regime_trend", "pa_regime_range",
             "pa_reversal_likely_fail", "pa_breakout_likely_fail",
             "pa_bars_since_trend_change", "pa_trend_weakened",
+            "pa_env_trend_dir", "pa_env_bars_since_extreme", "pa_env_trend_inertia",
+            "pa_env_inertia_bucket", "pa_env_trend_score_ratio", "pa_env_range_score_ratio",
+            "pa_env_score_ema_dir", "pa_env_score_price_vs_ema",
+            "pa_env_score_hh_hl", "pa_env_score_breakout_bar", "pa_env_score_pullback_depth",
+            "pa_env_score_pullback_duration", "pa_env_score_twenty_bar",
+            "pa_env_score_bar_quality", "pa_env_score_total", "pa_env_state",
+            "pa_env_order_type", "pa_env_entry_style", "pa_env_stop_style",
+            "pa_env_take_profit_style", "pa_env_position_size",
+            "pa_is_tight_channel", "pa_is_broad_channel", "pa_is_ttr",
+            "pa_mag20_bull", "pa_mag20_bear",
+            "pa_wedge_third_push_up", "pa_wedge_third_push_down",
+            "pa_channel_overshoot_revert_up", "pa_channel_overshoot_revert_down",
+            "pa_channel_reversal_ready",
+            "pa_breakout_success_up", "pa_breakout_success_down",
+            "pa_breakout_fail_up", "pa_breakout_fail_down",
+            "pa_measured_gap_up", "pa_measured_gap_down",
+            "pa_exhaustion_gap_up", "pa_exhaustion_gap_down",
             "pa_bull_pressure", "pa_bear_pressure", "pa_net_pressure",
             "pa_mm_target_up", "pa_mm_target_down",
             "pa_is_exhaustion_gap", "pa_is_measured_gap",
@@ -648,9 +1122,10 @@ def add_all_pa_features(df: pd.DataFrame, atr_series: pd.Series) -> pd.DataFrame
     mm = _measured_move_5m(bars_5m)
     gaps = _gap_detection_5m(bars_5m, direction_5m)
     stops = _pa_stops(bars_5m)
+    advanced = _advanced_pa_triggers_5m(bars_5m, regime, mag)
 
     # Map all 5-min features back to 1-min index
-    feature_sets = [bar_class, pullback, mag, inside, regime, twenty, pressure, mm, gaps, stops]
+    feature_sets = [bar_class, pullback, mag, inside, regime, twenty, pressure, mm, gaps, stops, advanced]
     for fset in feature_sets:
         cols = [c for c in fset.columns if c != "time_key"]
         mapped = _map_5min_to_1min(fset, times_1m, cols)

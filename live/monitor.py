@@ -366,7 +366,9 @@ class SymbolMonitor:
         benchmark: dict[str, float],
         run_date: date,
         notifier: Optional[FeishuNotifier] = None,
+        strategy_tag: str = "V3",
     ):
+        self.strategy_tag = strategy_tag
         self.symbol = symbol
         self.params = params
         self.benchmark = benchmark
@@ -408,6 +410,7 @@ class SymbolMonitor:
             "poc_slope",
             "poc_acceptance",
             "poc_factor",
+            "market_state",
             "long_entry_signal",
             "short_entry_signal",
             "long_exit_cond",
@@ -616,6 +619,7 @@ class SymbolMonitor:
         session_poc = float(snapshot.get("session_poc", np.nan))
         poc_dist_atr = float(snapshot.get("poc_dist_atr", np.nan))
         poc_factor = float(snapshot.get("poc_factor", np.nan))
+        market_state = str(snapshot.get("market_state", ""))
 
         if self.position is None:
             pos_str = "flat"
@@ -633,6 +637,7 @@ class SymbolMonitor:
             f"close={close_px:.2f} | slope={z_slope:+.6f} | "
             f"ceStop(L/S)={ce_long_stop:.2f}/{ce_short_stop:.2f} dir={ce_dir} | "
             f"poc={session_poc:.2f} dATR={poc_dist_atr:+.3f} f={poc_factor:+.3f} | "
+            f"state={market_state or 'n/a'} | "
             f"sig(en L/S={l_en}/{s_en}, ex L/S={l_ex}/{s_ex}) | "
             f"pos={pos_str}"
         )
@@ -666,6 +671,7 @@ class SymbolMonitor:
         poc_slope = float(row.get("poc_slope", np.nan))
         poc_acceptance = float(row.get("poc_acceptance", np.nan))
         poc_factor = float(row.get("poc_factor", np.nan))
+        market_state = str(row.get("pa_env_state", ""))
         session_allowed = bool(allowed.iloc[pos_in_df])
         long_entry = bool(long_sig.iloc[pos_in_df]) and atr_valid and session_allowed
         short_entry = bool(short_sig.iloc[pos_in_df]) and atr_valid and session_allowed
@@ -693,6 +699,7 @@ class SymbolMonitor:
             "poc_slope": poc_slope,
             "poc_acceptance": poc_acceptance,
             "poc_factor": poc_factor,
+            "market_state": market_state,
             "long_entry_signal": long_entry,
             "short_entry_signal": short_entry,
             "long_exit_cond": ce_sell,
@@ -745,6 +752,7 @@ class SymbolMonitor:
                     float(snapshot.get("poc_slope", np.nan)),
                     float(snapshot.get("poc_acceptance", np.nan)),
                     float(snapshot.get("poc_factor", np.nan)),
+                    str(snapshot.get("market_state", "")),
                     int(bool(snapshot.get("long_entry_signal", False))),
                     int(bool(snapshot.get("short_entry_signal", False))),
                     int(bool(snapshot.get("long_exit_cond", False))),
@@ -858,7 +866,7 @@ class SymbolMonitor:
         )
         if self.notifier is not None and self.notifier.enabled:
             self.notifier.send_text(
-                f"[ENTRY] {self.symbol} {side} | price={entry_price:.2f} | "
+                f"[{self.strategy_tag} ENTRY] {self.symbol} {side} | price={entry_price:.2f} | "
                 f"tp={take_profit:.2f} sl={stop_price:.2f} | "
                 f"time_stop={deadline.strftime('%Y-%m-%d %H:%M:%S')} | "
                 f"signal(L/S)={int(bool(snapshot.get('long_entry_signal', False)))}/"
@@ -980,7 +988,7 @@ class SymbolMonitor:
         )
         if self.notifier is not None and self.notifier.enabled:
             self.notifier.send_text(
-                f"[EXIT] {self.symbol} {side_str.upper()} | entry={pos.entry_price:.2f} "
+                f"[{self.strategy_tag} EXIT] {self.symbol} {side_str.upper()} | entry={pos.entry_price:.2f} "
                 f"exit={exit_price:.2f} | ret={trade_return:+.3%} | "
                 f"hold={held_minutes:.0f}m | reason={reason} | "
                 f"signal(exit L/S)={int(bool(snapshot.get('long_exit_cond', False)))}/"
@@ -1342,6 +1350,7 @@ def fetch_latest_tickers(
 # ---------------------------------------------------------------------------
 
 def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> int:
+    from live.pa_monitor import PAOptionsMonitor
     if OpenQuoteContext is None:
         _log_error("futu-api not installed. Run: pip install futu-api")
         return 1
@@ -1416,17 +1425,28 @@ def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> in
         for symbol, futu_code in FUTU_SYMBOLS.items():
             params = V3_BEST_PARAMS[symbol]
             benchmark = V3_BENCHMARKS[symbol]
-            mon = SymbolMonitor(
+            mon_v3 = SymbolMonitor(
                 symbol,
                 params,
                 benchmark,
                 run_date=run_date,
                 notifier=notifier,
+                strategy_tag="V3",
+            )
+            mon_pa = PAOptionsMonitor(
+                symbol,
+                params,
+                benchmark,
+                run_date=run_date,
+                notifier=notifier,
+                strategy_tag="PA",
             )
 
             history = fetch_recent_history(ctx, futu_code, days=WARMUP_DAYS)
-            mon.warm_up(history)
-            monitors[symbol] = mon
+            mon_v3.warm_up(history)
+            mon_pa.warm_up(history)
+            monitors[f"{symbol}_V3"] = mon_v3
+            monitors[f"{symbol}_PA"] = mon_pa
 
         _log_info(
             f"Ready | symbols={','.join(futu_codes)} | poll={poll_seconds}s | "
@@ -1499,11 +1519,18 @@ def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> in
                     ticker_df = fetch_latest_tickers(ctx, futu_code, count=1000) if ticker_enabled else pd.DataFrame()
                 if new_bars.empty:
                     continue
-                mon = monitors[symbol]
-                if mon.last_processed_time is not None:
-                    new_bars = new_bars[new_bars["time_key"] > mon.last_processed_time]
-                if not new_bars.empty:
-                    mon.process_new_bars(new_bars, ticker_df=ticker_df)
+                
+                for tag in ["V3", "PA"]:
+                    mon = monitors.get(f"{symbol}_{tag}")
+                    if mon is None:
+                        continue
+                    
+                    mon_new_bars = new_bars
+                    if mon.last_processed_time is not None:
+                        mon_new_bars = new_bars[new_bars["time_key"] > mon.last_processed_time]
+                        
+                    if not mon_new_bars.empty:
+                        mon.process_new_bars(mon_new_bars, ticker_df=ticker_df)
 
             now_et = _now_et()
             if _is_after_market_close_et(now_et):

@@ -55,6 +55,7 @@ def prepare_featured(symbol: str, params: RuleParams) -> pd.DataFrame:
         pseudo_cvd_method=params.pseudo_cvd_method,
         cvd_lookback=params.cvd_lookback,
         cvd_slope_lookback=params.cvd_slope_lookback,
+        pa_timeframe=getattr(params, "pa_timeframe", "5min"),
     )
     return apply_ce_features(base, params.ce_length, params.ce_multiplier)
 
