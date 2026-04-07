@@ -3115,20 +3115,27 @@ def add_pa_features(
             if c != "time_key" and c not in feature_cols:
                 feature_cols.append(c)
 
-    merged_5m = bars_5m[["time_key"]].copy()
+    merged_5m_parts = [bars_5m[["time_key"]]]
     for part in all_5m_parts:
-        for c in part.columns:
-            if c != "time_key":
-                merged_5m[c] = part[c].values
+        part_no_time = part.drop(columns=["time_key"], errors="ignore")
+        merged_5m_parts.append(part_no_time)
+    
+    # Avoid DataFrame fragmentation warning by concatenating all new columns at once
+    merged_5m = pd.concat(merged_5m_parts, axis=1)
+    
+    # Ensure no duplicate columns from potential overlaps in parts (other than time_key)
+    merged_5m = merged_5m.loc[:, ~merged_5m.columns.duplicated()]
 
     # Map 5m → 1m
     if timeframe == "1min":
-        for c in feature_cols:
-            result[c] = merged_5m[c].values
+        # Avoid DataFrame fragmentation warning by concatenating all new columns at once
+        merged_5m_subset = merged_5m[feature_cols]
+        result = pd.concat([result, merged_5m_subset], axis=1)
     else:
         mapped = _map_5min_to_1min(merged_5m, times_1m, feature_cols)
-        for c in feature_cols:
-            result[c] = mapped[c].values
+        # Avoid DataFrame fragmentation warning by concatenating all new columns at once
+        mapped_subset = mapped[feature_cols]
+        result = pd.concat([result, mapped_subset], axis=1)
 
     _append_htf_regime_from_1m(result, times_1m)
 
