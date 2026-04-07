@@ -26,7 +26,7 @@ from backtests.pa_pipeline_infer import (
     OOS_START,
     RESULTS_DIR,
     _chunked_booster_predict,
-    _chunked_l2b_regression_p_trade,
+    _apply_cp_skip,
     _tq,
     load_layered_pa_pipeline,
     materialize_layer3_features_v2,
@@ -64,7 +64,7 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     n_bars = len(df)
     emb_dim = int(p["tcn_meta"].get("bottleneck_dim", p["tcn_meta"]["num_channels"][-1]))
     embeddings = np.full((n_bars, emb_dim), np.nan, dtype=np.float32)
-    regime_probs_arr = np.full((n_bars, NUM_REGIME_CLASSES), np.nan, dtype=np.float32)
+    regime_probs_arr = np.full((n_bars, len(TCN_REGIME_FUT_PROB_COLS)), np.nan, dtype=np.float32)
 
     if len(windows) > 0:
         batch_size = max(8, int(os.environ.get("TCN_BATCH_SIZE", "4096")))
@@ -115,14 +115,15 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     l2b_feats = [c for c in p["tq_meta"]["feature_cols"] if c in df.columns]
     l2b_x = df[l2b_feats].fillna(0).values.astype(np.float32)
     rp = df[REGIME_NOW_PROB_COLS].values.astype(np.float32)
-    p_trade = _chunked_l2b_regression_p_trade(
-        l2b_x,
-        rp,
-        p["l2b_opp"],
-        p["l2b_opp_thr_vec"],
-        OOS_PRED_CHUNK,
-        desc=f"L2b step1 (reg gate) [{symbol}]",
-    )
+    
+    # Step 1: Binary Trade Gate
+    p_trade_raw = _chunked_booster_predict(p["l2b_s1"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step1 [{symbol}]")
+    
+    # Apply CP / TCN skip
+    thr_cp = p["tq_meta"]["hierarchy_thresholds"].get("thr_cp", 0.0)
+    tcn_prob = df["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in df.columns else None
+    p_trade, _ = _apply_cp_skip(rp, p_trade_raw, thr_cp, tcn_prob)
+    
     p_long = _chunked_booster_predict(p["l2b_s2"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step2 [{symbol}]")
     p_a = _chunked_booster_predict(p["l2b_s3"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step3 [{symbol}]")
 

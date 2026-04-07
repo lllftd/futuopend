@@ -142,29 +142,22 @@ def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
-def _chunked_l2b_regression_p_trade(
-    X: np.ndarray,
-    regime_probs: np.ndarray,
-    models: dict[str, dict[str, lgb.Booster]],
-    thr_vec: np.ndarray,
-    chunk: int,
-    desc: str,
-) -> np.ndarray:
-    """Step1 trade probability from regime-routed MFE/MAE heads (matches training Layer3 mapping)."""
-    n = len(X)
-    out = np.empty(n, dtype=np.float32)
-    if n == 0:
-        return out
-    n_chunk = (n + chunk - 1) // chunk
-    for start in _tq(range(0, n, chunk), desc=desc, unit="chunk", total=n_chunk):
-        end = min(start + chunk, n)
-        x_b = X[start:end]
-        rp = regime_probs[start:end]
-        opp = _compute_opportunity_scores_infer(x_b, rp, models)
-        gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)  # L2a class idx; predicted_regime = REGIMES_6[gix]
-        thr_row = thr_vec[gix]
-        out[start:end] = _opp_to_synthetic_p_trade(opp, thr_row)
-    return out
+def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float, tcn_transition_prob: np.ndarray = None) -> tuple[np.ndarray, np.ndarray]:
+    """Apply Conformal Prediction prediction sets and TCN transition signal to filter out uncertain/OOS trades."""
+    y_set = regime_probs >= thr_cp
+    set_size = y_set.sum(axis=1)
+    contains_bull = y_set[:, 0] | y_set[:, 1]
+    contains_bear = y_set[:, 2] | y_set[:, 3]
+    is_conflicting = contains_bull & contains_bear
+    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0)
+    
+    if tcn_transition_prob is not None:
+        high_transition_risk = tcn_transition_prob > 0.70
+        skip_cp = skip_cp | high_transition_risk
+        
+    p_trade_adj = p_trade.copy()
+    p_trade_adj[skip_cp] = 0.0
+    return p_trade_adj, skip_cp
 
 
 def _chunked_booster_predict(model: lgb.Booster, X: np.ndarray, chunk: int, desc: str) -> np.ndarray:
@@ -238,6 +231,7 @@ def load_layered_pa_pipeline():
         raise FileNotFoundError(
             "L2b regression Step1: no opp models loaded; check regression_gate.model_files.",
         )
+    l2b_step1 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_gate_step1.txt"))
     l2b_step2 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_dir_step2.txt"))
     l2b_step3 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_grade_step3.txt"))
 
@@ -265,6 +259,7 @@ def load_layered_pa_pipeline():
         "tq_meta": tq_meta,
         "l2b_opp": l2b_opp,
         "l2b_opp_thr_vec": l2b_opp_thr_vec,
+        "l2b_s1": l2b_step1,
         "l2b_s2": l2b_step2,
         "l2b_s3": l2b_step3,
         "l3_model": l3_model,
