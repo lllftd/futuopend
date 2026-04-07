@@ -60,18 +60,18 @@ import torch.nn as nn
 from sklearn.calibration import calibration_curve
 from sklearn.cluster import KMeans
 from sklearn.isotonic import IsotonicRegression
-    from sklearn.metrics import (
-        accuracy_score,
-        brier_score_loss,
-        classification_report,
-        confusion_matrix,
-        f1_score,
-        fbeta_score,
-        log_loss,
-        precision_score,
-        recall_score,
-        roc_auc_score,
-    )
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    fbeta_score,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1364,44 +1364,44 @@ def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
-    def _layer3_fill_p_trade_from_regression(
-        trade_quality_models: dict,
-        work: pd.DataFrame,
-        layer2_feats: list[str],
-        p_trade: np.ndarray,
-        p_long: np.ndarray,
-        p_a: np.ndarray,
-        chunk: int,
-    ) -> None:
-        s1 = trade_quality_models.get("step1_binary")
-        s2 = trade_quality_models["step2"]
-        s3 = trade_quality_models["step3"]
-        regb = trade_quality_models.get("step1_regression")
-        
-        regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
-        models = _l2b_nested_opp_models(regb) if regb else {}
-        thr_vec = regb["thr_vec"] if regb else None
-    
-        n = len(work)
-        n_chunk = (n + chunk - 1) // chunk
-        for i in _tq(range(0, n, chunk), desc="Layer3 trade stack", total=n_chunk, unit="chunk"):
-            j = min(i + chunk, n)
-            x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
-            
-            if s1 is not None:
-                raw_p = s1.predict(x_b)
-                rp = regime_mat[i:j]
-                p_rm = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
-                p_trade[i:j] = raw_p * (1.0 - 0.7 * p_rm)
-            else:
-                rp = regime_mat[i:j]
-                opp = _compute_opportunity_scores(x_b, rp, models)
-                gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)
-                thr_row = thr_vec[gix]
-                p_trade[i:j] = _opp_to_synthetic_p_trade(opp, thr_row)
-                
-            p_long[i:j] = s2.predict(x_b)
-            p_a[i:j] = s3.predict(x_b)
+def _layer3_fill_p_trade_from_regression(
+    trade_quality_models: dict,
+    work: pd.DataFrame,
+    layer2_feats: list[str],
+    p_trade: np.ndarray,
+    p_long: np.ndarray,
+    p_a: np.ndarray,
+    chunk: int,
+) -> None:
+    s1 = trade_quality_models.get("step1_binary")
+    s2 = trade_quality_models["step2"]
+    s3 = trade_quality_models["step3"]
+    regb = trade_quality_models.get("step1_regression")
+
+    regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
+    models = _l2b_nested_opp_models(regb) if regb else {}
+    thr_vec = regb["thr_vec"] if regb else None
+
+    n = len(work)
+    n_chunk = (n + chunk - 1) // chunk
+    for i in _tq(range(0, n, chunk), desc="Layer3 trade stack", total=n_chunk, unit="chunk"):
+        j = min(i + chunk, n)
+        x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
+
+        if s1 is not None:
+            raw_p = s1.predict(x_b)
+            rp = regime_mat[i:j]
+            p_rm = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
+            p_trade[i:j] = raw_p * (1.0 - 0.7 * p_rm)
+        else:
+            rp = regime_mat[i:j]
+            opp = _compute_opportunity_scores(x_b, rp, models)
+            gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)
+            thr_row = thr_vec[gix]
+            p_trade[i:j] = _opp_to_synthetic_p_trade(opp, thr_row)
+
+        p_long[i:j] = s2.predict(x_b)
+        p_a[i:j] = s3.predict(x_b)
 
 
 def compute_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
