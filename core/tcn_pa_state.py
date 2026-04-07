@@ -9,10 +9,38 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _default_bottleneck_dim() -> int:
     return max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for multi-class classification.
+    gamma=0 退化为标准 weighted CE。
+    """
+    def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0, reduction: str = 'mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        if alpha is not None:
+            self.register_buffer('alpha', alpha.float())
+        else:
+            self.alpha = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce)
+        focal_term = (1.0 - pt) ** self.gamma
+        loss = focal_term * ce
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 
 class SpatialDropout1d(nn.Module):

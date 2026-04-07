@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
-from core.tcn_pa_state import PAStateTCN
+from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 warnings.filterwarnings("ignore")
 
@@ -167,16 +167,17 @@ def _pa_feature_cols(df: pd.DataFrame) -> list[str]:
     """Select only continuous PA features for TCN (ignore discrete/boolean/targets)."""
     exclude = {"object", "category", "bool"}
     
-    # We only want continuous features. Exclude ones that are known to be binary/discrete/absolute
+    # Exclude non-continuous/non-boolean absolute targets
     exclude_substrings = [
-        "is_", "count", "state", "breakout", "signal", "outcome", 
+        "count", "state", "signal", "outcome", 
         "max_favorable", "max_adverse", "exit_bar", "reward_risk",
         "stop_", "nearest_", "target", "retrace", "round_number",
         "double_top", "double_bottom", "wedge", "overshoot", "channel_reversal",
         "head_shoulders", "or_", "pa_struct_break", "pa_hmm_", "prev_day"
     ]
     
-    cols = []
+    continuous_cols = []
+    bool_cols = []
     for c in df.columns:
         if not c.startswith("pa_"):
             continue
@@ -186,9 +187,15 @@ def _pa_feature_cols(df: pd.DataFrame) -> list[str]:
         if any(sub in c for sub in exclude_substrings):
             continue
             
-        cols.append(c)
+        if c.startswith(("pa_is_", "pa_breakout_")) and df[c].nunique(dropna=True) <= 2:
+            bool_cols.append(c)
+        else:
+            continuous_cols.append(c)
+
+    for c in bool_cols:
+        df[c] = df[c].astype(np.float32)
         
-    return sorted(cols)
+    return sorted(continuous_cols + bool_cols), sorted(bool_cols)
 
 
 def _count_sequences(df_1m: pd.DataFrame, seq_len: int) -> int:
@@ -252,6 +259,7 @@ def _zscore_stats_train_memmap(
     mm: np.memmap,
     train_idx: np.ndarray,
     n_feat: int,
+    bool_indices: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     sum_x = np.zeros(n_feat, dtype=np.float64)
     cnt_x = np.zeros(n_feat, dtype=np.float64)
@@ -287,6 +295,12 @@ def _zscore_stats_train_memmap(
         sum_sq += np.sum(np.where(fin, d * d, 0.0), axis=0)
     std = np.sqrt(sum_sq / np.maximum(cnt_x - 1.0, 1.0))
     std = np.where(std < 1e-8, 1.0, std)
+    
+    if bool_indices:
+        for idx in bool_indices:
+            mean[idx] = 0.0
+            std[idx] = 1.0
+            
     return mean.astype(np.float32), std.astype(np.float32)
 
 
@@ -348,8 +362,8 @@ def prepare_data():
         ms.groupby(df["symbol"]).transform(lambda s: s.shift(-15)).fillna(4).astype(int)
     )
 
-    feat_cols = _pa_feature_cols(df)
-    print(f"  Feature columns: {len(feat_cols)}")
+    feat_cols, bool_cols = _pa_feature_cols(df)
+    print(f"  PA features: {len(feat_cols) - len(bool_cols)} continuous + {len(bool_cols)} boolean = {len(feat_cols)} total")
 
     # Create sequences (with safe fallback if window too long for intraday bars)
     seq_len_used = SEQ_LEN
@@ -408,7 +422,8 @@ def prepare_data():
     )
 
     print("  Z-score stats (train rows, chunked)…", flush=True)
-    feat_mean, feat_std = _zscore_stats_train_memmap(mm, train_idx, n_feat)
+    bool_indices = {i for i, c in enumerate(feat_cols) if c in bool_cols}
+    feat_mean, feat_std = _zscore_stats_train_memmap(mm, train_idx, n_feat, bool_indices=bool_indices)
     print("  Normalizing memmap in-place (chunked)…", flush=True)
     _normalize_memmap_inplace(mm, feat_mean, feat_std)
     print("  Normalization done.", flush=True)
@@ -482,7 +497,16 @@ def _train_tcn_model(
     class_weights /= class_weights.mean()
     class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(dev)
 
-    criterion_train = nn.CrossEntropyLoss(weight=class_weights_t, label_smoothing=0.1)
+    focal_gamma = float(os.environ.get("FOCAL_GAMMA", "0.0"))
+    if focal_gamma > 0.0:
+        criterion_train = FocalLoss(alpha=class_weights_t, gamma=focal_gamma)
+        if show_model_summary:
+            print(f"  Loss: FocalLoss(gamma={focal_gamma}) + class_weights")
+    else:
+        criterion_train = nn.CrossEntropyLoss(weight=class_weights_t)
+        if show_model_summary:
+            print("  Loss: CrossEntropyLoss(no_smoothing) + class_weights")
+
     criterion_eval = nn.CrossEntropyLoss(weight=class_weights_t)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=5e-4)

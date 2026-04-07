@@ -74,6 +74,9 @@ from sklearn.metrics import (
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
 from core.tcn_pa_state import PAStateTCN
@@ -788,53 +791,58 @@ def _compute_sample_weights(y: np.ndarray, timestamps: np.ndarray) -> np.ndarray
     return weights
 
 
-def _grid_search_params(
+def _optuna_search_params(
     X_train, y_train, w_train,
     X_cal, y_cal,
     feat_cols: list[str],
     base_params: dict,
+    n_trials: int = 30,
 ) -> dict:
-    """Search over num_leaves and max_depth combinations."""
-    full_search_space = [
-        {"num_leaves": 63,  "max_depth": 7},
-        {"num_leaves": 63,  "max_depth": 8},
-        {"num_leaves": 127, "max_depth": 8},
-        {"num_leaves": 127, "max_depth": 9},
-        {"num_leaves": 127, "max_depth": -1},
-        {"num_leaves": 255, "max_depth": 9},
-        {"num_leaves": 255, "max_depth": 10},
-    ]
-    search_space = full_search_space[:3] if FAST_TRAIN_MODE else full_search_space
-    gs_rounds = 800 if FAST_TRAIN_MODE else 2000
-    gs_es = 40 if FAST_TRAIN_MODE else 60
-
-    best_score = float("inf")
-    best_combo = search_space[0]
-
+    """Restricted Optuna search for sensitive hyperparameters to prevent overfitting."""
     mode_name = "FAST" if FAST_TRAIN_MODE else "FULL"
-    print(f"\n  Grid search over {len(search_space)} param combos ({mode_name} mode):")
-    _require_lgb_matrix_matches_names(X_train, feat_cols, "Layer 2a grid search")
-    for combo in _tq(search_space, desc="L2a grid search", unit="combo"):
-        p = {**base_params, **combo}
-        train_data = lgb.Dataset(X_train, label=y_train, weight=w_train,
-                                 feature_name=feat_cols, free_raw_data=False)
-        valid_data = lgb.Dataset(X_cal, label=y_cal,
-                                 feature_name=feat_cols, free_raw_data=False)
-        model = lgb.train(
-            p, train_data, num_boost_round=gs_rounds, valid_sets=[valid_data],
-            callbacks=[lgb.early_stopping(gs_es, verbose=False)],
-        )
-        score = model.best_score["valid_0"]["multi_logloss"]
-        marker = " ★" if score < best_score else ""
-        print(f"    leaves={combo['num_leaves']:<4d}  depth={combo['max_depth']:<3d}  "
-              f"logloss={score:.5f}  rounds={model.best_iteration}{marker}")
-        if score < best_score:
-            best_score = score
-            best_combo = combo
+    print(f"\n  Optuna search over {n_trials} trials ({mode_name} mode):")
+    _require_lgb_matrix_matches_names(X_train, feat_cols, "Layer 2a Optuna search")
 
-    print(f"  → Best: leaves={best_combo['num_leaves']}  depth={best_combo['max_depth']}  "
-          f"logloss={best_score:.5f}")
-    return best_combo
+    # Limit search space for faster processing when FAST_TRAIN_MODE is enabled
+    actual_trials = min(10, n_trials) if FAST_TRAIN_MODE else n_trials
+
+    # We evaluate on Cal, so we want to be very careful not to overfit it
+    # Use early stopping but fewer rounds to speed up the search
+    optuna_rounds = 800 if FAST_TRAIN_MODE else 2000
+    optuna_es = 40 if FAST_TRAIN_MODE else 60
+
+    train_data = lgb.Dataset(X_train, label=y_train, weight=w_train,
+                             feature_name=feat_cols, free_raw_data=False)
+    valid_data = lgb.Dataset(X_cal, label=y_cal,
+                             feature_name=feat_cols, free_raw_data=False)
+
+    def objective(trial):
+        p = base_params.copy()
+        p["num_leaves"] = trial.suggest_int("num_leaves", 15, 63)
+        p["learning_rate"] = trial.suggest_float("learning_rate", 0.03, 0.1, log=True)
+        # Lock all other parameters to base_params to prevent small-data noise
+
+        model = lgb.train(
+            p, train_data, num_boost_round=optuna_rounds, valid_sets=[valid_data],
+            callbacks=[
+                lgb.early_stopping(optuna_es, verbose=False),
+            ],
+        )
+        if model.best_iteration < 10:
+            raise optuna.TrialPruned()
+        return model.best_score["valid_0"]["multi_logloss"]
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=42)
+    )
+    study.optimize(objective, n_trials=actual_trials, show_progress_bar=False)
+
+    best = study.best_params
+    print(f"  → Best Optuna params (n={actual_trials}): num_leaves={best['num_leaves']}  "
+          f"learning_rate={best['learning_rate']:.4f}  logloss={study.best_value:.5f}")
+
+    return {**base_params, **best}
 
 
 def _regime_lgbm_feature_cols(feat_cols: list[str]) -> list[str]:
@@ -902,8 +910,8 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
 
     print(f"  Train: {len(y_train):,}  |  Cal: {len(y_cal):,}  |  Test: {len(y_test):,}")
 
-    best_combo = _grid_search_params(
-        X_train, y_train, w_train, X_cal, y_cal, pa_only_feats, base_params,
+    best_combo = _optuna_search_params(
+        X_train, y_train, w_train, X_cal, y_cal, pa_only_feats, base_params, n_trials=30
     )
     params = {**base_params, **best_combo}
 
@@ -1187,14 +1195,21 @@ def _train_regime_opp_regression_models(
         mae_p = models[predicted_regime]["mae"].predict(X_ca[m])
         mfe_p = np.clip(mfe_p, 0.0, None)
         mae_p = np.clip(mae_p, 0.01, None)
-        opp_cal[m] = mfe_p / (mae_p + 0.1)
+        opp_cal[m] = np.log1p(mfe_p) - np.log1p(mae_p)
+
+    opp_nonzero = opp_cal[opp_cal != 0]
+    if len(opp_nonzero) > 0:
+        print(f"  [L2b regression] opportunity(log-ratio) dist (cal): "
+              f"min={np.min(opp_nonzero):.3f} 25%={np.percentile(opp_nonzero, 25):.3f} "
+              f"median={np.median(opp_nonzero):.3f} 75%={np.percentile(opp_nonzero, 75):.3f} "
+              f"max={np.max(opp_nonzero):.3f}")
 
     opp_thr: dict[str, float] = {}
     for argmax_idx, predicted_regime in enumerate(REGIMES_6):
         m = gix_cal == argmax_idx
         n_routed = int(m.sum())
         if predicted_regime not in models or n_routed < min_cal_for_opp_thr:
-            opp_thr[predicted_regime] = float(os.environ.get(f"L2B_OPP_THR_{predicted_regime.upper()}", "1.0"))
+            opp_thr[predicted_regime] = float(os.environ.get(f"L2B_OPP_THR_{predicted_regime.upper()}", "0.0"))
             why = "no model" if predicted_regime not in models else f"routed cal n={n_routed} < {min_cal_for_opp_thr}"
             print(
                 f"  [L2b regression] {predicted_regime}: fallback opp_thr={opp_thr[predicted_regime]:.2f} ({why})",
@@ -1202,8 +1217,8 @@ def _train_regime_opp_regression_models(
             continue
         y_true = y_trade_cal[m]
         o = opp_cal[m]
-        best_f1, best_thr, best_row = 0.0, 1.0, None
-        for thr in np.arange(0.3, 5.0, 0.1):
+        best_f1, best_thr, best_row = 0.0, 0.0, None
+        for thr in np.arange(-1.0, 3.0, 0.1):
             pred = (o >= thr).astype(int)
             prec = precision_score(y_true, pred, zero_division=0)
             rec = recall_score(y_true, pred, zero_division=0)
@@ -1212,7 +1227,7 @@ def _train_regime_opp_regression_models(
                 best_f1, best_thr = f1v, float(thr)
                 best_row = (prec, rec, f1v)
         if best_row is None:
-            best_thr = float(os.environ.get(f"L2B_OPP_THR_{predicted_regime.upper()}", "1.0"))
+            best_thr = float(os.environ.get(f"L2B_OPP_THR_{predicted_regime.upper()}", "0.0"))
             print(
                 f"  [L2b regression] {predicted_regime}: no thr met prec>={min_prec}; fallback thr={best_thr:.2f}",
             )
@@ -1260,7 +1275,7 @@ def _compute_opportunity_triplet(
         ma = models[predicted_regime]["mae"].predict(X[m])
         mf = np.clip(mf, 0.0, None)
         ma = np.clip(ma, 0.01, None)
-        opp[m] = mf / (ma + 0.1)
+        opp[m] = np.log1p(mf) - np.log1p(ma)
         mfe_p[m] = mf
         mae_p[m] = ma
     return opp, mfe_p, mae_p
@@ -1280,7 +1295,7 @@ def _l2b_triplet_from_trade_prob(p_trade: np.ndarray) -> tuple[np.ndarray, np.nd
     pt = np.clip(p_trade.astype(np.float64), 0.0, 1.0)
     mf = np.clip(2.0 * pt, 0.0, 5.0)
     ma = np.clip(0.5 + 0.5 * (1.0 - pt), 0.01, 4.0)
-    opp = mf / (ma + 0.1)
+    opp = np.log1p(mf) - np.log1p(ma)
     return opp, mf, ma
 
 
