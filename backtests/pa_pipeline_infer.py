@@ -251,12 +251,18 @@ def load_layered_pa_pipeline():
         l3_size = None
         l3_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, "execution_sizer_v1.txt"))
 
-    # Layer 4: Exit Manager (Multi-class Binning + Survival Proxy)
+    # Layer 4: Exit Manager (Ordinal EVT / Multi-class Binning + Survival Proxy)
     try:
         with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "rb") as f:
             l4_meta = pickle.load(f)
-        l4_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["tp"]))
-        l4_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["sl"]))
+        
+        if l4_meta.get("l4_schema", 1) >= 3:
+            l4_tp = [lgb.Booster(model_file=os.path.join(MODEL_DIR, fn)) for fn in l4_meta["model_files"]["tp_ordinal"]]
+            l4_sl = [lgb.Booster(model_file=os.path.join(MODEL_DIR, fn)) for fn in l4_meta["model_files"]["sl_ordinal"]]
+        else:
+            l4_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["tp"]))
+            l4_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["sl"]))
+            
         l4_time = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["time"]))
     except Exception:
         l4_meta = None

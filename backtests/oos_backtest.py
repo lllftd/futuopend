@@ -158,8 +158,36 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         )
         exec_size = np.clip(exec_size, -1.5, 1.5)
 
-    # Layer 4 Execution (Multi-class Binning & Survival)
-    if p.get("l4_tp") and p.get("l4_sl") and p.get("l4_time"):
+    # Layer 4 Execution (Ordinal EVT / Multi-class Binning & Survival)
+    if p.get("l4_meta") and p["l4_meta"].get("l4_schema", 1) >= 3:
+        # Ordinal approach
+        tp_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])
+        sl_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 SL>{k} [{symbol}]") for k, m in enumerate(p["l4_sl"])])
+        
+        # Enforce monotonicity: P(>0) >= P(>1) >= P(>2)
+        tp_probs[:, 1] = np.minimum(tp_probs[:, 0], tp_probs[:, 1])
+        tp_probs[:, 2] = np.minimum(tp_probs[:, 1], tp_probs[:, 2])
+        sl_probs[:, 1] = np.minimum(sl_probs[:, 0], sl_probs[:, 1])
+        sl_probs[:, 2] = np.minimum(sl_probs[:, 1], sl_probs[:, 2])
+        
+        # Exact probabilities for 4 bins
+        tp_p_exact = np.column_stack([1.0 - tp_probs[:, 0], tp_probs[:, 0] - tp_probs[:, 1], tp_probs[:, 1] - tp_probs[:, 2], tp_probs[:, 2]])
+        sl_p_exact = np.column_stack([1.0 - sl_probs[:, 0], sl_probs[:, 0] - sl_probs[:, 1], sl_probs[:, 1] - sl_probs[:, 2], sl_probs[:, 2]])
+        
+        tp_centers = np.array([0.25, 0.85, 1.85, 3.5])
+        sl_centers = np.array([0.25, 0.75, 1.25, 2.0])
+        
+        pred_tp_atr = np.sum(tp_p_exact * tp_centers, axis=1)
+        pred_sl_atr = np.sum(sl_p_exact * sl_centers, axis=1)
+        pred_time = _chunked_booster_predict(p["l4_time"], l3_x, OOS_PRED_CHUNK, desc=f"L4 Time [{symbol}]")
+        
+        evt_tp_max = p["l4_meta"].get("evt_tp_max", 5.0)
+        evt_sl_max = p["l4_meta"].get("evt_sl_max", 3.0)
+        pred_tp_atr = np.clip(pred_tp_atr, 0.1, evt_tp_max)
+        pred_sl_atr = np.clip(pred_sl_atr, 0.1, evt_sl_max)
+        
+    elif p.get("l4_tp") and p.get("l4_sl") and p.get("l4_time"):
+        # Old multiclass approach
         pred_tp_prob = _chunked_booster_predict(p["l4_tp"], l3_x, OOS_PRED_CHUNK, desc=f"L4 TP [{symbol}]")
         pred_sl_prob = _chunked_booster_predict(p["l4_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L4 SL [{symbol}]")
         pred_time = _chunked_booster_predict(p["l4_time"], l3_x, OOS_PRED_CHUNK, desc=f"L4 Time [{symbol}]")
@@ -191,6 +219,11 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     tp_price = 0.0
     entry_time = None
     max_hold = 30
+    
+    # Hawkes parameters
+    hawkes_decay = np.exp(-1.0 / 6.0) # ~6 bars decay (30 mins)
+    hawkes_lambda = 0.0
+    hawkes_threshold = 2.5 # Critical threshold for emergency exit
 
     n_sim = max(0, len(df) - 2)
     bar_range = range(1, len(df) - 1)
@@ -200,6 +233,12 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         nxt_high = df["high"].iloc[i + 1]
         nxt_low = df["low"].iloc[i + 1]
         nxt_time = df["time_key"].iloc[i + 1]
+        
+        # Hawkes online update
+        ret_i = abs(df["close"].iloc[i] / df["open"].iloc[i] - 1.0)
+        atr_pct = atr_arr[i] / df["open"].iloc[i] if df["open"].iloc[i] > 0 else 1e-5
+        jump = 1.0 if ret_i > 1.5 * atr_pct else 0.0
+        hawkes_lambda = hawkes_lambda * hawkes_decay + jump
 
         if in_pos == 0:
             if sz > 0.6:
@@ -226,48 +265,60 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
             exit_reason = ""
 
             if in_pos == 1:
-                # Trailing Stop: move SL to break-even if we are 1 ATR in profit
-                if nxt_high > entry_price + atr_arr[i]:
-                    sl_price = max(sl_price, entry_price + atr_arr[i] * 0.1)
-                
-                if nxt_low <= sl_price:
-                    exit_signal = True
-                    exit_price = min(sl_price, float(nxt_open))
-                    exit_reason = "SL"
-                elif nxt_high >= tp_price:
-                    exit_signal = True
-                    exit_price = max(tp_price, float(nxt_open))
-                    exit_reason = "TP"
-                elif sz < -0.2:
+                # Emergency Exit (BOCPD Proxy / Hawkes Volatility Spike)
+                if hawkes_lambda > hawkes_threshold:
                     exit_signal = True
                     exit_price = float(nxt_open)
-                    exit_reason = "Signal_Flip"
-                elif hold >= max_hold:
-                    exit_signal = True
-                    exit_price = float(nxt_open)
-                    exit_reason = "Time_Stop"
+                    exit_reason = "Hawkes_BOCPD_Panic"
+                else:
+                    # Trailing Stop: move SL to break-even if we are 1 ATR in profit
+                    if nxt_high > entry_price + atr_arr[i]:
+                        sl_price = max(sl_price, entry_price + atr_arr[i] * 0.1)
+                    
+                    if nxt_low <= sl_price:
+                        exit_signal = True
+                        exit_price = min(sl_price, float(nxt_open))
+                        exit_reason = "SL"
+                    elif nxt_high >= tp_price:
+                        exit_signal = True
+                        exit_price = max(tp_price, float(nxt_open))
+                        exit_reason = "TP"
+                    elif sz < -0.2:
+                        exit_signal = True
+                        exit_price = float(nxt_open)
+                        exit_reason = "Signal_Flip"
+                    elif hold >= max_hold:
+                        exit_signal = True
+                        exit_price = float(nxt_open)
+                        exit_reason = "Time_Stop"
 
             elif in_pos == -1:
-                # Trailing Stop: move SL to break-even if we are 1 ATR in profit
-                if nxt_low < entry_price - atr_arr[i]:
-                    sl_price = min(sl_price, entry_price - atr_arr[i] * 0.1)
+                # Emergency Exit (BOCPD Proxy / Hawkes Volatility Spike)
+                if hawkes_lambda > hawkes_threshold:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Hawkes_BOCPD_Panic"
+                else:
+                    # Trailing Stop: move SL to break-even if we are 1 ATR in profit
+                    if nxt_low < entry_price - atr_arr[i]:
+                        sl_price = min(sl_price, entry_price - atr_arr[i] * 0.1)
 
-                if nxt_high >= sl_price:
-                    exit_signal = True
-                    exit_price = max(sl_price, float(nxt_open))
-                    exit_reason = "SL"
-                elif nxt_low <= tp_price:
-                    exit_signal = True
-                    exit_price = min(tp_price, float(nxt_open))
-                    exit_reason = "TP"
-                elif sz > 0.2:
-                    exit_signal = True
-                    exit_price = float(nxt_open)
-                    exit_reason = "Signal_Flip"
-                elif hold >= max_hold:
-                    exit_signal = True
-                    exit_price = float(nxt_open)
-                    exit_reason = "Time_Stop"
+                    if nxt_high >= sl_price:
+                        exit_signal = True
+                        exit_price = max(sl_price, float(nxt_open))
+                        exit_reason = "SL"
+                    elif nxt_low <= tp_price:
+                        exit_signal = True
+                        exit_price = min(tp_price, float(nxt_open))
+                        exit_reason = "TP"
+                    elif sz > 0.2:
+                        exit_signal = True
+                        exit_price = float(nxt_open)
+                        exit_reason = "Signal_Flip"
+                    elif hold >= max_hold:
+                        exit_signal = True
+                        exit_price = float(nxt_open)
+                        exit_reason = "Time_Stop"
 
             if exit_signal:
                 ret = (exit_price / entry_price - 1.0) * in_pos

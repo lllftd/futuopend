@@ -2572,32 +2572,51 @@ def train_exit_manager_layer4(
     rounds = 800 if FAST_TRAIN_MODE else 2000
     es_cb = _lgb_train_callbacks(60 if FAST_TRAIN_MODE else 100)
 
-    print("  Training TP Multi-class Binning Classifier (4 Bins)...")
-    tp_params = {
-        "objective": "multiclass",
-        "num_class": 4,
-        "metric": "multi_logloss",
-        "boosting_type": "gbdt",
-        "learning_rate": 0.02,
-        "num_leaves": 31,
-        "max_depth": 5,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "verbosity": -1,
-        "seed": 54,
-        "n_jobs": _lgbm_n_jobs(),
-    }
-    d_tp_tr = lgb.Dataset(X_train, label=y_tp_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
-    d_tp_va = lgb.Dataset(X_test, label=y_tp_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
-    model_tp = lgb.train(tp_params, d_tp_tr, num_boost_round=rounds, valid_sets=[d_tp_va], callbacks=es_cb)
+    print("  Training TP Ordinal Regressor (3 Binary Classifiers)...")
+    tp_models = []
+    for k in range(3):
+        print(f"    -> TP > {k} ...")
+        tp_params = {
+            "objective": "binary",
+            "metric": "auc",
+            "boosting_type": "gbdt",
+            "learning_rate": 0.02,
+            "num_leaves": 31,
+            "max_depth": 5,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 5,
+            "verbosity": -1,
+            "seed": 54 + k,
+            "n_jobs": _lgbm_n_jobs(),
+        }
+        y_bin_tr = (y_tp_train > k).astype(np.int32)
+        y_bin_te = (y_tp_test > k).astype(np.int32)
+        
+        pos_w = len(y_bin_tr) / max(y_bin_tr.sum(), 1)
+        w_tr_adj = w_train * np.where(y_bin_tr == 1, pos_w, 1.0)
+        
+        d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
+        d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+        m = lgb.train(tp_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb)
+        tp_models.append(m)
 
-    print("  Training SL Multi-class Binning Classifier (4 Bins)...")
-    sl_params = tp_params.copy()
-    sl_params["seed"] = 55
-    d_sl_tr = lgb.Dataset(X_train, label=y_sl_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
-    d_sl_va = lgb.Dataset(X_test, label=y_sl_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
-    model_sl = lgb.train(sl_params, d_sl_tr, num_boost_round=rounds, valid_sets=[d_sl_va], callbacks=es_cb)
+    print("  Training SL Ordinal Regressor (3 Binary Classifiers)...")
+    sl_models = []
+    for k in range(3):
+        print(f"    -> SL > {k} ...")
+        sl_params = tp_params.copy()
+        sl_params["seed"] = 64 + k
+        y_bin_tr = (y_sl_train > k).astype(np.int32)
+        y_bin_te = (y_sl_test > k).astype(np.int32)
+        
+        pos_w = len(y_bin_tr) / max(y_bin_tr.sum(), 1)
+        w_tr_adj = w_train * np.where(y_bin_tr == 1, pos_w, 1.0)
+        
+        d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
+        d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+        m = lgb.train(sl_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb)
+        sl_models.append(m)
 
     print("  Training Time Survival Proxy (Poisson Regression on Holding Bars)...")
     time_params = {
@@ -2620,19 +2639,30 @@ def train_exit_manager_layer4(
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     EXECUTION_SIZER_TIME_FILE = "execution_sizer_time.txt"
-    model_tp.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TP_FILE))
-    model_sl.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SL_FILE))
+    model_tp_files = [f"execution_sizer_tp_gt{k}.txt" for k in range(3)]
+    model_sl_files = [f"execution_sizer_sl_gt{k}.txt" for k in range(3)]
+    
+    for k, m in enumerate(tp_models):
+        m.save_model(os.path.join(MODEL_DIR, model_tp_files[k]))
+    for k, m in enumerate(sl_models):
+        m.save_model(os.path.join(MODEL_DIR, model_sl_files[k]))
+        
     model_time.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TIME_FILE))
 
+    evt_tp_max = float(np.percentile(mfe_atr[mfe_atr > 0], 99.5)) if (mfe_atr > 0).any() else 5.0
+    evt_sl_max = float(np.percentile(mae_atr[mae_atr > 0], 99.5)) if (mae_atr > 0).any() else 3.0
+
     meta = {
-        "l4_schema": 2,
-        "type": "exit_manager_binning_and_survival",
+        "l4_schema": 3,
+        "type": "exit_manager_ordinal_evt_bocpd_hawkes",
         "feature_cols": exec_feat_cols,
         "tp_bins": [0.5, 1.2, 2.5],
         "sl_bins": [0.5, 1.0, 1.5],
+        "evt_tp_max": evt_tp_max,
+        "evt_sl_max": evt_sl_max,
         "model_files": {
-            "tp": EXECUTION_SIZER_TP_FILE,
-            "sl": EXECUTION_SIZER_SL_FILE,
+            "tp_ordinal": model_tp_files,
+            "sl_ordinal": model_sl_files,
             "time": EXECUTION_SIZER_TIME_FILE,
         },
     }
@@ -2640,9 +2670,10 @@ def train_exit_manager_layer4(
     with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "wb") as f:
         pickle.dump(meta, f)
         
-    print(f"\n  Layer 4 Models saved → {MODEL_DIR}/{EXECUTION_SIZER_TP_FILE}, {EXECUTION_SIZER_SL_FILE}, {EXECUTION_SIZER_TIME_FILE}")
+    print(f"\n  Layer 4 Models saved → {MODEL_DIR}/execution_sizer_tp_gt*.txt, execution_sizer_sl_gt*.txt, {EXECUTION_SIZER_TIME_FILE}")
     print(f"  Layer 4 Meta saved  → {MODEL_DIR}/exit_manager_meta.pkl")
-    return {"tp": model_tp, "sl": model_sl, "time": model_time, "meta": meta}
+    print(f"  EVT Bounds (99.5% Tail): TP_max={evt_tp_max:.2f} ATR, SL_max={evt_sl_max:.2f} ATR")
+    return {"tp_models": tp_models, "sl_models": sl_models, "time": model_time, "meta": meta}
 
 
 # ───────────────────────────────────────────────────────────────────────
