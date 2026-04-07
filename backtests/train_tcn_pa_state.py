@@ -190,16 +190,15 @@ def _count_sequences(df_1m: pd.DataFrame, seq_len: int) -> int:
     """Count valid within-day windows without materializing feature tensors."""
     n = 0
     for _, grp in df_1m.groupby("symbol"):
-        grp = grp.sort_values("time_key").reset_index(drop=True)
         if len(grp) < seq_len:
             continue
-        timestamps = grp["time_key"].values
-        dates = pd.to_datetime(timestamps).date
-        for start in range(len(grp) - seq_len + 1):
-            end = start + seq_len
-            if dates[start] != dates[end - 1]:
-                continue
-            n += 1
+        grp = grp.sort_values("time_key").reset_index(drop=True)
+        dates = pd.to_datetime(grp["time_key"].values).date
+        
+        start_dates = dates[:-seq_len + 1]
+        end_dates = dates[seq_len - 1:]
+        valid_mask = start_dates == end_dates
+        n += valid_mask.sum()
     return n
 
 
@@ -210,6 +209,8 @@ def _fill_sequences_memmap(
     seq_len: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Write all sequences into mm; return (y, time_key, symbol) per row."""
+    from numpy.lib.stride_tricks import sliding_window_view
+    
     n = mm.shape[0]
     y_out = np.empty(n, dtype=np.int64)
     ts_out = np.empty(n, dtype="datetime64[ns]")
@@ -221,22 +222,33 @@ def _fill_sequences_memmap(
         unit="sym",
         total=int(df_1m["symbol"].nunique()),
     ):
-        grp = grp.sort_values("time_key").reset_index(drop=True)
         if len(grp) < seq_len:
             continue
+        grp = grp.sort_values("time_key").reset_index(drop=True)
+        
         feats = grp[feat_cols].values.astype(np.float32)
         labels = grp["state_label"].values.astype(np.int64)
         timestamps = grp["time_key"].values
         dates = pd.to_datetime(timestamps).date
-        for start in range(len(grp) - seq_len + 1):
-            end = start + seq_len
-            if dates[start] != dates[end - 1]:
-                continue
-            mm[row] = feats[start:end]
-            y_out[row] = labels[end - 1]
-            ts_out[row] = pd.Timestamp(timestamps[end - 1]).asm8
-            sym_out[row] = sym
-            row += 1
+        
+        # Vectorized sliding window
+        windows = sliding_window_view(feats, window_shape=(seq_len, feats.shape[1])).squeeze(axis=1)
+        
+        # Valid day boundary mask
+        start_dates = dates[:-seq_len + 1]
+        end_dates = dates[seq_len - 1:]
+        valid_mask = start_dates == end_dates
+        
+        valid_windows = windows[valid_mask]
+        n_valid = len(valid_windows)
+        
+        if n_valid > 0:
+            mm[row : row + n_valid] = valid_windows
+            y_out[row : row + n_valid] = labels[seq_len - 1:][valid_mask]
+            ts_out[row : row + n_valid] = timestamps[seq_len - 1:][valid_mask].astype("datetime64[ns]")
+            sym_out[row : row + n_valid] = sym
+            row += n_valid
+            
     if row != n:
         raise RuntimeError(f"Sequence count mismatch: expected {n}, wrote {row}")
     mm.flush()
