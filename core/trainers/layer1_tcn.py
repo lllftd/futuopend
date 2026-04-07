@@ -76,14 +76,18 @@ def _train_tcn_model(
     class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(dev)
 
     focal_gamma = float(os.environ.get("FOCAL_GAMMA", "0.0"))
+    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", "0.10"))
+    
     if focal_gamma > 0.0:
+        # Note: focal loss implementation doesn't currently use label smoothing directly in our custom class, 
+        # but for clean baseline comparison, we ensure baseline CE uses it.
         criterion_train = FocalLoss(alpha=class_weights_t, gamma=focal_gamma)
         if show_model_summary:
             print(f"  Loss: FocalLoss(gamma={focal_gamma}) + class_weights")
     else:
-        criterion_train = nn.CrossEntropyLoss(weight=class_weights_t)
+        criterion_train = nn.CrossEntropyLoss(weight=class_weights_t, label_smoothing=label_smoothing)
         if show_model_summary:
-            print("  Loss: CrossEntropyLoss(no_smoothing) + class_weights")
+            print(f"  Loss: CrossEntropyLoss(label_smoothing={label_smoothing}) + class_weights")
 
     criterion_eval = nn.CrossEntropyLoss(weight=class_weights_t)
 

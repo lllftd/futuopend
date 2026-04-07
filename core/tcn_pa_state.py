@@ -71,22 +71,34 @@ class CausalConv1d(nn.Module):
 class TemporalBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout):
         super().__init__()
-        self.conv1 = CausalConv1d(in_ch, out_ch, kernel_size, dilation)
-        self.bn1 = nn.BatchNorm1d(out_ch)
-        self.conv2 = CausalConv1d(out_ch, out_ch, kernel_size, dilation)
-        self.bn2 = nn.BatchNorm1d(out_ch)
+        # Use WeightNorm instead of BatchNorm for causality and batch independence
+        # Channel doubled for WaveNet gated activation
+        self.conv1 = nn.utils.weight_norm(CausalConv1d(in_ch, out_ch * 2, kernel_size, dilation))
+        self.conv2 = nn.utils.weight_norm(CausalConv1d(out_ch, out_ch * 2, kernel_size, dilation))
+        
+        # Initialize gate bias to +1.0 so gates start open
+        nn.init.constant_(self.conv1.conv.bias[out_ch:], 1.0)
+        nn.init.constant_(self.conv2.conv.bias[out_ch:], 1.0)
+        
         self.spatial_drop = SpatialDropout1d(dropout)
         self.drop = nn.Dropout(dropout)
+        
         self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-        self.act = nn.GELU()
+        if self.downsample is not None:
+            self.downsample = nn.utils.weight_norm(self.downsample)
+
+    def _gated_activation(self, x):
+        # x shape: (B, out_ch * 2, T)
+        filter_out, gate_out = x.chunk(2, dim=1)
+        return torch.tanh(filter_out) * torch.sigmoid(gate_out)
 
     def forward(self, x):
-        out = self.act(self.bn1(self.conv1(x)))
+        out = self._gated_activation(self.conv1(x))
         out = self.spatial_drop(out)
-        out = self.act(self.bn2(self.conv2(out)))
+        out = self._gated_activation(self.conv2(out))
         out = self.drop(out)
         res = self.downsample(x) if self.downsample is not None else x
-        return self.act(out + res)
+        return out + res
 
 
 class PAStateTCN(nn.Module):
@@ -122,6 +134,11 @@ class PAStateTCN(nn.Module):
         return logits
 
     def forward_with_embedding(self, x):
+        # Apply Gaussian noise injection for robust sequence learning
+        if self.training:
+            noise = torch.randn_like(x) * 0.05
+            x = x + noise
+            
         x = x.transpose(1, 2)
         out = self.tcn(x)
         h = out[:, :, -1]
