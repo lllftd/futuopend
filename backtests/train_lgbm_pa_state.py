@@ -1362,34 +1362,41 @@ def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
-def _layer3_fill_p_trade_from_regression(
-    trade_quality_models: dict,
-    work: pd.DataFrame,
-    layer2_feats: list[str],
-    p_trade: np.ndarray,
-    p_long: np.ndarray,
-    p_a: np.ndarray,
-    chunk: int,
-) -> None:
-    s2 = trade_quality_models["step2"]
-    s3 = trade_quality_models["step3"]
-    regb = trade_quality_models["step1_regression"]
-    models = _l2b_nested_opp_models(regb)
-    thr_vec = regb["thr_vec"]
-    regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
-    n = len(work)
-    n_chunk = (n + chunk - 1) // chunk
-    for i in _tq(range(0, n, chunk), desc="Layer3 trade stack (reg gate)", total=n_chunk, unit="chunk"):
-        j = min(i + chunk, n)
-        x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
-        rp = regime_mat[i:j]
-        opp = _compute_opportunity_scores(x_b, rp, models)
-        gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)  # per-row L2a argmax → REGIMES_6[gix]
-        thr_row = thr_vec[gix]
-        p_trade[i:j] = _opp_to_synthetic_p_trade(opp, thr_row)
-        p_long[i:j] = s2.predict(x_b)
-        p_a[i:j] = s3.predict(x_b)
-        del x_b, rp, opp
+    def _layer3_fill_p_trade_from_regression(
+        trade_quality_models: dict,
+        work: pd.DataFrame,
+        layer2_feats: list[str],
+        p_trade: np.ndarray,
+        p_long: np.ndarray,
+        p_a: np.ndarray,
+        chunk: int,
+    ) -> None:
+        s1 = trade_quality_models.get("step1_binary")
+        s2 = trade_quality_models["step2"]
+        s3 = trade_quality_models["step3"]
+        regb = trade_quality_models.get("step1_regression")
+        
+        regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
+        models = _l2b_nested_opp_models(regb) if regb else {}
+        thr_vec = regb["thr_vec"] if regb else None
+    
+        n = len(work)
+        n_chunk = (n + chunk - 1) // chunk
+        for i in _tq(range(0, n, chunk), desc="Layer3 trade stack", total=n_chunk, unit="chunk"):
+            j = min(i + chunk, n)
+            x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
+            
+            if s1 is not None:
+                p_trade[i:j] = s1.predict(x_b)
+            else:
+                rp = regime_mat[i:j]
+                opp = _compute_opportunity_scores(x_b, rp, models)
+                gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)
+                thr_row = thr_vec[gix]
+                p_trade[i:j] = _opp_to_synthetic_p_trade(opp, thr_row)
+                
+            p_long[i:j] = s2.predict(x_b)
+            p_a[i:j] = s3.predict(x_b)
 
 
 def compute_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -1419,6 +1426,16 @@ def compute_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
     atr5 = pd.Series(bar_range).rolling(5, min_periods=1).mean().values
     atr20 = pd.Series(bar_range).rolling(20, min_periods=1).mean().values
     body_ma5 = pd.Series(body_abs).rolling(5, min_periods=1).mean().values
+
+    # New range expansion/compression features
+    tp = (high + low + close) / 3.0
+    tp_ma20 = pd.Series(tp).rolling(20, min_periods=1).mean().values
+    tp_std20 = pd.Series(tp).rolling(20, min_periods=1).std().fillna(0).values
+    bo_bb_width = np.where(tp_ma20 > 1e-6, (4.0 * tp_std20) / tp_ma20, 0.0)
+    
+    atr_ma500 = pd.Series(safe_atr).rolling(500, min_periods=1).mean().values
+    atr_std500 = pd.Series(safe_atr).rolling(500, min_periods=1).std().fillna(1e-6).values
+    bo_atr_zscore = (safe_atr - atr_ma500) / np.maximum(atr_std500, 1e-6)
 
     # Consecutive bars in dominant direction
     bo_consec = np.zeros(n)
@@ -1476,6 +1493,8 @@ def compute_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
         "bo_inside_prior": bo_inside_prior,
         "bo_pressure_diff": bo_pressure_diff,
         "bo_or_dist": bo_or_dist,
+        "bo_bb_width": bo_bb_width,
+        "bo_atr_zscore": bo_atr_zscore,
     }, index=df.index)
     return out
 
@@ -1484,7 +1503,7 @@ BO_FEAT_COLS = [
     "bo_body_atr", "bo_range_atr", "bo_vol_spike", "bo_close_extremity",
     "bo_wick_imbalance", "bo_range_compress", "bo_body_growth",
     "bo_gap_signal", "bo_consec_dir", "bo_inside_prior",
-    "bo_pressure_diff", "bo_or_dist",
+    "bo_pressure_diff", "bo_or_dist", "bo_bb_width", "bo_atr_zscore",
 ]
 
 # Calibrated "regime now" probabilities (Layer 2a). Not in Layer 2b X; used for reconstruct + Layer 3.
@@ -1906,6 +1925,20 @@ def train_trade_quality_classifier(
         step1_regression_bundle[f"{regime}_mfe"] = pair["mfe"]
         step1_regression_bundle[f"{regime}_mae"] = pair["mae"]
 
+    print("  [L2b train] Dedicated Step1 TRADE/SKIP binary classifier …", flush=True)
+    c1, clean1 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 Binary")
+    w1_train = _binary_weights(y_trade_train, t[train_mask], pos_boost=1.5)
+    w1_cal = _binary_weights(y_trade_cal, t[cal_mask], pos_boost=1.5)
+    d1_train = lgb.Dataset(X_train, label=y_trade_train, weight=w1_train, feature_name=all_bo_feats, free_raw_data=False)
+    d1_cal = lgb.Dataset(X_cal, label=y_trade_cal, weight=w1_cal, feature_name=all_bo_feats, free_raw_data=False)
+    try:
+        step1_binary_model = lgb.train(
+            common_params, d1_train, num_boost_round=rounds, valid_sets=[d1_cal], callbacks=c1,
+        )
+    finally:
+        for fn in clean1:
+            fn()
+
     print("  [L2b train] Step2 LONG/SHORT LightGBM …", flush=True)
     c2, clean2 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step2 LONG/SHORT")
     try:
@@ -1926,28 +1959,34 @@ def train_trade_quality_classifier(
             fn()
 
     rp_cal = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
-    opp_cal = _compute_opportunity_scores(X_cal, rp_cal, reg_models)
-    gix_c = np.argmax(rp_cal, axis=1).astype(np.int64, copy=False)  # L2a class index; thr_vec[k]=REGIMES_6[k]
-    p_trade_cal = _opp_to_synthetic_p_trade(opp_cal, thr_vec[gix_c])
+    p_trade_cal = step1_binary_model.predict(X_cal)
+    
+    # Find best F1 threshold for binary classifier
+    best_f1, best_thr = 0.0, 0.5
+    for thr_c in np.arange(0.1, 0.9, 0.02):
+        pr = (p_trade_cal >= thr_c).astype(int)
+        f1v = f1_score(y_trade_cal, pr, zero_division=0)
+        if f1v > best_f1:
+            best_f1, best_thr = f1v, thr_c
+    thr_trade_cal = best_thr
+    
     p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp)
-    thr_trade_cal = 0.5
     pr_cal = (p_trade_cal >= thr_trade_cal).astype(int)
     f1_cal_at_thr = f1_score(y_trade_cal, pr_cal, zero_division=0)
     n_trade_pred_cal = int(pr_cal.sum())
     rec_cal_thr = recall_score(y_trade_cal, pr_cal, zero_division=0)
     prec_cal_thr = precision_score(y_trade_cal, pr_cal, zero_division=0)
-    thr_rule_note = "regression gate: synth p_trade, fixed thr=0.5"
+    thr_rule_note = f"binary classifier: opt thr={thr_trade_cal:.2f}"
     print(
-        f"  Step1 cal: synthetic p_trade @ {thr_trade_cal:.2f}  "
+        f"  Step1 cal: {thr_rule_note}  "
         f"F1={f1_cal_at_thr:.4f}  recall={rec_cal_thr:.3f}  precision={prec_cal_thr:.4f}  "
-        f"n_trade={n_trade_pred_cal:,}/{len(y_trade_cal):,}  ({thr_rule_note})"
+        f"n_trade={n_trade_pred_cal:,}/{len(y_trade_cal):,}"
     )
 
     # Evaluate cascade
     rp_test = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
     opp_te = _compute_opportunity_scores(X_test, rp_test, reg_models)
-    gix_t = np.argmax(rp_test, axis=1).astype(np.int64, copy=False)  # L2a class index → REGIMES_6[gix_t]
-    p_trade = _opp_to_synthetic_p_trade(opp_te, thr_vec[gix_t])
+    p_trade = step1_binary_model.predict(X_test)
     p_trade, skip_cp_test = _apply_cp_skip(rp_test, p_trade, thr_cp)
     print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
     
@@ -1999,12 +2038,13 @@ def train_trade_quality_classifier(
     print(imp_df.head(25).to_string(index=False))
 
     os.makedirs(MODEL_DIR, exist_ok=True)
+    step1_binary_model.save_model(os.path.join(MODEL_DIR, "trade_gate_step1.txt"))
     step2_model.save_model(os.path.join(MODEL_DIR, "trade_dir_step2.txt"))
     step3_model.save_model(os.path.join(MODEL_DIR, "trade_grade_step3.txt"))
     import pickle
 
     meta = {
-        "type": "trade_quality_hier_regression_gate",
+        "type": "trade_quality_hier_binary_gate",
         "class_names": QUALITY_CLASS_NAMES,
         "feature_cols": all_bo_feats,
         "pa_base_feat_cols": pa_base,
@@ -2027,6 +2067,7 @@ def train_trade_quality_classifier(
             "threshold_selection_rule": thr_rule_note,
         },
         "model_files": {
+            "step1_trade": "trade_gate_step1.txt",
             "step2_direction": "trade_dir_step2.txt",
             "step3_grade": "trade_grade_step3.txt",
         },
@@ -2057,13 +2098,14 @@ def train_trade_quality_classifier(
         pickle.dump(meta, f)
 
     print(
-        f"\n  Models saved → l2b_opp_mfe/mae_<regime>.txt (trained regimes), "
-        f"trade_dir_step2.txt, trade_grade_step3.txt",
+        f"\n  Models saved → trade_gate_step1.txt, trade_dir_step2.txt, trade_grade_step3.txt\n"
+        f"  (L3 continuous features models saved to l2b_opp_mfe/mae_<regime>.txt)",
     )
     print(f"  Meta saved  → {MODEL_DIR}/trade_quality_meta.pkl")
 
     model_bundle = {
         "step1_regression": step1_regression_bundle,
+        "step1_binary": step1_binary_model,
         "step2": step2_model,
         "step3": step3_model,
         "thresholds": meta["hierarchy_thresholds"],
