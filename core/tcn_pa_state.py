@@ -10,6 +10,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import weight_norm
 
 
 def _default_bottleneck_dim() -> int:
@@ -73,19 +74,19 @@ class TemporalBlock(nn.Module):
         super().__init__()
         # Use WeightNorm instead of BatchNorm for causality and batch independence
         # Channel doubled for WaveNet gated activation
-        self.conv1 = nn.utils.weight_norm(CausalConv1d(in_ch, out_ch * 2, kernel_size, dilation))
-        self.conv2 = nn.utils.weight_norm(CausalConv1d(out_ch, out_ch * 2, kernel_size, dilation))
+        self.conv1 = weight_norm(CausalConv1d(in_ch, out_ch * 2, kernel_size, dilation))
+        self.conv2 = weight_norm(CausalConv1d(out_ch, out_ch * 2, kernel_size, dilation))
         
         # Initialize gate bias to +1.0 so gates start open
-        nn.init.constant_(self.conv1.conv.bias[out_ch:], 1.0)
-        nn.init.constant_(self.conv2.conv.bias[out_ch:], 1.0)
+        nn.init.constant_(self.conv1.parametrizations.conv.original.bias[out_ch:], 1.0)
+        nn.init.constant_(self.conv2.parametrizations.conv.original.bias[out_ch:], 1.0)
         
         self.spatial_drop = SpatialDropout1d(dropout)
         self.drop = nn.Dropout(dropout)
         
         self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
         if self.downsample is not None:
-            self.downsample = nn.utils.weight_norm(self.downsample)
+            self.downsample = weight_norm(self.downsample)
 
     def _gated_activation(self, x):
         # x shape: (B, out_ch * 2, T)
@@ -98,7 +99,9 @@ class TemporalBlock(nn.Module):
         out = self._gated_activation(self.conv2(out))
         out = self.drop(out)
         res = self.downsample(x) if self.downsample is not None else x
-        return out + res
+        # Scale by sqrt(0.5) to prevent exploding activations in deeper layers 
+        # (variance compensation for residual connections with weightnorm)
+        return (out + res) * 0.70710678
 
 
 class PAStateTCN(nn.Module):
@@ -112,8 +115,10 @@ class PAStateTCN(nn.Module):
         dropout: float,
         bottleneck_dim: int | None = None,
         num_classes: int = 6,
+        noise_std: float = 0.05,
     ):
         super().__init__()
+        self.noise_std = noise_std
         bd = int(bottleneck_dim) if bottleneck_dim is not None else _default_bottleneck_dim()
         self.bottleneck_dim = bd
         layers = []
@@ -135,8 +140,8 @@ class PAStateTCN(nn.Module):
 
     def forward_with_embedding(self, x):
         # Apply Gaussian noise injection for robust sequence learning
-        if self.training:
-            noise = torch.randn_like(x) * 0.05
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(x) * self.noise_std
             x = x + noise
             
         x = x.transpose(1, 2)

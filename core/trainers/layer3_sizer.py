@@ -285,8 +285,8 @@ def train_execution_sizer(
     )
 
     size_params = {
-        "objective": "huber",
-        "alpha": 0.9,
+        "objective": "fair",
+        "fair_c": 1.0,  # Fair loss parameter controlling transition from L2 to L1
         "metric": "mae",
         "boosting_type": "gbdt",
         "learning_rate": 0.02,

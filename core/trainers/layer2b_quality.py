@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
@@ -359,9 +360,10 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
         X_std = X_cluster.std(axis=0) + 1e-6
         X_scaled = (X_cluster - X_mean) / X_std
 
-        # K-Means clustering into 3 classes (A, B, CHOP)
-        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-        clusters = kmeans.fit_predict(X_scaled)
+        # GMM clustering into 3 classes (A, B, CHOP)
+        # GMM captures the covariance between MFE and MAE better than spherical KMeans
+        gmm = GaussianMixture(n_components=3, covariance_type='full', random_state=42, n_init=5)
+        clusters = gmm.fit_predict(X_scaled)
 
         # Interpret clusters based on heuristic score: MFE + RR - MAE
         cluster_scores = []
