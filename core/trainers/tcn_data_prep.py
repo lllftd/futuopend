@@ -14,9 +14,11 @@ from sklearn.metrics import accuracy_score, f1_score, log_loss
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
+import time as _time
 
 from core.pa_rules import add_pa_features
 from core.tcn_pa_state import FocalLoss, PAStateTCN
+from core.indicators import atr as compute_atr
 
 from core.trainers.tcn_constants import *
 from core.trainers.tcn_utils import *
