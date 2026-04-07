@@ -1172,6 +1172,76 @@ def _climax_detection_5m(bars: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _tr_measured_move_5m(bars: pd.DataFrame, regime: pd.DataFrame) -> pd.DataFrame:
+    """Measured moves for Trading Ranges (TR)."""
+    env = regime["pa_env_state"].astype(str).to_numpy()
+    high = bars["high"].astype(float)
+    low = bars["low"].astype(float)
+    close = bars["close"].astype(float)
+    n = len(bars)
+    
+    tr_mm_target_up = np.full(n, np.nan)
+    tr_mm_target_down = np.full(n, np.nan)
+    
+    tr_mask = np.isin(env, ["wide_tr", "ttr", "neutral_50_50"])
+    
+    current_tr_high = np.nan
+    current_tr_low = np.nan
+    
+    for i in range(n):
+        if tr_mask[i]:
+            if np.isnan(current_tr_high):
+                current_tr_high = high.iloc[i]
+                current_tr_low = low.iloc[i]
+            else:
+                current_tr_high = max(current_tr_high, high.iloc[i])
+                current_tr_low = min(current_tr_low, low.iloc[i])
+        else:
+            if i > 0 and tr_mask[i - 1] and not np.isnan(current_tr_high):
+                box_height = current_tr_high - current_tr_low
+                if close.iloc[i] > current_tr_high:
+                    tr_mm_target_up[i] = current_tr_high + box_height
+                elif close.iloc[i] < current_tr_low:
+                    tr_mm_target_down[i] = current_tr_low - box_height
+            
+            current_tr_high = np.nan
+            current_tr_low = np.nan
+            
+        if i > 0 and not tr_mask[i]:
+            if np.isnan(tr_mm_target_up[i]) and not np.isnan(tr_mm_target_up[i - 1]):
+                if high.iloc[i] < tr_mm_target_up[i - 1]:
+                    tr_mm_target_up[i] = tr_mm_target_up[i - 1]
+            if np.isnan(tr_mm_target_down[i]) and not np.isnan(tr_mm_target_down[i - 1]):
+                if low.iloc[i] > tr_mm_target_down[i - 1]:
+                    tr_mm_target_down[i] = tr_mm_target_down[i - 1]
+                    
+    out = pd.DataFrame(index=bars.index)
+    out["time_key"] = bars["time_key"].values
+    out["pa_tr_mm_target_up"] = tr_mm_target_up
+    out["pa_tr_mm_target_down"] = tr_mm_target_down
+    return out
+
+
+def _volume_climax_exhaustion_5m(bars: pd.DataFrame, regime: pd.DataFrame) -> pd.DataFrame:
+    """Identify Volume Exhaustion/Climax based on extreme Z-Score after a trend."""
+    vol = bars["volume"].astype(float)
+    ages = regime["pa_env_bars_since_extreme"].to_numpy(dtype=int)
+    env = regime["pa_env_state"].astype(str).to_numpy()
+    
+    vol_ma = vol.rolling(20, min_periods=5).mean()
+    vol_std = vol.rolling(20, min_periods=5).std()
+    vol_zscore = ((vol - vol_ma) / (vol_std + 1e-8)).fillna(0)
+    
+    is_trend = np.isin(env, ["tight_bull_channel", "wide_bull_channel", "tight_bear_channel", "wide_bear_channel"])
+    vol_exhaustion = is_trend & (ages >= 20) & (vol_zscore > 3.0)
+    
+    out = pd.DataFrame(index=bars.index)
+    out["time_key"] = bars["time_key"].values
+    out["pa_vol_exhaustion_climax"] = vol_exhaustion.astype(bool).values
+    out["pa_vol_zscore_20"] = vol_zscore.values
+    return out
+
+
 def _final_flag_5m(bars: pd.DataFrame, regime: pd.DataFrame, inside: pd.DataFrame) -> pd.DataFrame:
     env = regime["pa_env_state"].astype(str).to_numpy()
     bull_late = np.isin(env, ["tight_bull_channel", "wide_bull_channel"]) & (
@@ -2977,6 +3047,8 @@ def add_pa_features(
     channel_z = _channel_zones_5m(bars_5m, regime)
     endless_pb = _endless_pullback_5m(bars_5m, direction_5m)
     cycle = _market_cycle_5m(regime)
+    tr_mm = _tr_measured_move_5m(bars_5m, regime)
+    vol_climax = _volume_climax_exhaustion_5m(bars_5m, regime)
 
     # ── Causal replacements (new implementations) ──
     stops = _causal_pa_stops(bars_5m)
@@ -3012,7 +3084,7 @@ def add_pa_features(
         momentum, trail_mom, ct_quality, channel_z,
         endless_pb, gap_enh, triangle, session, cycle,
         vol_bo, hs, para_wedge, prev_day, open_pat,
-        bo_strength,
+        bo_strength, tr_mm, vol_climax,
         htf_feats, struct_feats, ma_feats, vol_feats, hmm_garch_feats, leading_feats,
     ]
 
