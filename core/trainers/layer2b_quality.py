@@ -712,6 +712,7 @@ def train_trade_quality_classifier(
         "seed": 42,
         "n_jobs": _lgbm_n_jobs(),
         "monotone_constraints": mc_tuple,
+        "monotone_constraints_method": "advanced",
     }
     rounds = 1800 if FAST_TRAIN_MODE else 4000
     es = 90 if FAST_TRAIN_MODE else 140
