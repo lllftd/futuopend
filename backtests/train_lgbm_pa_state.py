@@ -949,6 +949,21 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
         cal /= cal.sum(axis=1, keepdims=True)  # re-normalise to sum=1
         return cal
 
+    # ── Conformal Prediction Calibration (Score method) ──
+    probs_cal = predict_calibrated(X_cal)
+    p_true = probs_cal[np.arange(len(y_cal)), y_cal]
+    scores = 1.0 - p_true
+    alpha = 0.05
+    n_cal = len(y_cal)
+    q_level = np.ceil((n_cal + 1) * (1 - alpha)) / n_cal
+    q_level = min(q_level, 1.0)
+    Q_hat = np.quantile(scores, q_level, method="higher")
+    thr_cp = 1.0 - Q_hat
+    
+    print(f"\n  Conformal Prediction Calibration (alpha={alpha}):")
+    print(f"    1-alpha Quantile Q_hat: {Q_hat:.4f}")
+    print(f"    Probability Threshold (thr_cp):  {thr_cp:.4f}")
+
     # ── Evaluate on held-out test set ──
     probs = predict_calibrated(X_test)
     y_pred = probs.argmax(axis=1)
@@ -974,6 +989,16 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
     print("  Confusion Matrix:")
     cm = confusion_matrix(y_test, y_pred, labels=list(range(NUM_REGIME_CLASSES)))
     print(pd.DataFrame(cm, index=target_names, columns=target_names).to_string())
+
+    # ── CP analysis on test set ──
+    y_set_test = probs >= thr_cp
+    set_size = y_set_test.sum(axis=1)
+    contains_bull = y_set_test[:, 0] | y_set_test[:, 1]
+    contains_bear = y_set_test[:, 2] | y_set_test[:, 3]
+    is_conflicting = contains_bull & contains_bear
+    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0)
+    print(f"\n  Test set CP SKIP rate:  {skip_cp.mean():.2%} ({skip_cp.sum():,} bars)")
+    print(f"  Test set_size distr:    {dict(zip(*np.unique(set_size, return_counts=True)))}")
 
     # ── Confidence-filtered accuracy ──
     print(f"\n  Confidence-Filtered Accuracy:")
@@ -1012,7 +1037,7 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
     print(f"\n  Model saved → {MODEL_DIR}/{STATE_CLASSIFIER_FILE}")
     print(f"  Calibrators saved → {MODEL_DIR}/state_calibrators.pkl")
 
-    return model, calibrators, imp_df
+    return model, calibrators, imp_df, float(thr_cp)
 
 
 # Backward-compatible name
@@ -1651,11 +1676,25 @@ def _reconstruct_quality_classes(
     return pred
 
 
+def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float) -> tuple[np.ndarray, np.ndarray]:
+    """Apply Conformal Prediction prediction sets to filter out uncertain/OOS trades."""
+    y_set = regime_probs >= thr_cp
+    set_size = y_set.sum(axis=1)
+    contains_bull = y_set[:, 0] | y_set[:, 1]
+    contains_bear = y_set[:, 2] | y_set[:, 3]
+    is_conflicting = contains_bull & contains_bear
+    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0)
+    p_trade_adj = p_trade.copy()
+    p_trade_adj[skip_cp] = 0.0
+    return p_trade_adj, skip_cp
+
+
 def train_trade_quality_classifier(
     df: pd.DataFrame,
     feat_cols: list[str],
     regime_model: lgb.Booster,
     regime_calibrators: list,
+    thr_cp: float,
 ):
     print("\n" + "=" * 70)
     print("  LAYER 2b: Hierarchical Trade-Quality Stack (regression Step1)")
@@ -1890,6 +1929,7 @@ def train_trade_quality_classifier(
     opp_cal = _compute_opportunity_scores(X_cal, rp_cal, reg_models)
     gix_c = np.argmax(rp_cal, axis=1).astype(np.int64, copy=False)  # L2a class index; thr_vec[k]=REGIMES_6[k]
     p_trade_cal = _opp_to_synthetic_p_trade(opp_cal, thr_vec[gix_c])
+    p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp)
     thr_trade_cal = 0.5
     pr_cal = (p_trade_cal >= thr_trade_cal).astype(int)
     f1_cal_at_thr = f1_score(y_trade_cal, pr_cal, zero_division=0)
@@ -1908,6 +1948,9 @@ def train_trade_quality_classifier(
     opp_te = _compute_opportunity_scores(X_test, rp_test, reg_models)
     gix_t = np.argmax(rp_test, axis=1).astype(np.int64, copy=False)  # L2a class index → REGIMES_6[gix_t]
     p_trade = _opp_to_synthetic_p_trade(opp_te, thr_vec[gix_t])
+    p_trade, skip_cp_test = _apply_cp_skip(rp_test, p_trade, thr_cp)
+    print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
+    
     p_long = np.full(len(X_test), 0.5, dtype=float)
     p_a = np.full(len(X_test), 0.5, dtype=float)
     if len(X2_test) > 0:
@@ -1971,7 +2014,10 @@ def train_trade_quality_classifier(
         "bo_feat_cols": BO_FEAT_COLS,
         "regime_prob_cols_layer3": REGIME_PROB_COLS,
         "garch_cols": garch_cols,
-        "hierarchy_thresholds": {"trade": float(thr_trade_cal), "long": 0.50, "grade_a": 0.50},
+        "hierarchy_thresholds": {
+            "trade": float(thr_trade_cal), "long": 0.50, "grade_a": 0.50, 
+            "cp_alpha": 0.05, "thr_cp": float(thr_cp)
+        },
         "step1_calibration": {
             "best_trade_threshold": float(thr_trade_cal),
             "best_f1_cal": float(f1_cal_at_thr),
@@ -2089,6 +2135,7 @@ def train_execution_sizer(
     regime_model: lgb.Booster,
     regime_calibrators: list,
     trade_quality_models: dict,
+    thr_cp: float,
 ):
     print("\n" + "=" * 70)
     print("  LAYER 3: Execution Sizer v2 (L2b triplet × regime × TCN × GARCH × PA + gate×size)")
@@ -2126,6 +2173,7 @@ def train_execution_sizer(
     _layer3_fill_trade_stack_probs(
         trade_quality_models, work, layer2_feats, p_trade, p_long, p_a, chunk,
     )
+    p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp)
 
     l2b_opp = np.empty(n, dtype=np.float32)
     l2b_mfe = np.empty(n, dtype=np.float32)
@@ -2368,16 +2416,16 @@ def main():
 
     df, feat_cols = prepare_dataset(["QQQ", "SPY"])
 
-    regime_model, regime_cal, regime_imp = train_regime_classifier(df, feat_cols)
+    regime_model, regime_cal, regime_imp, thr_cp = train_regime_classifier(df, feat_cols)
     print(
         "  [progress] Layer 2a done → Layer 2b (prep + hierarchical trade models) …",
         flush=True,
     )
     tq_model, tq_meta, tq_imp = train_trade_quality_classifier(
-        df, feat_cols, regime_model, regime_cal,
+        df, feat_cols, regime_model, regime_cal, thr_cp,
     )
     _, exec_meta, exec_imp = train_execution_sizer(
-        df, feat_cols, regime_model, regime_cal, tq_model,
+        df, feat_cols, regime_model, regime_cal, tq_model, thr_cp,
     )
 
     print("\n" + "=" * 70)
