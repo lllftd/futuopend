@@ -6,6 +6,14 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", 
 LABELED_SUFFIX = os.environ.get("LABELED_SUFFIX", "_labeled_v2")
 
 NUM_REGIME_CLASSES = 6
+STATE_NAMES: dict[int, str] = {
+    0: "bull_conv",
+    1: "bull_div",
+    2: "bear_conv",
+    3: "bear_div",
+    4: "range_conv",
+    5: "range_div",
+}
 STATE_CLASSIFIER_FILE = "state_classifier_6c.txt"
 REGIME_NOW_PROB_COLS = ["bull_conv", "bull_div", "bear_conv", "bear_div", "range_conv", "range_div"]
 REGIME_PROB_COLS = REGIME_NOW_PROB_COLS
@@ -13,8 +21,8 @@ RANGE_REGIME_INDICES = [4, 5]
 TCN_REGIME_FUT_PROB_COLS = ["tcn_transition_same", "tcn_transition_prob"]
 TCN_BOTTLENECK_DIM = max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
 
-_LGBM_EXCLUDE_PA_STRING_COLS = {
-    "symbol", "time_key", "date", "market_state", "code", "name", 
+LGBM_EXCLUDE_PA_STRING_COLS = {
+    "symbol", "time_key", "date", "market_state", "code", "name",
     "time_key_day", "market_state_shifted",
 }
 

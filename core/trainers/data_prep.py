@@ -23,10 +23,10 @@ from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
+from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
 
 def _load_and_compute_pa(symbol: str) -> pd.DataFrame:
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
-    raw = pd.read_csv(os.path.join(data_dir, f"{symbol}.csv"))
+    raw = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}.csv"))
     raw["time_key"] = pd.to_datetime(raw["time_key"])
     raw = raw.sort_values("time_key").reset_index(drop=True)
 
@@ -39,7 +39,6 @@ def _load_and_compute_pa(symbol: str) -> pd.DataFrame:
 
 
 def _load_labels(symbol: str) -> pd.DataFrame:
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
     cols = [
         "time_key", "market_state",
         "signal", "outcome",
@@ -47,7 +46,7 @@ def _load_labels(symbol: str) -> pd.DataFrame:
         "max_favorable", "max_adverse", "exit_bar",
         "atr",
     ]
-    lbl = pd.read_csv(os.path.join(data_dir, f"{symbol}{LABELED_SUFFIX}.csv"), usecols=cols)
+    lbl = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}{LABELED_SUFFIX}.csv"), usecols=cols)
     lbl["time_key"] = pd.to_datetime(lbl["time_key"])
     lbl.rename(columns={"atr": "lbl_atr"}, inplace=True)
     return lbl
@@ -112,15 +111,16 @@ def _create_tcn_windows(feat_1m: np.ndarray, seq_len: int) -> tuple[np.ndarray, 
 def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -> pd.DataFrame:
     """
     Real TCN forward only — no uniform-prior placeholders.
-    Run order: train_tcn_pa_state.py first so tcn_meta.pkl + tcn_state_classifier.pt exist.
+    Requires ``tcn_meta.pkl`` + the same weight file basename as ``train_pipeline`` /
+    ``tcn_constants.STATE_CLASSIFIER_FILE`` (not legacy ``tcn_transition_classifier.pt``).
     """
     meta_path = os.path.join(MODEL_DIR, "tcn_meta.pkl")
-    model_path = os.path.join(MODEL_DIR, "tcn_transition_classifier.pt")
+    model_path = os.path.join(MODEL_DIR, TCN_STATE_DICT_BASENAME)
 
     if not (os.path.exists(meta_path) and os.path.exists(model_path)):
         raise RuntimeError(
-            f"Missing TCN checkpoint under {MODEL_DIR}: need tcn_meta.pkl and tcn_transition_classifier.pt. "
-            "Train first: python3 backtests/train_tcn_pa_state.py"
+            f"Missing TCN checkpoint under {MODEL_DIR}: need tcn_meta.pkl and {TCN_STATE_DICT_BASENAME!r} "
+            "(from Layer 1 / backtests.train_pipeline). Retrain: ./scripts/run_train.sh layer1"
         )
 
     import pickle
@@ -298,6 +298,12 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 "time_key": pd.to_datetime(oof["ts"])
             })
             rp = np.asarray(oof["regime_probs"], dtype=np.float32)
+            if rp.shape[1] != len(TCN_REGIME_FUT_PROB_COLS):
+                raise RuntimeError(
+                    f"{oof_path} regime_probs has width {rp.shape[1]} but TCN_REGIME_FUT_PROB_COLS "
+                    f"expects {len(TCN_REGIME_FUT_PROB_COLS)} (e.g. old 6-class cache vs binary transition). "
+                    f"Delete {oof_path} and re-train Layer 1 (TCN)."
+                )
             for j, col in enumerate(TCN_REGIME_FUT_PROB_COLS):
                 oof_df[col] = rp[:, j]
 

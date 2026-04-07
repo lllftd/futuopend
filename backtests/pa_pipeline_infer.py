@@ -19,6 +19,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from core.tcn_pa_state import PAStateTCN
+from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
 
 OOS_PRED_CHUNK = max(4096, int(os.environ.get("OOS_PRED_CHUNK", "65536")))
 
@@ -194,7 +195,11 @@ def load_layered_pa_pipeline():
         num_classes=n_cls,
     ).to(device)
     tcn_model.load_state_dict(
-        torch.load(os.path.join(MODEL_DIR, "tcn_state_classifier.pt"), map_location=device, weights_only=True)
+        torch.load(
+            os.path.join(MODEL_DIR, TCN_STATE_DICT_BASENAME),
+            map_location=device,
+            weights_only=True,
+        )
     )
     tcn_model.eval()
 

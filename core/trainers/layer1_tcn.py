@@ -23,6 +23,11 @@ from core.trainers.constants import TCN_REGIME_FUT_PROB_COLS
 from core.trainers.tcn_constants import *
 from core.trainers.tcn_utils import _tq, _tqdm_disabled
 
+# Layer 1 label is binary transition (see tcn_data_prep.prepare_data); not NUM_REGIME_CLASSES (6).
+TCN_HEAD_NUM_CLASSES = len(TCN_REGIME_FUT_PROB_COLS)
+TCN_HEAD_TARGET_NAMES = ["same", "transition"]
+
+
 def _train_tcn_model(
     X_mm: np.memmap,
     y: np.ndarray,
@@ -60,7 +65,7 @@ def _train_tcn_model(
         kernel_size=TCN_KERNEL_SIZE,
         dropout=TCN_DROPOUT,
         bottleneck_dim=TCN_BOTTLENECK_DIM,
-        num_classes=NUM_REGIME_CLASSES,
+        num_classes=TCN_HEAD_NUM_CLASSES,
     ).to(dev)
 
     if show_model_summary:
@@ -69,10 +74,10 @@ def _train_tcn_model(
         print(f"  Architecture: channels={SLIM_CHANNELS}, kernel={TCN_KERNEL_SIZE}, dropout={TCN_DROPOUT}")
 
     y_tr = y[train_idx]
-    class_counts = np.bincount(y_tr, minlength=NUM_REGIME_CLASSES).astype(float)
+    class_counts = np.bincount(y_tr, minlength=TCN_HEAD_NUM_CLASSES).astype(float)
     class_counts = np.maximum(class_counts, 1.0)
     class_freq = class_counts / class_counts.sum()
-    class_weights = (1.0 / np.maximum(class_freq * NUM_REGIME_CLASSES, 1e-6)) ** TCN_CE_WEIGHT_POWER
+    class_weights = (1.0 / np.maximum(class_freq * TCN_HEAD_NUM_CLASSES, 1e-6)) ** TCN_CE_WEIGHT_POWER
     class_weights /= class_weights.mean()
     class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(dev)
 
@@ -188,9 +193,8 @@ def train_tcn(
         flush=True,
     )
 
-    n_tcn_classes = len(TCN_REGIME_FUT_PROB_COLS)
     oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
-    oof_regime_probs = np.zeros((len(train_idx), n_tcn_classes), dtype=np.float32)
+    oof_regime_probs = np.zeros((len(train_idx), TCN_HEAD_NUM_CLASSES), dtype=np.float32)
 
     print("  Loading memmap into RAM for fast training…", flush=True)
     X_tseq = torch.from_numpy(np.array(X_mm))
@@ -269,13 +273,12 @@ def train_tcn(
     y_true = np.concatenate(all_labels)
     acc = accuracy_score(y_true, y_pred)
     print(f"\n  Test Accuracy — future transition (binary): {acc:.4f}")
-    target_names = [STATE_NAMES[i] for i in range(NUM_REGIME_CLASSES)]
     print("\n  Classification Report — future transition (+15 bars):")
     print(
         classification_report(
             y_true, y_pred,
-            labels=list(range(NUM_REGIME_CLASSES)),
-            target_names=target_names,
+            labels=list(range(TCN_HEAD_NUM_CLASSES)),
+            target_names=TCN_HEAD_TARGET_NAMES,
             digits=4, zero_division=0,
         )
     )

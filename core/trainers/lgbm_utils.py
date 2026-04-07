@@ -81,7 +81,7 @@ def _tcn_inference_device() -> torch.device:
 
 
 def _is_lgbm_string_tag_col(name: str) -> bool:
-    if name in _LGBM_EXCLUDE_PA_STRING_COLS:
+    if name in LGBM_EXCLUDE_PA_STRING_COLS:
         return True
     if name.startswith("pa_htf_") and name.endswith("_state"):
         return True
@@ -323,7 +323,7 @@ def _optuna_search_params(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=42)
     )
-    study.optimize(objective, n_trials=actual_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=actual_trials, show_progress_bar=True)
 
     best = study.best_params
     print(f"  → Best Optuna params (n={actual_trials}): num_leaves={best['num_leaves']}  "

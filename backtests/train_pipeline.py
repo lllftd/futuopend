@@ -9,18 +9,27 @@ import datetime
 
 # Layer 1 (TCN) Imports
 from core.trainers.tcn_constants import (
-    DEVICE, MODEL_DIR as TCN_MODEL_DIR, STATE_CLASSIFIER_FILE as TCN_STATE_FILE, 
-    SEQ_LEN, SLIM_CHANNELS, TCN_KERNEL_SIZE, TCN_DROPOUT, TCN_BOTTLENECK_DIM, 
-    NUM_REGIME_CLASSES as TCN_NUM_CLASSES, STATE_NAMES
+    DEVICE,
+    MODEL_DIR as TCN_MODEL_DIR,
+    STATE_CLASSIFIER_FILE as TCN_STATE_FILE,
+    SEQ_LEN,
+    SLIM_CHANNELS,
+    TCN_KERNEL_SIZE,
+    TCN_DROPOUT,
+    TCN_BOTTLENECK_DIM,
 )
 from core.trainers.tcn_data_prep import prepare_data as prepare_tcn_data
 from core.trainers.layer1_tcn import train_tcn
 
 # Layer 2-4 (LGBM) Imports
 from core.trainers.constants import (
-    MODEL_DIR, STATE_CLASSIFIER_FILE, 
-    EXECUTION_SIZER_GATE_FILE, EXECUTION_SIZER_SIZE_FILE, 
-    EXECUTION_SIZER_TP_FILE, EXECUTION_SIZER_SL_FILE
+    MODEL_DIR,
+    STATE_CLASSIFIER_FILE,
+    EXECUTION_SIZER_GATE_FILE,
+    EXECUTION_SIZER_SIZE_FILE,
+    EXECUTION_SIZER_TP_FILE,
+    EXECUTION_SIZER_SL_FILE,
+    TCN_REGIME_FUT_PROB_COLS,
 )
 from core.trainers.lgbm_utils import configure_compute_threads, _lgbm_n_jobs
 from core.trainers.data_prep import prepare_dataset as prepare_lgbm_data
@@ -100,8 +109,8 @@ def run_layer1_tcn():
                 "bottleneck_dim": TCN_BOTTLENECK_DIM,
                 "is_dual_head": False,
                 "tcn_head": "regime_transition_15_bottleneck",
-                "num_regime_classes": TCN_NUM_CLASSES,
-                "state_names": STATE_NAMES,
+                "num_regime_classes": len(TCN_REGIME_FUT_PROB_COLS),
+                "state_names": ["same", "transition"],
             }
             with open(os.path.join(TCN_MODEL_DIR, "tcn_meta.pkl"), "wb") as f:
                 pickle.dump(meta, f)

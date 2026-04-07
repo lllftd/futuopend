@@ -73,13 +73,18 @@ class TemporalBlock(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout):
         super().__init__()
         # Use WeightNorm instead of BatchNorm for causality and batch independence
-        # Channel doubled for WaveNet gated activation
-        self.conv1 = weight_norm(CausalConv1d(in_ch, out_ch * 2, kernel_size, dilation))
-        self.conv2 = weight_norm(CausalConv1d(out_ch, out_ch * 2, kernel_size, dilation))
-        
+        # Channel doubled for WaveNet gated activation.
+        # weight_norm must wrap nn.Conv1d (has .weight); CausalConv1d only delegates to .conv.
+        self.conv1 = CausalConv1d(in_ch, out_ch * 2, kernel_size, dilation)
+        weight_norm(self.conv1.conv)
+        self.conv2 = CausalConv1d(out_ch, out_ch * 2, kernel_size, dilation)
+        weight_norm(self.conv2.conv)
+
         # Initialize gate bias to +1.0 so gates start open
-        nn.init.constant_(self.conv1.parametrizations.conv.original.bias[out_ch:], 1.0)
-        nn.init.constant_(self.conv2.parametrizations.conv.original.bias[out_ch:], 1.0)
+        if self.conv1.conv.bias is not None:
+            nn.init.constant_(self.conv1.conv.bias[out_ch:], 1.0)
+        if self.conv2.conv.bias is not None:
+            nn.init.constant_(self.conv2.conv.bias[out_ch:], 1.0)
         
         self.spatial_drop = SpatialDropout1d(dropout)
         self.drop = nn.Dropout(dropout)

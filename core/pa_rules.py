@@ -370,13 +370,16 @@ def _mag_bar_5m(bars: pd.DataFrame, ema_20: pd.Series) -> pd.DataFrame:
 def _inside_bars_5m(bars: pd.DataFrame) -> pd.DataFrame:
     prev_high = bars["high"].shift(1)
     prev_low = bars["low"].shift(1)
-    is_inside = (bars["high"] < prev_high) & (bars["low"] > prev_low)
-    is_ii = is_inside & is_inside.shift(1).fillna(False)
+    # Explicit bool dtype avoids FutureWarning on object/array fillna downcasting (pandas 2.x).
+    is_inside = (
+        (bars["high"] < prev_high) & (bars["low"] > prev_low)
+    ).fillna(False).astype(bool)
+    is_ii = is_inside & is_inside.shift(1).fillna(False).astype(bool)
 
     out = pd.DataFrame(index=bars.index)
     out["time_key"] = bars["time_key"].values
-    out["pa_is_inside_bar"] = is_inside.fillna(False).values
-    out["pa_is_ii_pattern"] = is_ii.fillna(False).values
+    out["pa_is_inside_bar"] = is_inside.values
+    out["pa_is_ii_pattern"] = is_ii.values
     return out
 
 
