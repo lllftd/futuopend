@@ -1193,7 +1193,7 @@ def _train_regime_opp_regression_models(
         m_mfe = lgb.train(
             base_reg, d_mfe_tr, num_boost_round=reg_rounds, valid_sets=[d_mfe_va], callbacks=cb,
         )
-        w_mae = _opp_regression_sample_weights(y_mfe_g, predicted_regime)
+        w_mae = _opp_regression_sample_weights(y_mae_g, predicted_regime)
         d_mae_tr = lgb.Dataset(X_g, label=y_mae_g, weight=w_mae, feature_name=all_bo_feats, free_raw_data=False)
         d_mae_va = lgb.Dataset(X_va, label=y_mae_va, feature_name=all_bo_feats, free_raw_data=False)
         print(f"    [L2b regression] {predicted_regime}: train MAE head …", flush=True)
