@@ -9,6 +9,10 @@ env/
 
 # Local outputs and runtime artifacts
 results/
+*.log
+lgbm_models/
+data/*.csv
+data/.tcn_*.dat
 
 # IDE/runtime local folders
 .cursor/

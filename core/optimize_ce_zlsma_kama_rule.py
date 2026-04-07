@@ -351,9 +351,9 @@ def build_entry_signals(df: pd.DataFrame, params: RuleParams) -> tuple[pd.Series
         raw_long = raw_long & df["pa_net_pressure"].ge(params.pa_pressure_min).fillna(False)
         raw_short = raw_short & df["pa_net_pressure"].le(-params.pa_pressure_min).fillna(False)
 
-    if params.pa_regime_filter and "pa_reversal_likely_fail" in df.columns:
+    if params.pa_regime_filter and "pa_regime_trend" in df.columns:
         ce_is_reversal = df["ce_buy_signal"].fillna(False) | df["ce_sell_signal"].fillna(False)
-        reversal_suppress = ce_is_reversal & df["pa_reversal_likely_fail"].fillna(False)
+        reversal_suppress = ce_is_reversal & df["pa_regime_trend"].fillna(False)
         raw_long = raw_long & ~reversal_suppress
         raw_short = raw_short & ~reversal_suppress
 

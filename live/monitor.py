@@ -97,10 +97,6 @@ CE_VALIDITY_MODE = "5m"
 CE_SIGNAL_VALID_BARS = 5
 
 
-def _date_tag(d: date) -> str:
-    return d.strftime("%Y%m%d")
-
-
 def _day_folder_name(d: date) -> str:
     return d.strftime("%Y-%m-%d")
 
@@ -1552,40 +1548,6 @@ def run_live(host: str, port: int, feishu_webhook: str, poll_seconds: int) -> in
         ctx.close()
 
     return 0
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _print_param_summary() -> None:
-    _log_info(f"{_C.CYAN}{'='*60}{_C.RESET}")
-    _log_info(f"{_C.CYAN}  V3 Strategy Parameters{_C.RESET}")
-    _log_info(f"{_C.CYAN}{'='*60}{_C.RESET}")
-    for symbol in MONITOR_SYMBOLS:
-        params = V3_BEST_PARAMS[symbol]
-        bench = V3_BENCHMARKS[symbol]
-        _log_info(
-            f"  {_C.BOLD}{symbol}{_C.RESET}: "
-            f"CE({params.ce_length},{params.ce_multiplier}) "
-            f"{params.exit_model} "
-            f"TP={params.tp_atr_multiple or params.tp_pct} "
-            f"SL={params.sl_pct} "
-            f"TS={params.time_stop_minutes}m "
-            f"session={params.session_filter}"
-        )
-        _log_info(
-            f"    ZLSMA={params.zlsma_length} KAMA={params.kama_er_length}/"
-            f"{params.kama_fast_length}/{params.kama_slow_length} "
-            f"sizing={params.pa_position_sizing_mode}"
-        )
-        _log_info(
-            f"    Benchmark: sharpe={bench['sharpe']:.2f} "
-            f"win={bench['win_rate']:.1%} "
-            f"dd={bench['max_drawdown']:.2%} "
-            f"hold={bench['avg_holding_minutes']:.1f}m"
-        )
-    _log_info(f"{_C.CYAN}{'='*60}{_C.RESET}")
 
 
 # ---------------------------------------------------------------------------
