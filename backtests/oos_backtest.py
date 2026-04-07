@@ -152,16 +152,26 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
             p["l3_size"], l3_x, OOS_PRED_CHUNK, desc=f"L3 size [{symbol}]",
         )
         exec_size = np.clip(pg * ps, -1.0, 1.0)
+        if p.get("l3_tp") and p.get("l3_sl"):
+            pred_tp_atr = _chunked_booster_predict(p["l3_tp"], l3_x, OOS_PRED_CHUNK, desc=f"L3 TP [{symbol}]")
+            pred_sl_atr = _chunked_booster_predict(p["l3_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L3 SL [{symbol}]")
+        else:
+            pred_tp_atr = df["l2b_pred_mfe"].values * 0.85
+            pred_sl_atr = df["l2b_pred_mae"].values * 1.5
     else:
         exec_size = _chunked_booster_predict(
             p["l3_model"], l3_x, OOS_PRED_CHUNK, desc=f"L3 sizer [{symbol}]",
         )
         exec_size = np.clip(exec_size, -1.5, 1.5)
+        pred_tp_atr = df["l2b_pred_mfe"].values * 0.85
+        pred_sl_atr = df["l2b_pred_mae"].values * 1.5
 
     df["exec_size"] = exec_size
+    df["pred_tp_atr"] = np.clip(pred_tp_atr, 0.1, 10.0)
+    df["pred_sl_atr"] = np.clip(pred_sl_atr, 0.1, 5.0)
     df["atr_5m"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean()
-    mfe_arr = df["l2b_pred_mfe"].values
-    mae_arr = df["l2b_pred_mae"].values
+    tp_arr = df["pred_tp_atr"].values
+    sl_arr = df["pred_sl_atr"].values
     atr_arr = df["atr_5m"].values
 
     trades = []
@@ -186,16 +196,16 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 in_pos = 1
                 entry_price = float(nxt_open)
                 entry_time = nxt_time
-                # Dynamic SL/TP based on Layer 2b predictions and current ATR
-                sl_price = entry_price - max(mae_arr[i], 0.5) * atr_arr[i] * 1.5
-                tp_price = entry_price + max(mfe_arr[i], 1.0) * atr_arr[i] * 0.85
+                # Dynamic SL/TP based on Layer 3 TP/SL models and current ATR
+                sl_price = entry_price - sl_arr[i] * atr_arr[i]
+                tp_price = entry_price + tp_arr[i] * atr_arr[i]
                 hold = 0
             elif sz < -0.6:
                 in_pos = -1
                 entry_price = float(nxt_open)
                 entry_time = nxt_time
-                sl_price = entry_price + max(mae_arr[i], 0.5) * atr_arr[i] * 1.5
-                tp_price = entry_price - max(mfe_arr[i], 1.0) * atr_arr[i] * 0.85
+                sl_price = entry_price + sl_arr[i] * atr_arr[i]
+                tp_price = entry_price - tp_arr[i] * atr_arr[i]
                 hold = 0
         else:
             hold += 1

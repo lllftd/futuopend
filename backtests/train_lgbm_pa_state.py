@@ -1083,6 +1083,8 @@ LAYER3_PA_KEY_FEATURES: tuple[str, ...] = (
 
 EXECUTION_SIZER_GATE_FILE = "execution_sizer_gate.txt"
 EXECUTION_SIZER_SIZE_FILE = "execution_sizer_size.txt"
+EXECUTION_SIZER_TP_FILE = "execution_sizer_tp.txt"
+EXECUTION_SIZER_SL_FILE = "execution_sizer_sl.txt"
 EXECUTION_SIZER_LEGACY_V1_FILE = "execution_sizer_v1.txt"
 
 
@@ -2270,6 +2272,9 @@ def train_execution_sizer(
     edge = np.clip(edge, -3.0, 3.0)
     edge_scale = np.clip(0.90 + 0.30 * edge, 0.0, 1.60)
     y_target = np.clip(base_size * edge_scale, -1.0, 1.0)
+    
+    y_tp_target = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
+    y_sl_target = np.clip(work["max_adverse"].values / safe_atr, 0.0, 3.0)
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
@@ -2317,6 +2322,9 @@ def train_execution_sizer(
 
     X_train, y_train = X[cal_mask], y_target[cal_mask]
     X_test, y_test = X[test_mask], y_target[test_mask]
+
+    y_tp_train, y_sl_train = y_tp_target[cal_mask], y_sl_target[cal_mask]
+    y_tp_test, y_sl_test = y_tp_target[test_mask], y_sl_target[test_mask]
 
     y_gate_train = (np.abs(y_train) >= l3_flat_tau).astype(np.int32)
     pos_ct = int(y_gate_train.sum())
@@ -2402,6 +2410,20 @@ def train_execution_sizer(
         callbacks=es_cb,
     )
 
+    print("\n  Training Layer 3 TP (Take Profit) and SL (Stop Loss) models ...")
+    
+    tp_params = size_params.copy()
+    tp_params["seed"] = 44
+    d_tp_tr = lgb.Dataset(X_train, label=y_tp_train, weight=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
+    d_tp_va = lgb.Dataset(X_test, label=y_tp_test, weight=y_gate_test, feature_name=exec_feat_cols, free_raw_data=True)
+    model_tp = lgb.train(tp_params, d_tp_tr, num_boost_round=rounds // 2, valid_sets=[d_tp_va], callbacks=es_cb)
+
+    sl_params = size_params.copy()
+    sl_params["seed"] = 45
+    d_sl_tr = lgb.Dataset(X_train, label=y_sl_train, weight=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
+    d_sl_va = lgb.Dataset(X_test, label=y_sl_test, weight=y_gate_test, feature_name=exec_feat_cols, free_raw_data=True)
+    model_sl = lgb.train(sl_params, d_sl_tr, num_boost_round=rounds // 2, valid_sets=[d_sl_va], callbacks=es_cb)
+
     pred_g = model_gate.predict(X_test)
     pred_s = model_size.predict(X_test)
     pred = np.clip(pred_g * pred_s, -1.0, 1.0)
@@ -2433,6 +2455,8 @@ def train_execution_sizer(
     os.makedirs(MODEL_DIR, exist_ok=True)
     model_gate.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_GATE_FILE))
     model_size.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SIZE_FILE))
+    model_tp.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TP_FILE))
+    model_sl.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SL_FILE))
     import pickle
 
     meta = {
@@ -2453,14 +2477,16 @@ def train_execution_sizer(
         "model_files": {
             "gate": EXECUTION_SIZER_GATE_FILE,
             "size": EXECUTION_SIZER_SIZE_FILE,
+            "tp": EXECUTION_SIZER_TP_FILE,
+            "sl": EXECUTION_SIZER_SL_FILE,
         },
     }
     with open(os.path.join(MODEL_DIR, "execution_sizer_meta.pkl"), "wb") as f:
         pickle.dump(meta, f)
-    bundle = {"gate": model_gate, "size": model_size, "meta": meta}
+    bundle = {"gate": model_gate, "size": model_size, "tp": model_tp, "sl": model_sl, "meta": meta}
     print(
         f"\n  Models saved → {MODEL_DIR}/{EXECUTION_SIZER_GATE_FILE}, "
-        f"{EXECUTION_SIZER_SIZE_FILE}",
+        f"{EXECUTION_SIZER_SIZE_FILE}, {EXECUTION_SIZER_TP_FILE}, {EXECUTION_SIZER_SL_FILE}"
     )
     print(f"  Meta saved  → {MODEL_DIR}/execution_sizer_meta.pkl")
     return bundle, meta, imp_df
