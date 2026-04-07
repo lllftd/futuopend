@@ -47,6 +47,9 @@ class Logger:
         self.terminal.flush()
         self.log.flush()
         
+    def isatty(self):
+        return getattr(self.terminal, "isatty", lambda: False)()
+        
     def close(self):
         sys.stdout = self.original_stdout
         sys.stderr = self.original_stderr
