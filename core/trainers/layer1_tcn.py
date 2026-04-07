@@ -183,8 +183,9 @@ def train_tcn(
         flush=True,
     )
 
+    n_tcn_classes = len(TCN_REGIME_FUT_PROB_COLS)
     oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
-    oof_regime_probs = np.zeros((len(train_idx), NUM_REGIME_CLASSES), dtype=np.float32)
+    oof_regime_probs = np.zeros((len(train_idx), n_tcn_classes), dtype=np.float32)
 
     print("  Loading memmap into RAM for fast training…", flush=True)
     X_tseq = torch.from_numpy(np.array(X_mm))
