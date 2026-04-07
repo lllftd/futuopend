@@ -159,10 +159,16 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         exec_size = np.clip(exec_size, -1.5, 1.5)
 
     df["exec_size"] = exec_size
+    df["atr_5m"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean()
+    mfe_arr = df["l2b_pred_mfe"].values
+    mae_arr = df["l2b_pred_mae"].values
+    atr_arr = df["atr_5m"].values
 
     trades = []
     in_pos = 0
     entry_price = 0.0
+    sl_price = 0.0
+    tp_price = 0.0
     entry_time = None
     max_hold = 30
 
@@ -171,41 +177,89 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     for i in _tq(bar_range, desc=f"Simulate [{symbol}]", unit="bar", total=n_sim, mininterval=0.25):
         sz = exec_size[i]
         nxt_open = df["open"].iloc[i + 1]
+        nxt_high = df["high"].iloc[i + 1]
+        nxt_low = df["low"].iloc[i + 1]
+        nxt_time = df["time_key"].iloc[i + 1]
 
         if in_pos == 0:
             if sz > 0.6:
                 in_pos = 1
                 entry_price = float(nxt_open)
-                entry_time = df["time_key"].iloc[i + 1]
+                entry_time = nxt_time
+                # Dynamic SL/TP based on Layer 2b predictions and current ATR
+                sl_price = entry_price - max(mae_arr[i], 0.5) * atr_arr[i] * 1.5
+                tp_price = entry_price + max(mfe_arr[i], 1.0) * atr_arr[i] * 0.85
                 hold = 0
             elif sz < -0.6:
                 in_pos = -1
                 entry_price = float(nxt_open)
-                entry_time = df["time_key"].iloc[i + 1]
+                entry_time = nxt_time
+                sl_price = entry_price + max(mae_arr[i], 0.5) * atr_arr[i] * 1.5
+                tp_price = entry_price - max(mfe_arr[i], 1.0) * atr_arr[i] * 0.85
                 hold = 0
         else:
             hold += 1
             exit_signal = False
-            if in_pos == 1 and sz < -0.2:
-                exit_signal = True
-            if in_pos == -1 and sz > 0.2:
-                exit_signal = True
-            if hold >= max_hold:
-                exit_signal = True
+            exit_price = 0.0
+            exit_reason = ""
+
+            if in_pos == 1:
+                # Trailing Stop: move SL to break-even if we are 1 ATR in profit
+                if nxt_high > entry_price + atr_arr[i]:
+                    sl_price = max(sl_price, entry_price + atr_arr[i] * 0.1)
+                
+                if nxt_low <= sl_price:
+                    exit_signal = True
+                    exit_price = min(sl_price, float(nxt_open))
+                    exit_reason = "SL"
+                elif nxt_high >= tp_price:
+                    exit_signal = True
+                    exit_price = max(tp_price, float(nxt_open))
+                    exit_reason = "TP"
+                elif sz < -0.2:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Signal_Flip"
+                elif hold >= max_hold:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Time_Stop"
+
+            elif in_pos == -1:
+                # Trailing Stop: move SL to break-even if we are 1 ATR in profit
+                if nxt_low < entry_price - atr_arr[i]:
+                    sl_price = min(sl_price, entry_price - atr_arr[i] * 0.1)
+
+                if nxt_high >= sl_price:
+                    exit_signal = True
+                    exit_price = max(sl_price, float(nxt_open))
+                    exit_reason = "SL"
+                elif nxt_low <= tp_price:
+                    exit_signal = True
+                    exit_price = min(tp_price, float(nxt_open))
+                    exit_reason = "TP"
+                elif sz > 0.2:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Signal_Flip"
+                elif hold >= max_hold:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Time_Stop"
 
             if exit_signal:
-                exit_price = float(nxt_open)
                 ret = (exit_price / entry_price - 1.0) * in_pos
                 trades.append(
                     {
                         "symbol": symbol,
                         "entry_time": entry_time,
-                        "exit_time": df["time_key"].iloc[i + 1],
+                        "exit_time": nxt_time,
                         "direction": "LONG" if in_pos == 1 else "SHORT",
                         "entry_price": entry_price,
                         "exit_price": exit_price,
                         "return": ret,
                         "holding_bars": hold,
+                        "exit_reason": exit_reason,
                     }
                 )
                 in_pos = 0
