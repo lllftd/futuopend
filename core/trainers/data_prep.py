@@ -163,6 +163,9 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 flush=True,
             )
         n_tcn_classes = int(meta.get("num_regime_classes", 2))
+        if n_tcn_classes != len(TCN_REGIME_FUT_PROB_COLS):
+            raise ValueError(f"TCN output classes ({n_tcn_classes}) does not match TCN_REGIME_FUT_PROB_COLS ({len(TCN_REGIME_FUT_PROB_COLS)}).")
+        
         model = PAStateTCN(
             input_size=input_size,
             num_channels=meta["num_channels"],
@@ -208,7 +211,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                     "Need enough history per symbol."
                 )
 
-            regime_probs_arr = np.full((n_bars, NUM_REGIME_CLASSES), np.nan, dtype=np.float32)
+            regime_probs_arr = np.full((n_bars, n_tcn_classes), np.nan, dtype=np.float32)
             embeddings = np.full((n_bars, bottleneck_dim), np.nan, dtype=np.float32)
 
             all_reg_prob, all_emb = [], []
