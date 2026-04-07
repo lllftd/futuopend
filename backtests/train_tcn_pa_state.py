@@ -76,7 +76,7 @@ TRAIN_END = "2023-01-01"
 CAL_END = "2023-07-01"
 TEST_END = "2025-01-01"
 
-SEQ_LEN = 60
+SEQ_LEN = 30
 # Stronger regularization / wider temporal receptive field for noisy 1-min inputs
 TCN_KERNEL_SIZE = 5
 TCN_DROPOUT = 0.375
@@ -455,14 +455,14 @@ def _train_tcn_model(
         flush=True,
     )
 
-    X_t = torch.from_numpy(X_mm)
+    X_t = torch.from_numpy(np.array(X_mm))
     y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
     base_ds = TensorDataset(X_t, y_t)
     train_ds = Subset(base_ds, train_idx)
     cal_ds = Subset(base_ds, cal_idx)
 
-    train_dl = DataLoader(train_ds, batch_size=512, shuffle=True, drop_last=True)
-    cal_dl = DataLoader(cal_ds, batch_size=1024, shuffle=False)
+    train_dl = DataLoader(train_ds, batch_size=4096, shuffle=True, drop_last=True)
+    cal_dl = DataLoader(cal_ds, batch_size=4096, shuffle=False)
 
     model = PAStateTCN(
         input_size=n_features,
@@ -597,8 +597,8 @@ def train_tcn(
     oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
     oof_regime_probs = np.zeros((len(train_idx), NUM_REGIME_CLASSES), dtype=np.float32)
 
-    print("  Building torch view + starting in-process OOF (first line may take ~1–3 min on MPS)…", flush=True)
-    X_tseq = torch.from_numpy(X_mm)
+    print("  Loading memmap into RAM for fast training…", flush=True)
+    X_tseq = torch.from_numpy(np.array(X_mm))
     for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
         start_idx = fold * fold_size
         end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
@@ -617,7 +617,7 @@ def train_tcn(
         )
 
         val_ds = TensorDataset(X_tseq[val_fold_idx])
-        val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False)
+        val_dl = DataLoader(val_ds, batch_size=4096, shuffle=False)
 
         fold_embs, fold_rp = [], []
         with torch.inference_mode():
@@ -643,7 +643,7 @@ def train_tcn(
         pickle.dump(oof_cache, f)
     print(f"\n  Saved OOF cache -> {MODEL_DIR}/tcn_oof_cache.pkl")
 
-    X_t = torch.from_numpy(X_mm)
+    X_t = torch.from_numpy(np.array(X_mm))
 
     # 2. Final Model Training (same max_epochs / patience as OOF — Scheme A)
     final_model = _train_tcn_model(
@@ -660,7 +660,7 @@ def train_tcn(
     y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
     test_ds = TensorDataset(X_t, y_t)
     test_ds_sub = Subset(test_ds, test_idx)
-    test_dl = DataLoader(test_ds_sub, batch_size=1024, shuffle=False)
+    test_dl = DataLoader(test_ds_sub, batch_size=4096, shuffle=False)
 
     all_preds, all_labels = [], []
     with torch.no_grad():

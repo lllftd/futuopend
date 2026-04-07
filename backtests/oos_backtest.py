@@ -67,7 +67,7 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     regime_probs_arr = np.full((n_bars, NUM_REGIME_CLASSES), np.nan, dtype=np.float32)
 
     if len(windows) > 0:
-        batch_size = max(8, int(os.environ.get("TCN_BATCH_SIZE", "512")))
+        batch_size = max(8, int(os.environ.get("TCN_BATCH_SIZE", "4096")))
         device = p["device"]
         n_batches = (len(windows) + batch_size - 1) // batch_size
         with torch.inference_mode():

@@ -431,7 +431,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
         model = model.to(device)
         model.eval()
         # Mac / CPU PyTorch Conv1d + large batches can SIGSEGV; keep CPU batches small unless overridden.
-        _bs_default = "2048" if device.type in ("mps", "cuda") else "64"
+        _bs_default = "4096" if device.type in ("mps", "cuda") else "64"
         batch_size = max(8, int(os.environ.get("TCN_BATCH_SIZE", _bs_default)))
     
         feat_mean = np.asarray(meta["mean"], dtype=np.float32)
