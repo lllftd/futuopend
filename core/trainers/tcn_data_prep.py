@@ -3,7 +3,9 @@ from __future__ import annotations
 import gc
 import os
 import pickle
+import time as _time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -14,14 +16,13 @@ from sklearn.metrics import accuracy_score, f1_score, log_loss
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
-import time as _time
 
+from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
 from core.tcn_pa_state import FocalLoss, PAStateTCN
-from core.indicators import atr as compute_atr
 
 from core.trainers.tcn_constants import *
-from core.trainers.tcn_utils import *
+from core.trainers.tcn_utils import _tq  # not included in `import *` (leading underscore)
 
 def _load_and_compute_pa(symbol: str) -> pd.DataFrame:
     raw = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}.csv"))

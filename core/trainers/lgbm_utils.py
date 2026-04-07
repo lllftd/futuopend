@@ -3,10 +3,12 @@ from __future__ import annotations
 import gc
 import os
 import pickle
+import sys
 import warnings
 from typing import Any
 
 import lightgbm as lgb
+import optuna
 import numpy as np
 import pandas as pd
 import torch
@@ -20,6 +22,9 @@ from core.pa_rules import add_pa_features
 from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 from core.trainers.constants import *
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 
 def _tcn_bottleneck_dim_from_meta() -> int:
     meta_path = os.path.join(MODEL_DIR, "tcn_meta.pkl")
@@ -160,6 +165,15 @@ def _split_feature_groups(feat_cols: list[str]) -> tuple[list[str], list[str], l
     tcn = [c for c in feat_cols if c.startswith("tcn_")]
     base = [c for c in feat_cols if c not in set(hmm + garch + tcn)]
     return base, hmm, garch, tcn
+
+
+def _regime_lgbm_feature_cols(feat_cols: list[str]) -> list[str]:
+    """PA + GARCH only for regime head / L2b regime predict (no TCN, no pa_hmm_* — avoids label leakage)."""
+    return [
+        c
+        for c in feat_cols
+        if not c.startswith("tcn_") and not c.startswith("pa_hmm_")
+    ]
 
 
 def _tq(it, **kwargs):
@@ -348,3 +362,29 @@ def _layer3_chunk_rows() -> int:
     return max(4096, int(os.environ.get("LAYER3_CHUNK", "65536")))
 
 
+# `from module import *` skips leading-underscore names unless listed here.
+__all__ = [
+    "configure_compute_threads",
+    "_compute_sample_weights",
+    "_is_lgbm_string_tag_col",
+    "_l2b_reg_objective_params",
+    "_layer3_chunk_rows",
+    "_lgb_log_eval_period",
+    "_lgb_round_tqdm_enabled",
+    "_lgb_train_callbacks",
+    "_lgb_train_callbacks_with_round_tqdm",
+    "_lgbm_booster_feature_names",
+    "_lgbm_n_jobs",
+    "_mfe_mae_atr_arrays",
+    "_numeric_feature_cols_for_matrix",
+    "_opp_regression_sample_weights",
+    "_optuna_search_params",
+    "_regime_lgbm_feature_cols",
+    "_require_lgb_matrix_matches_names",
+    "_split_feature_groups",
+    "_tcn_bottleneck_dim_from_meta",
+    "_tcn_derived_feature_names",
+    "_tcn_inference_device",
+    "_tq",
+    "_unique_cols",
+]

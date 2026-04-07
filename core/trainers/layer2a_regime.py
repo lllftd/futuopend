@@ -11,7 +11,16 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    classification_report,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
@@ -22,18 +31,6 @@ from core.tcn_pa_state import PAStateTCN, FocalLoss
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.data_prep import *
-
-def _regime_lgbm_feature_cols(feat_cols: list[str]) -> list[str]:
-    """Layer-2a regime head: PA + GARCH only (no TCN, no HMM columns).
-
-    state_label is derived from pa_hmm_state / HMM softmax; including pa_hmm_* in X is label leakage
-    (trees memorize argmax). Exclude the full HMM block so L2a learns regime from causal price/vol features.
-    """
-    return [
-        c
-        for c in feat_cols
-        if not c.startswith("tcn_") and not c.startswith("pa_hmm_")
-    ]
 
 
 def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):

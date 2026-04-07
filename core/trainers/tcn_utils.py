@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sys
 import gc
 import os
 import pickle
+import sys
 from collections import Counter
 from typing import Any, Dict, List, Tuple
 

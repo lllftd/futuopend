@@ -6,3 +6,4 @@ tqdm
 lightgbm>=4.0,<5
 torch
 scikit-learn>=1.3,<2
+optuna>=3.0,<4

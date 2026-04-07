@@ -3,7 +3,9 @@ from __future__ import annotations
 import gc
 import os
 import pickle
+import time as _time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
 
 import lightgbm as lgb
