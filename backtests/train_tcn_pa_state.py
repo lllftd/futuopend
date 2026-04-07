@@ -104,15 +104,11 @@ TCN_OOF_Y_NPY = "tcn_oof_y.npy"
 TCN_OOF_TRAIN_IDX_NPY = "tcn_oof_train_idx.npy"
 
 STATE_NAMES = {
-    0: "bull_conv",
-    1: "bull_div",
-    2: "bear_conv",
-    3: "bear_div",
-    4: "range_conv",
-    5: "range_div",
+    0: "same",
+    1: "transition"
 }
-NUM_REGIME_CLASSES = 6
-STATE_CLASSIFIER_FILE = "state_classifier_6c.txt"
+NUM_REGIME_CLASSES = 2
+STATE_CLASSIFIER_FILE = "tcn_transition_classifier.pt"
 
 
 def _pick_tcn_train_device() -> torch.device:
@@ -356,11 +352,12 @@ def prepare_data():
 
     df = pd.concat(parts, ignore_index=True)
     df = df.sort_values(["symbol", "time_key"]).reset_index(drop=True)
-    # Future regime (15 bars ahead), per symbol — same 6-class space as CSV market_state.
-    ms = pd.to_numeric(df["market_state"], errors="coerce")
-    df["state_label"] = (
+    # Future regime transition (15 bars ahead).
+    ms = pd.to_numeric(df["market_state"], errors="coerce").fillna(4).astype(int)
+    fut_ms = (
         ms.groupby(df["symbol"]).transform(lambda s: s.shift(-15)).fillna(4).astype(int)
     )
+    df["state_label"] = (ms != fut_ms).astype(int)
 
     feat_cols, bool_cols = _pa_feature_cols(df)
     print(f"  PA features: {len(feat_cols) - len(bool_cols)} continuous + {len(bool_cols)} boolean = {len(feat_cols)} total")
@@ -775,7 +772,7 @@ def train_tcn(
     print("\n" + "=" * 70, flush=True)
     print(
         f"  Training TCN — {TCN_OOF_FOLDS}-fold OOF "
-        f"(future 6-class regime, +15 bars)",
+        f"(future transition signal, +15 bars)",
         flush=True,
     )
     print("=" * 70, flush=True)
@@ -889,9 +886,9 @@ def train_tcn(
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
     acc = accuracy_score(y_true, y_pred)
-    print(f"\n  Test Accuracy — future regime (6-class): {acc:.4f}")
+    print(f"\n  Test Accuracy — future transition (binary): {acc:.4f}")
     target_names = [STATE_NAMES[i] for i in range(NUM_REGIME_CLASSES)]
-    print("\n  Classification Report — future market_state (+15 bars):")
+    print("\n  Classification Report — future transition (+15 bars):")
     print(
         classification_report(
             y_true, y_pred,
@@ -915,7 +912,7 @@ def main():
         return
 
     print("=" * 70)
-    print("  TCN — Future Regime (6-class, +15 bars)")
+    print("  TCN — Future Transition Signal (binary, +15 bars)")
     print("=" * 70)
     print(f"  Device: {DEVICE}  (override: TORCH_DEVICE=cuda:0 | mps | cpu)")
 
@@ -934,7 +931,7 @@ def main():
 
         # Save
         os.makedirs(MODEL_DIR, exist_ok=True)
-        torch.save(tcn_model.state_dict(), os.path.join(MODEL_DIR, "tcn_state_classifier.pt"))
+        torch.save(tcn_model.state_dict(), os.path.join(MODEL_DIR, STATE_CLASSIFIER_FILE))
 
         meta = {
             "mean": norm_stats["mean"],
@@ -947,14 +944,14 @@ def main():
             "dropout": TCN_DROPOUT,
             "bottleneck_dim": TCN_BOTTLENECK_DIM,
             "is_dual_head": False,
-            "tcn_head": "regime6_future_15_bottleneck",
+            "tcn_head": "regime_transition_15_bottleneck",
             "num_regime_classes": NUM_REGIME_CLASSES,
             "state_names": STATE_NAMES,
         }
         with open(os.path.join(MODEL_DIR, "tcn_meta.pkl"), "wb") as f:
             pickle.dump(meta, f)
 
-        print(f"\n  TCN 6-class future-regime model saved → {MODEL_DIR}/tcn_state_classifier.pt")
+        print(f"\n  TCN binary future-transition model saved → {MODEL_DIR}/{STATE_CLASSIFIER_FILE}")
         print(f"  Meta saved → {MODEL_DIR}/tcn_meta.pkl")
         print("\n" + "=" * 70)
         print("  DONE")

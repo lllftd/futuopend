@@ -116,7 +116,7 @@ REGIME_NOW_PROB_COLS = [f"regime_now_{STATE_NAMES[i]}" for i in range(NUM_REGIME
 # Layer 2a calibrated probs + max-prob confidence for Layer 3 / diagnostics
 REGIME_PROB_COLS = REGIME_NOW_PROB_COLS + ["regime_now_conf"]
 
-TCN_REGIME_FUT_PROB_COLS = [f"tcn_regime_fut_{STATE_NAMES[i]}" for i in range(NUM_REGIME_CLASSES)]
+TCN_REGIME_FUT_PROB_COLS = ["tcn_transition_same", "tcn_transition_prob"]
 # Default when tcn_meta.pkl is missing; otherwise use meta["bottleneck_dim"] (see _tcn_derived_feature_names).
 TCN_BOTTLENECK_DIM = max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
 
@@ -368,11 +368,11 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
     Run order: train_tcn_pa_state.py first so tcn_meta.pkl + tcn_state_classifier.pt exist.
     """
     meta_path = os.path.join(MODEL_DIR, "tcn_meta.pkl")
-    model_path = os.path.join(MODEL_DIR, "tcn_state_classifier.pt")
+    model_path = os.path.join(MODEL_DIR, "tcn_transition_classifier.pt")
 
     if not (os.path.exists(meta_path) and os.path.exists(model_path)):
         raise RuntimeError(
-            f"Missing TCN checkpoint under {MODEL_DIR}: need tcn_meta.pkl and tcn_state_classifier.pt. "
+            f"Missing TCN checkpoint under {MODEL_DIR}: need tcn_meta.pkl and tcn_transition_classifier.pt. "
             "Train first: python3 backtests/train_tcn_pa_state.py"
         )
 
@@ -417,13 +417,14 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 f"(env TCN_BOTTLENECK_DIM={TCN_BOTTLENECK_DIM}); using meta.",
                 flush=True,
             )
+        n_tcn_classes = int(meta.get("num_regime_classes", 2))
         model = PAStateTCN(
             input_size=input_size,
             num_channels=meta["num_channels"],
             kernel_size=meta["kernel_size"],
             dropout=0.0,
             bottleneck_dim=bottleneck_dim,
-            num_classes=NUM_REGIME_CLASSES,
+            num_classes=n_tcn_classes,
         )
         sd = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(sd)
@@ -539,7 +540,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 oof = pickle.load(f)
             if "regime_probs" not in oof:
                 raise RuntimeError(
-                    f"{oof_path} is missing 'regime_probs' (6-class). Retrain TCN: train_tcn_pa_state.py"
+                    f"{oof_path} is missing 'regime_probs' (transition). Retrain TCN: train_tcn_pa_state.py"
                 )
 
             oof_df = pd.DataFrame({
@@ -1699,14 +1700,20 @@ def _reconstruct_quality_classes(
     return pred
 
 
-def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float) -> tuple[np.ndarray, np.ndarray]:
-    """Apply Conformal Prediction prediction sets to filter out uncertain/OOS trades."""
+def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float, tcn_transition_prob: np.ndarray = None) -> tuple[np.ndarray, np.ndarray]:
+    """Apply Conformal Prediction prediction sets and TCN transition signal to filter out uncertain/OOS trades."""
     y_set = regime_probs >= thr_cp
     set_size = y_set.sum(axis=1)
     contains_bull = y_set[:, 0] | y_set[:, 1]
     contains_bear = y_set[:, 2] | y_set[:, 3]
     is_conflicting = contains_bull & contains_bear
     skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0)
+    
+    # Optional: Hard Skip if TCN predicts very high transition probability
+    if tcn_transition_prob is not None:
+        high_transition_risk = tcn_transition_prob > 0.70
+        skip_cp = skip_cp | high_transition_risk
+        
     p_trade_adj = p_trade.copy()
     p_trade_adj[skip_cp] = 0.0
     return p_trade_adj, skip_cp
@@ -1981,7 +1988,8 @@ def train_trade_quality_classifier(
             best_f05, best_thr = f05, thr_c
     thr_trade_cal = best_thr if best_f05 > 0 else 0.85
     
-    p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp)
+    tcn_transition_prob_cal = work["tcn_transition_prob"].values.astype(np.float32)[cal_mask] if "tcn_transition_prob" in work.columns else None
+    p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp, tcn_transition_prob_cal)
     pr_cal = (p_trade_cal >= thr_trade_cal).astype(int)
     f1_cal_at_thr = f1_score(y_trade_cal, pr_cal, zero_division=0)
     n_trade_pred_cal = int(pr_cal.sum())
@@ -2003,7 +2011,8 @@ def train_trade_quality_classifier(
     p_range_mass_test = rp_test[:, RANGE_REGIME_INDICES].sum(axis=1)
     p_trade = p_trade * (1.0 - 0.7 * p_range_mass_test)
     
-    p_trade, skip_cp_test = _apply_cp_skip(rp_test, p_trade, thr_cp)
+    tcn_transition_prob_test = work["tcn_transition_prob"].values.astype(np.float32)[test_mask] if "tcn_transition_prob" in work.columns else None
+    p_trade, skip_cp_test = _apply_cp_skip(rp_test, p_trade, thr_cp, tcn_transition_prob_test)
     print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
     
     p_long = np.full(len(X_test), 0.5, dtype=float)
@@ -2231,7 +2240,8 @@ def train_execution_sizer(
     _layer3_fill_trade_stack_probs(
         trade_quality_models, work, layer2_feats, p_trade, p_long, p_a, chunk,
     )
-    p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp)
+    tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
+    p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp, tcn_transition_prob_all)
 
     l2b_opp = np.empty(n, dtype=np.float32)
     l2b_mfe = np.empty(n, dtype=np.float32)
