@@ -60,17 +60,18 @@ import torch.nn as nn
 from sklearn.calibration import calibration_curve
 from sklearn.cluster import KMeans
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import (
-    accuracy_score,
-    brier_score_loss,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    log_loss,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+    from sklearn.metrics import (
+        accuracy_score,
+        brier_score_loss,
+        classification_report,
+        confusion_matrix,
+        f1_score,
+        fbeta_score,
+        log_loss,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+    )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1387,7 +1388,10 @@ def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float
             x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
             
             if s1 is not None:
-                p_trade[i:j] = s1.predict(x_b)
+                raw_p = s1.predict(x_b)
+                rp = regime_mat[i:j]
+                p_rm = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
+                p_trade[i:j] = raw_p * (1.0 - 0.7 * p_rm)
             else:
                 rp = regime_mat[i:j]
                 opp = _compute_opportunity_scores(x_b, rp, models)
@@ -1927,8 +1931,9 @@ def train_trade_quality_classifier(
 
     print("  [L2b train] Dedicated Step1 TRADE/SKIP binary classifier …", flush=True)
     c1, clean1 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 Binary")
-    w1_train = _binary_weights(y_trade_train, t[train_mask], pos_boost=1.5)
-    w1_cal = _binary_weights(y_trade_cal, t[cal_mask], pos_boost=1.5)
+    # Massive pos_boost to force model to learn the rare 3% signals instead of predicting CHOP for everything
+    w1_train = _binary_weights(y_trade_train, t[train_mask], pos_boost=8.0)
+    w1_cal = _binary_weights(y_trade_cal, t[cal_mask], pos_boost=4.0)
     d1_train = lgb.Dataset(X_train, label=y_trade_train, weight=w1_train, feature_name=all_bo_feats, free_raw_data=False)
     d1_cal = lgb.Dataset(X_cal, label=y_trade_cal, weight=w1_cal, feature_name=all_bo_feats, free_raw_data=False)
     try:
@@ -1961,14 +1966,20 @@ def train_trade_quality_classifier(
     rp_cal = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
     p_trade_cal = step1_binary_model.predict(X_cal)
     
-    # Find best F1 threshold for binary classifier
-    best_f1, best_thr = 0.0, 0.5
-    for thr_c in np.arange(0.1, 0.9, 0.02):
+    # 1. Range Regime Penalty: heavily slash probabilities in range regimes
+    p_range_mass_cal = rp_cal[:, RANGE_REGIME_INDICES].sum(axis=1)
+    p_trade_cal = p_trade_cal * (1.0 - 0.7 * p_range_mass_cal)
+    
+    # 2. Threshold Search: Prioritize Precision via F0.5 score + strict Precision floor >= 15%
+    best_f05, best_thr = 0.0, 0.7
+    for thr_c in np.arange(0.2, 0.95, 0.02):
         pr = (p_trade_cal >= thr_c).astype(int)
-        f1v = f1_score(y_trade_cal, pr, zero_division=0)
-        if f1v > best_f1:
-            best_f1, best_thr = f1v, thr_c
-    thr_trade_cal = best_thr
+        f05 = fbeta_score(y_trade_cal, pr, beta=0.5, zero_division=0)
+        prec = precision_score(y_trade_cal, pr, zero_division=0)
+        # Require 15% precision floor to stop 100k CHOP leak
+        if f05 > best_f05 and prec >= 0.15:
+            best_f05, best_thr = f05, thr_c
+    thr_trade_cal = best_thr if best_f05 > 0 else 0.85
     
     p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp)
     pr_cal = (p_trade_cal >= thr_trade_cal).astype(int)
@@ -1976,7 +1987,7 @@ def train_trade_quality_classifier(
     n_trade_pred_cal = int(pr_cal.sum())
     rec_cal_thr = recall_score(y_trade_cal, pr_cal, zero_division=0)
     prec_cal_thr = precision_score(y_trade_cal, pr_cal, zero_division=0)
-    thr_rule_note = f"binary classifier: opt thr={thr_trade_cal:.2f}"
+    thr_rule_note = f"binary gate: opt F0.5 thr={thr_trade_cal:.2f} (prec>=0.15)"
     print(
         f"  Step1 cal: {thr_rule_note}  "
         f"F1={f1_cal_at_thr:.4f}  recall={rec_cal_thr:.3f}  precision={prec_cal_thr:.4f}  "
@@ -1987,6 +1998,11 @@ def train_trade_quality_classifier(
     rp_test = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
     opp_te = _compute_opportunity_scores(X_test, rp_test, reg_models)
     p_trade = step1_binary_model.predict(X_test)
+    
+    # Apply identical range penalty to test set
+    p_range_mass_test = rp_test[:, RANGE_REGIME_INDICES].sum(axis=1)
+    p_trade = p_trade * (1.0 - 0.7 * p_range_mass_test)
+    
     p_trade, skip_cp_test = _apply_cp_skip(rp_test, p_trade, thr_cp)
     print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
     
