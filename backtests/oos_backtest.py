@@ -158,20 +158,30 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         )
         exec_size = np.clip(exec_size, -1.5, 1.5)
 
-    # Layer 4 Execution (TP/SL Quantile Regressors)
-    if p.get("l4_tp") and p.get("l4_sl"):
-        pred_tp_atr = _chunked_booster_predict(p["l4_tp"], l3_x, OOS_PRED_CHUNK, desc=f"L4 TP [{symbol}]")
-        pred_sl_atr = _chunked_booster_predict(p["l4_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L4 SL [{symbol}]")
+    # Layer 4 Execution (Multi-class Binning & Survival)
+    if p.get("l4_tp") and p.get("l4_sl") and p.get("l4_time"):
+        pred_tp_prob = _chunked_booster_predict(p["l4_tp"], l3_x, OOS_PRED_CHUNK, desc=f"L4 TP [{symbol}]")
+        pred_sl_prob = _chunked_booster_predict(p["l4_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L4 SL [{symbol}]")
+        pred_time = _chunked_booster_predict(p["l4_time"], l3_x, OOS_PRED_CHUNK, desc=f"L4 Time [{symbol}]")
+        
+        tp_centers = np.array([0.25, 0.85, 1.85, 3.5])
+        sl_centers = np.array([0.25, 0.75, 1.25, 2.0])
+        
+        pred_tp_atr = np.sum(pred_tp_prob * tp_centers, axis=1)
+        pred_sl_atr = np.sum(pred_sl_prob * sl_centers, axis=1)
     else:
         pred_tp_atr = df["l2b_pred_mfe"].values * 0.85
         pred_sl_atr = df["l2b_pred_mae"].values * 1.5
+        pred_time = np.full(len(df), 30.0)
 
     df["exec_size"] = exec_size
     df["pred_tp_atr"] = np.clip(pred_tp_atr, 0.1, 10.0)
     df["pred_sl_atr"] = np.clip(pred_sl_atr, 0.1, 5.0)
+    df["pred_time"] = np.clip(pred_time, 2.0, 100.0)
     df["atr_5m"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean()
     tp_arr = df["pred_tp_atr"].values
     sl_arr = df["pred_sl_atr"].values
+    time_arr = df["pred_time"].values
     atr_arr = df["atr_5m"].values
 
     trades = []
@@ -196,9 +206,10 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 in_pos = 1
                 entry_price = float(nxt_open)
                 entry_time = nxt_time
-                # Dynamic SL/TP based on Layer 3 TP/SL models and current ATR
+                # Dynamic SL/TP and Time Stop based on Layer 4 models
                 sl_price = entry_price - sl_arr[i] * atr_arr[i]
                 tp_price = entry_price + tp_arr[i] * atr_arr[i]
+                max_hold = int(time_arr[i] * 1.2)
                 hold = 0
             elif sz < -0.6:
                 in_pos = -1
@@ -206,6 +217,7 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 entry_time = nxt_time
                 sl_price = entry_price + sl_arr[i] * atr_arr[i]
                 tp_price = entry_price - tp_arr[i] * atr_arr[i]
+                max_hold = int(time_arr[i] * 1.2)
                 hold = 0
         else:
             hold += 1

@@ -2487,8 +2487,8 @@ def train_exit_manager_layer4(
     thr_cp: float,
 ):
     print("\n" + "=" * 70)
-    print("  LAYER 4: Exit Manager (Quantile Regression for TP / SL)")
-    print("  y_tp = MFE/ATR (Quantile=0.4) | y_sl = MAE/ATR (Quantile=0.9)")
+    print("  LAYER 4: Exit Manager (Multi-class Binning + Time Survival + CP Uncertainty)")
+    print("  y_tp = MFE/ATR (4 Bins) | y_sl = MAE/ATR (4 Bins) | y_time = Exit Bar")
     print("=" * 70)
 
     chunk = _layer3_chunk_rows()
@@ -2520,8 +2520,17 @@ def train_exit_manager_layer4(
     _layer3_fill_l2b_triplet_arrays(trade_quality_models, work, layer2_feats, p_trade, l2b_opp, l2b_mfe, l2b_mae, chunk)
 
     safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values, 1e-3)
-    y_tp_target = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
-    y_sl_target = np.clip(work["max_adverse"].values / safe_atr, 0.0, 4.0)
+    
+    # Layer 4 Targets: Discretized Bins for TP/SL and Continuous Time-to-Event
+    mfe_atr = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
+    mae_atr = np.clip(work["max_adverse"].values / safe_atr, 0.0, 4.0)
+    
+    # Bins: 0: <0.5, 1: 0.5-1.2, 2: 1.2-2.5, 3: >2.5
+    y_tp_target = np.digitize(mfe_atr, bins=[0.5, 1.2, 2.5]).astype(np.int32)
+    # Bins: 0: <0.5, 1: 0.5-1.0, 2: 1.0-1.5, 3: >1.5
+    y_sl_target = np.digitize(mae_atr, bins=[0.5, 1.0, 1.5]).astype(np.int32)
+    # Time target (Survival): predict expected duration of the trade
+    y_time_target = np.clip(work.get("exit_bar", np.zeros(n)).fillna(0).values, 1, 30).astype(np.float32)
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
@@ -2550,6 +2559,7 @@ def train_exit_manager_layer4(
     X_train, X_test = X[cal_mask], X[test_mask]
     y_tp_train, y_tp_test = y_tp_target[cal_mask], y_tp_target[test_mask]
     y_sl_train, y_sl_test = y_sl_target[cal_mask], y_sl_target[test_mask]
+    y_time_train, y_time_test = y_time_target[cal_mask], y_time_target[test_mask]
     
     # We only care about training TP/SL on actual trades that passed the gate!
     thr_trade = trade_quality_models["thresholds"]["trade"]
@@ -2559,14 +2569,14 @@ def train_exit_manager_layer4(
     w_train = np.where(gate_mask_train, 1.0, 0.05) # Emphasize actual trades
     w_test = np.where(gate_mask_test, 1.0, 0.05)
 
-    rounds = 1000 if FAST_TRAIN_MODE else 2500
-    es_cb = _lgb_train_callbacks(80 if FAST_TRAIN_MODE else 100)
+    rounds = 800 if FAST_TRAIN_MODE else 2000
+    es_cb = _lgb_train_callbacks(60 if FAST_TRAIN_MODE else 100)
 
-    print("  Training TP Quantile Regressor (alpha=0.40 - Conservative MFE)...")
+    print("  Training TP Multi-class Binning Classifier (4 Bins)...")
     tp_params = {
-        "objective": "quantile",
-        "alpha": 0.40,
-        "metric": "quantile",
+        "objective": "multiclass",
+        "num_class": 4,
+        "metric": "multi_logloss",
         "boosting_type": "gbdt",
         "learning_rate": 0.02,
         "num_leaves": 31,
@@ -2582,36 +2592,57 @@ def train_exit_manager_layer4(
     d_tp_va = lgb.Dataset(X_test, label=y_tp_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
     model_tp = lgb.train(tp_params, d_tp_tr, num_boost_round=rounds, valid_sets=[d_tp_va], callbacks=es_cb)
 
-    print("  Training SL Quantile Regressor (alpha=0.90 - Tail MAE)...")
+    print("  Training SL Multi-class Binning Classifier (4 Bins)...")
     sl_params = tp_params.copy()
-    sl_params["alpha"] = 0.90
     sl_params["seed"] = 55
     d_sl_tr = lgb.Dataset(X_train, label=y_sl_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
     d_sl_va = lgb.Dataset(X_test, label=y_sl_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
     model_sl = lgb.train(sl_params, d_sl_tr, num_boost_round=rounds, valid_sets=[d_sl_va], callbacks=es_cb)
 
+    print("  Training Time Survival Proxy (Poisson Regression on Holding Bars)...")
+    time_params = {
+        "objective": "poisson",
+        "metric": "rmse",
+        "boosting_type": "gbdt",
+        "learning_rate": 0.02,
+        "num_leaves": 31,
+        "max_depth": 5,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "verbosity": -1,
+        "seed": 56,
+        "n_jobs": _lgbm_n_jobs(),
+    }
+    d_time_tr = lgb.Dataset(X_train, label=y_time_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
+    d_time_va = lgb.Dataset(X_test, label=y_time_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+    model_time = lgb.train(time_params, d_time_tr, num_boost_round=rounds, valid_sets=[d_time_va], callbacks=es_cb)
+
     os.makedirs(MODEL_DIR, exist_ok=True)
+    EXECUTION_SIZER_TIME_FILE = "execution_sizer_time.txt"
     model_tp.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TP_FILE))
     model_sl.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SL_FILE))
+    model_time.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TIME_FILE))
 
     meta = {
-        "l4_schema": 1,
-        "type": "exit_manager_quantile",
+        "l4_schema": 2,
+        "type": "exit_manager_binning_and_survival",
         "feature_cols": exec_feat_cols,
-        "tp_alpha": 0.40,
-        "sl_alpha": 0.90,
+        "tp_bins": [0.5, 1.2, 2.5],
+        "sl_bins": [0.5, 1.0, 1.5],
         "model_files": {
             "tp": EXECUTION_SIZER_TP_FILE,
             "sl": EXECUTION_SIZER_SL_FILE,
+            "time": EXECUTION_SIZER_TIME_FILE,
         },
     }
     import pickle
     with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "wb") as f:
         pickle.dump(meta, f)
         
-    print(f"\n  Layer 4 Models saved → {MODEL_DIR}/{EXECUTION_SIZER_TP_FILE}, {EXECUTION_SIZER_SL_FILE}")
+    print(f"\n  Layer 4 Models saved → {MODEL_DIR}/{EXECUTION_SIZER_TP_FILE}, {EXECUTION_SIZER_SL_FILE}, {EXECUTION_SIZER_TIME_FILE}")
     print(f"  Layer 4 Meta saved  → {MODEL_DIR}/exit_manager_meta.pkl")
-    return {"tp": model_tp, "sl": model_sl, "meta": meta}
+    return {"tp": model_tp, "sl": model_sl, "time": model_time, "meta": meta}
 
 
 # ───────────────────────────────────────────────────────────────────────

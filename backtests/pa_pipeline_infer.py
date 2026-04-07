@@ -251,16 +251,18 @@ def load_layered_pa_pipeline():
         l3_size = None
         l3_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, "execution_sizer_v1.txt"))
 
-    # Layer 4: Exit Manager (TP / SL Quantile Regressors)
+    # Layer 4: Exit Manager (Multi-class Binning + Survival Proxy)
     try:
         with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "rb") as f:
             l4_meta = pickle.load(f)
         l4_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["tp"]))
         l4_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["sl"]))
+        l4_time = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["time"]))
     except Exception:
         l4_meta = None
         l4_tp = None
         l4_sl = None
+        l4_time = None
 
     return {
         "tcn": tcn_model,
@@ -280,5 +282,6 @@ def load_layered_pa_pipeline():
         "l3_meta": l3_meta,
         "l4_tp": l4_tp,
         "l4_sl": l4_sl,
+        "l4_time": l4_time,
         "l4_meta": l4_meta,
     }
