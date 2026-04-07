@@ -2828,7 +2828,9 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
 
     vol_ewm = ret_s.ewm(span=30, adjust=False, min_periods=5).std().fillna(0.0).to_numpy(dtype=float)
     vol_ewm = np.where(vol_ewm > eps, vol_ewm, eps)
-    vol_baseline = pd.Series(vol_ewm).ewm(span=120, adjust=False, min_periods=20).mean().bfill().to_numpy(dtype=float)
+    # Replaced bfill() with fillna(current_vol) to prevent leaking bar 20's mean backwards to bars 0-19
+    vol_baseline_s = pd.Series(vol_ewm).ewm(span=120, adjust=False, min_periods=20).mean()
+    vol_baseline = vol_baseline_s.fillna(pd.Series(vol_ewm)).to_numpy(dtype=float)
     vol_baseline = np.where(vol_baseline > eps, vol_baseline, eps)
     vol_z = np.clip((vol_ewm / vol_baseline) - 1.0, -4.0, 4.0)
 
@@ -2886,8 +2888,9 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
     alpha = 0.08
     beta = 0.90
     var = np.zeros(n, dtype=float)
-    seed_var = np.nanvar(log_ret[: min(max(n, 1), 60)])
-    seed_var = float(seed_var) if np.isfinite(seed_var) and seed_var > eps else 1e-6
+    # Calculate seed variance using strictly past/current data to prevent leakage from bar 60 to bar 0
+    seed_var = float(log_ret[1] ** 2) if n > 1 else 1e-6
+    seed_var = max(seed_var, 1e-6)
     var[0] = seed_var
     omega = max(seed_var * (1.0 - alpha - beta), 1e-10)
 
@@ -2896,7 +2899,9 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
         var[i] = omega + alpha * prev_r2 + beta * var[i - 1]
 
     garch_vol = np.sqrt(np.maximum(var, eps))
-    garch_vol_ma = pd.Series(garch_vol).ewm(span=120, adjust=False, min_periods=20).mean().bfill().to_numpy(dtype=float)
+    # Replaced bfill() with fillna(current_garch_vol) to prevent leaking bar 20's moving average backwards
+    garch_vol_ma_s = pd.Series(garch_vol).ewm(span=120, adjust=False, min_periods=20).mean()
+    garch_vol_ma = garch_vol_ma_s.fillna(pd.Series(garch_vol)).to_numpy(dtype=float)
     garch_vol_ma = np.where(garch_vol_ma > eps, garch_vol_ma, eps)
     garch_vol_ratio = garch_vol / garch_vol_ma
     garch_vol_z = np.clip(garch_vol_ratio - 1.0, -4.0, 4.0)
