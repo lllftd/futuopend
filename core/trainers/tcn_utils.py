@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import gc
 import os
 import pickle
@@ -10,7 +11,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import sys
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
