@@ -2764,6 +2764,19 @@ def _volume_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
         if vol_sma5[j - 10] > 0:
             vol_mom[j] = (vol_sma5[j] / vol_sma5[j - 10]) - 1.0
 
+    # Effort vs Result (EVR) - Order Flow concept
+    # High volume but small range -> Absorption / Stopping Volume
+    rng_safe = np.maximum(high - low, 1e-12)
+    evr = vol / rng_safe
+    evr_sma20 = pd.Series(evr).rolling(20, min_periods=5).mean().to_numpy(dtype=float)
+    evr_ratio = evr / np.where(evr_sma20 > 1e-12, evr_sma20, 1.0)
+    
+    # Absorption: High volume, small body, long wick
+    upper_wick = high - np.maximum(opn, close)
+    lower_wick = np.minimum(opn, close) - low
+    absorption_bull = (rvol > 1.5) & (lower_wick > body * 1.5) & (body_ratio < 0.4)
+    absorption_bear = (rvol > 1.5) & (upper_wick > body * 1.5) & (body_ratio < 0.4)
+
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
     out["pa_vol_rvol"] = rvol
@@ -2775,6 +2788,9 @@ def _volume_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
     out["pa_vol_climax"] = vol_climax
     out["pa_vol_dryup"] = vol_dryup
     out["pa_vol_momentum"] = vol_mom
+    out["pa_vol_evr_ratio"] = evr_ratio
+    out["pa_vol_absorption_bull"] = absorption_bull.astype(bool)
+    out["pa_vol_absorption_bear"] = absorption_bear.astype(bool)
     return out
 
 
