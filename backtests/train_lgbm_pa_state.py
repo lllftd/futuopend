@@ -2410,20 +2410,6 @@ def train_execution_sizer(
         callbacks=es_cb,
     )
 
-    print("\n  Training Layer 3 TP (Take Profit) and SL (Stop Loss) models ...")
-    
-    tp_params = size_params.copy()
-    tp_params["seed"] = 44
-    d_tp_tr = lgb.Dataset(X_train, label=y_tp_train, weight=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
-    d_tp_va = lgb.Dataset(X_test, label=y_tp_test, weight=y_gate_test, feature_name=exec_feat_cols, free_raw_data=True)
-    model_tp = lgb.train(tp_params, d_tp_tr, num_boost_round=rounds // 2, valid_sets=[d_tp_va], callbacks=es_cb)
-
-    sl_params = size_params.copy()
-    sl_params["seed"] = 45
-    d_sl_tr = lgb.Dataset(X_train, label=y_sl_train, weight=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
-    d_sl_va = lgb.Dataset(X_test, label=y_sl_test, weight=y_gate_test, feature_name=exec_feat_cols, free_raw_data=True)
-    model_sl = lgb.train(sl_params, d_sl_tr, num_boost_round=rounds // 2, valid_sets=[d_sl_va], callbacks=es_cb)
-
     pred_g = model_gate.predict(X_test)
     pred_s = model_size.predict(X_test)
     pred = np.clip(pred_g * pred_s, -1.0, 1.0)
@@ -2455,8 +2441,6 @@ def train_execution_sizer(
     os.makedirs(MODEL_DIR, exist_ok=True)
     model_gate.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_GATE_FILE))
     model_size.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SIZE_FILE))
-    model_tp.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TP_FILE))
-    model_sl.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SL_FILE))
     import pickle
 
     meta = {
@@ -2477,19 +2461,157 @@ def train_execution_sizer(
         "model_files": {
             "gate": EXECUTION_SIZER_GATE_FILE,
             "size": EXECUTION_SIZER_SIZE_FILE,
-            "tp": EXECUTION_SIZER_TP_FILE,
-            "sl": EXECUTION_SIZER_SL_FILE,
         },
     }
     with open(os.path.join(MODEL_DIR, "execution_sizer_meta.pkl"), "wb") as f:
         pickle.dump(meta, f)
-    bundle = {"gate": model_gate, "size": model_size, "tp": model_tp, "sl": model_sl, "meta": meta}
+    bundle = {"gate": model_gate, "size": model_size, "meta": meta}
     print(
         f"\n  Models saved → {MODEL_DIR}/{EXECUTION_SIZER_GATE_FILE}, "
-        f"{EXECUTION_SIZER_SIZE_FILE}, {EXECUTION_SIZER_TP_FILE}, {EXECUTION_SIZER_SL_FILE}"
+        f"{EXECUTION_SIZER_SIZE_FILE}"
     )
     print(f"  Meta saved  → {MODEL_DIR}/execution_sizer_meta.pkl")
     return bundle, meta, imp_df
+
+
+# ───────────────────────────────────────────────────────────────────────
+# 4.5 Layer 4 — Exit Manager (Quantile Regression for TP/SL)
+# ───────────────────────────────────────────────────────────────────────
+
+def train_exit_manager_layer4(
+    df: pd.DataFrame,
+    feat_cols: list[str],
+    regime_model: lgb.Booster,
+    regime_calibrators: list,
+    trade_quality_models: dict,
+    thr_cp: float,
+):
+    print("\n" + "=" * 70)
+    print("  LAYER 4: Exit Manager (Quantile Regression for TP / SL)")
+    print("  y_tp = MFE/ATR (Quantile=0.4) | y_sl = MAE/ATR (Quantile=0.9)")
+    print("=" * 70)
+
+    chunk = _layer3_chunk_rows()
+    work = df.copy(deep=False)
+    bo_frame = compute_breakout_features(work)
+    for c in BO_FEAT_COLS:
+        work[c] = bo_frame[c].values
+    del bo_frame
+
+    n = len(work)
+    cal_regime = np.empty((n, NUM_REGIME_CLASSES), dtype=np.float32)
+    _layer3_fill_regime_calibrated(regime_model, regime_calibrators, work, cal_regime, chunk)
+    _layer3_attach_regime_probs_to_work(work, cal_regime)
+
+    garch_cols = sorted([c for c in work.columns if c.startswith("pa_garch_") and str(work[c].dtype) not in {"object", "category"}])
+    layer2_feats = trade_quality_models["feature_cols"]
+
+    p_trade = np.empty(n, dtype=np.float32)
+    p_long = np.empty(n, dtype=np.float32)
+    p_a = np.empty(n, dtype=np.float32)
+    _layer3_fill_trade_stack_probs(trade_quality_models, work, layer2_feats, p_trade, p_long, p_a, chunk)
+    
+    tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
+    p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp, tcn_transition_prob_all)
+
+    l2b_opp = np.empty(n, dtype=np.float32)
+    l2b_mfe = np.empty(n, dtype=np.float32)
+    l2b_mae = np.empty(n, dtype=np.float32)
+    _layer3_fill_l2b_triplet_arrays(trade_quality_models, work, layer2_feats, p_trade, l2b_opp, l2b_mfe, l2b_mae, chunk)
+
+    safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values, 1e-3)
+    y_tp_target = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
+    y_sl_target = np.clip(work["max_adverse"].values / safe_atr, 0.0, 4.0)
+
+    tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
+    pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
+
+    inter_blk = (l2b_opp.astype(np.float64)[:, None] * cal_regime.astype(np.float64)).astype(np.float32, copy=False)
+    triplet_blk = np.hstack([l2b_opp.reshape(-1, 1), l2b_mfe.reshape(-1, 1), l2b_mae.reshape(-1, 1)]).astype(np.float32, copy=False)
+    sc_conf = cal_regime.max(axis=1, keepdims=True).astype(np.float32, copy=False)
+    regime_blk = np.hstack([cal_regime, sc_conf]).astype(np.float32, copy=False)
+
+    tcn_mat = work[tcn_prob_cols].to_numpy(dtype=np.float32, copy=False) if tcn_prob_cols else np.empty((n, 0), np.float32)
+    pa_mat = work[pa_key_cols].to_numpy(dtype=np.float32, copy=False) if pa_key_cols else np.empty((n, 0), np.float32)
+    g_mat = work[garch_cols].to_numpy(dtype=np.float32, copy=False) if garch_cols else np.empty((n, 0), dtype=np.float32)
+
+    X = np.hstack([triplet_blk, regime_blk, tcn_mat, g_mat, pa_mat, inter_blk])
+    exec_feat_cols = (
+        ["l2b_opportunity_score", "l2b_pred_mfe", "l2b_pred_mae"]
+        + REGIME_NOW_PROB_COLS
+        + ["regime_now_conf"]
+        + tcn_prob_cols + garch_cols + pa_key_cols + L2B_OPP_X_REGIME_COLS
+    )
+
+    t = df["time_key"].values
+    cal_mask = (t >= np.datetime64(TRAIN_END)) & (t < np.datetime64(CAL_END))
+    test_mask = (t >= np.datetime64(CAL_END)) & (t < np.datetime64(TEST_END))
+
+    X_train, X_test = X[cal_mask], X[test_mask]
+    y_tp_train, y_tp_test = y_tp_target[cal_mask], y_tp_target[test_mask]
+    y_sl_train, y_sl_test = y_sl_target[cal_mask], y_sl_target[test_mask]
+    
+    # We only care about training TP/SL on actual trades that passed the gate!
+    thr_trade = trade_quality_models["thresholds"]["trade"]
+    gate_mask_train = p_trade[cal_mask] >= thr_trade
+    gate_mask_test = p_trade[test_mask] >= thr_trade
+    
+    w_train = np.where(gate_mask_train, 1.0, 0.05) # Emphasize actual trades
+    w_test = np.where(gate_mask_test, 1.0, 0.05)
+
+    rounds = 1000 if FAST_TRAIN_MODE else 2500
+    es_cb = _lgb_train_callbacks(80 if FAST_TRAIN_MODE else 100)
+
+    print("  Training TP Quantile Regressor (alpha=0.40 - Conservative MFE)...")
+    tp_params = {
+        "objective": "quantile",
+        "alpha": 0.40,
+        "metric": "quantile",
+        "boosting_type": "gbdt",
+        "learning_rate": 0.02,
+        "num_leaves": 31,
+        "max_depth": 5,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "verbosity": -1,
+        "seed": 54,
+        "n_jobs": _lgbm_n_jobs(),
+    }
+    d_tp_tr = lgb.Dataset(X_train, label=y_tp_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
+    d_tp_va = lgb.Dataset(X_test, label=y_tp_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+    model_tp = lgb.train(tp_params, d_tp_tr, num_boost_round=rounds, valid_sets=[d_tp_va], callbacks=es_cb)
+
+    print("  Training SL Quantile Regressor (alpha=0.90 - Tail MAE)...")
+    sl_params = tp_params.copy()
+    sl_params["alpha"] = 0.90
+    sl_params["seed"] = 55
+    d_sl_tr = lgb.Dataset(X_train, label=y_sl_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
+    d_sl_va = lgb.Dataset(X_test, label=y_sl_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+    model_sl = lgb.train(sl_params, d_sl_tr, num_boost_round=rounds, valid_sets=[d_sl_va], callbacks=es_cb)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    model_tp.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_TP_FILE))
+    model_sl.save_model(os.path.join(MODEL_DIR, EXECUTION_SIZER_SL_FILE))
+
+    meta = {
+        "l4_schema": 1,
+        "type": "exit_manager_quantile",
+        "feature_cols": exec_feat_cols,
+        "tp_alpha": 0.40,
+        "sl_alpha": 0.90,
+        "model_files": {
+            "tp": EXECUTION_SIZER_TP_FILE,
+            "sl": EXECUTION_SIZER_SL_FILE,
+        },
+    }
+    import pickle
+    with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "wb") as f:
+        pickle.dump(meta, f)
+        
+    print(f"\n  Layer 4 Models saved → {MODEL_DIR}/{EXECUTION_SIZER_TP_FILE}, {EXECUTION_SIZER_SL_FILE}")
+    print(f"  Layer 4 Meta saved  → {MODEL_DIR}/exit_manager_meta.pkl")
+    return {"tp": model_tp, "sl": model_sl, "meta": meta}
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -2521,6 +2643,9 @@ def main():
     _, exec_meta, exec_imp = train_execution_sizer(
         df, feat_cols, regime_model, regime_cal, tq_model, thr_cp,
     )
+    _ = train_exit_manager_layer4(
+        df, feat_cols, regime_model, regime_cal, tq_model, thr_cp,
+    )
 
     print("\n" + "=" * 70)
     print("  DONE — Models saved:")
@@ -2530,6 +2655,7 @@ def main():
         f"    Layer 3 sizer:        {MODEL_DIR}/{EXECUTION_SIZER_GATE_FILE} + "
         f"{EXECUTION_SIZER_SIZE_FILE}",
     )
+    print(f"    Layer 4 TP/SL:        {MODEL_DIR}/{EXECUTION_SIZER_TP_FILE} + {EXECUTION_SIZER_SL_FILE}")
     print(f"    Regime calibrators:   {MODEL_DIR}/state_calibrators.pkl")
     print("=" * 70)
 

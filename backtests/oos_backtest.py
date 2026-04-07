@@ -152,17 +152,17 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
             p["l3_size"], l3_x, OOS_PRED_CHUNK, desc=f"L3 size [{symbol}]",
         )
         exec_size = np.clip(pg * ps, -1.0, 1.0)
-        if p.get("l3_tp") and p.get("l3_sl"):
-            pred_tp_atr = _chunked_booster_predict(p["l3_tp"], l3_x, OOS_PRED_CHUNK, desc=f"L3 TP [{symbol}]")
-            pred_sl_atr = _chunked_booster_predict(p["l3_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L3 SL [{symbol}]")
-        else:
-            pred_tp_atr = df["l2b_pred_mfe"].values * 0.85
-            pred_sl_atr = df["l2b_pred_mae"].values * 1.5
     else:
         exec_size = _chunked_booster_predict(
             p["l3_model"], l3_x, OOS_PRED_CHUNK, desc=f"L3 sizer [{symbol}]",
         )
         exec_size = np.clip(exec_size, -1.5, 1.5)
+
+    # Layer 4 Execution (TP/SL Quantile Regressors)
+    if p.get("l4_tp") and p.get("l4_sl"):
+        pred_tp_atr = _chunked_booster_predict(p["l4_tp"], l3_x, OOS_PRED_CHUNK, desc=f"L4 TP [{symbol}]")
+        pred_sl_atr = _chunked_booster_predict(p["l4_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L4 SL [{symbol}]")
+    else:
         pred_tp_atr = df["l2b_pred_mfe"].values * 0.85
         pred_sl_atr = df["l2b_pred_mae"].values * 1.5
 

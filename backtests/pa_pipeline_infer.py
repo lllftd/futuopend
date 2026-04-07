@@ -242,24 +242,25 @@ def load_layered_pa_pipeline():
         mf_paths = l3_meta.get("model_files") or {}
         gate_name = mf_paths.get("gate", "execution_sizer_gate.txt")
         size_name = mf_paths.get("size", "execution_sizer_size.txt")
-        tp_name = mf_paths.get("tp", "execution_sizer_tp.txt")
-        sl_name = mf_paths.get("sl", "execution_sizer_sl.txt")
         
         l3_gate = lgb.Booster(model_file=os.path.join(MODEL_DIR, gate_name))
         l3_size = lgb.Booster(model_file=os.path.join(MODEL_DIR, size_name))
-        try:
-            l3_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, tp_name))
-            l3_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, sl_name))
-        except Exception:
-            l3_tp = None
-            l3_sl = None
         l3_model = None
     else:
         l3_gate = None
         l3_size = None
-        l3_tp = None
-        l3_sl = None
         l3_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, "execution_sizer_v1.txt"))
+
+    # Layer 4: Exit Manager (TP / SL Quantile Regressors)
+    try:
+        with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "rb") as f:
+            l4_meta = pickle.load(f)
+        l4_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["tp"]))
+        l4_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["sl"]))
+    except Exception:
+        l4_meta = None
+        l4_tp = None
+        l4_sl = None
 
     return {
         "tcn": tcn_model,
@@ -276,7 +277,8 @@ def load_layered_pa_pipeline():
         "l3_model": l3_model,
         "l3_gate": l3_gate,
         "l3_size": l3_size,
-        "l3_tp": l3_tp,
-        "l3_sl": l3_sl,
         "l3_meta": l3_meta,
+        "l4_tp": l4_tp,
+        "l4_sl": l4_sl,
+        "l4_meta": l4_meta,
     }
