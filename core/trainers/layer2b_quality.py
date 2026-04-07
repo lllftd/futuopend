@@ -644,6 +644,17 @@ def train_trade_quality_classifier(
     print(f"  Train: {len(y_train6):,}  |  Cal: {len(y_cal6):,}  |  Test: {len(y_test6):,}")
     print(f"  Step1 TRADE rate (train/test): {y_trade_train.mean():.2%} / {y_trade_test.mean():.2%}")
 
+    mc = np.zeros(len(all_bo_feats), dtype=int)
+    # Impose monotonic constraints: higher values of these risk features MUST monotonically decrease the quality score.
+    # This prevents the tree from learning irrational rules on historical black swan events.
+    if "bo_wick_imbalance" in all_bo_feats:
+        mc[all_bo_feats.index("bo_wick_imbalance")] = -1
+    if "pa_bo_wick_imbalance" in all_bo_feats:
+        mc[all_bo_feats.index("pa_bo_wick_imbalance")] = -1
+    if "pa_vol_exhaustion_climax" in all_bo_feats:
+        mc[all_bo_feats.index("pa_vol_exhaustion_climax")] = -1
+    mc_tuple = tuple(mc)
+
     common_params = {
         "objective": "binary",
         "metric": "binary_logloss",
@@ -660,6 +671,7 @@ def train_trade_quality_classifier(
         "verbosity": -1,
         "seed": 42,
         "n_jobs": _lgbm_n_jobs(),
+        "monotone_constraints": mc_tuple,
     }
     rounds = 1800 if FAST_TRAIN_MODE else 4000
     es = 90 if FAST_TRAIN_MODE else 140
