@@ -424,6 +424,46 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     return y
 
 
+def focal_loss_lgb_eval_error(y_pred, dtrain, alpha=0.25, gamma=2.0):
+    """
+    Custom eval metric for Focal Loss to be used with LightGBM.
+    Returns (eval_name, eval_result, is_higher_better).
+    """
+    label = dtrain.get_label()
+    # Apply sigmoid to raw predictions
+    p = 1.0 / (1.0 + np.exp(-y_pred))
+    
+    # Calculate the loss
+    loss = - alpha * (1 - p)**gamma * label * np.log(np.maximum(p, 1e-7)) \
+           - (1 - alpha) * p**gamma * (1 - label) * np.log(np.maximum(1 - p, 1e-7))
+    
+    return 'focal_loss', np.mean(loss), False
+
+
+def focal_loss_lgb(y_pred, dtrain, alpha=0.25, gamma=2.0):
+    """
+    Custom Focal Loss objective function for LightGBM.
+    y_pred is the raw margin (before sigmoid).
+    """
+    label = dtrain.get_label()
+    # Apply sigmoid to get probabilities
+    p = 1.0 / (1.0 + np.exp(-y_pred))
+    
+    # Gradient (first derivative)
+    # df/dx = (p - y) * alpha_t * [ gamma * (1-p_t)^(gamma-1) * p_t * log(p_t) + (1-p_t)^gamma ]
+    # A simplified but effective gradient approximation for focal loss:
+    pt = np.where(label == 1, p, 1.0 - p)
+    alpha_t = np.where(label == 1, alpha, 1.0 - alpha)
+    
+    grad = (p - label) * alpha_t * ((1.0 - pt)**gamma)
+    
+    # Hessian (second derivative) approximation
+    # For stability in GBDT, using the standard binary cross-entropy hessian multiplied by the focal weight
+    hess = alpha_t * ((1.0 - pt)**gamma) * p * (1.0 - p)
+    
+    return grad, hess
+
+
 def _binary_weights(y: np.ndarray, timestamps: np.ndarray, pos_boost: float = 1.0) -> np.ndarray:
     """Balanced weights for binary tasks with recency adjustment."""
     ts = pd.to_datetime(timestamps)
@@ -743,11 +783,23 @@ def train_trade_quality_classifier(
     finally:
         for fn in clean2:
             fn()
-    print("  [L2b train] Step3 A/B LightGBM …", flush=True)
+    print("  [L2b train] Step3 A/B LightGBM (Custom Focal Loss) …", flush=True)
     c3, clean3 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step3 A/B")
+    
+    # Use Focal Loss for Step 3 to drastically boost A-grade recall (dealing with extreme 0.06% class imbalance)
+    # 1=A, 0=B. A is extremely rare, so we need alpha > 0.5 to weight it higher, and gamma >= 2.0 to focus on hard examples.
+    def custom_focal_obj(preds, dtrain): return focal_loss_lgb(preds, dtrain, alpha=0.75, gamma=2.0)
+    def custom_focal_eval(preds, dtrain): return focal_loss_lgb_eval_error(preds, dtrain, alpha=0.75, gamma=2.0)
+    
+    focal_params = common_params.copy()
+    # Remove standard objective/metric to use custom ones
+    focal_params.pop("objective", None)
+    focal_params.pop("metric", None)
+    
     try:
         step3_model = lgb.train(
-            common_params, d3_train, num_boost_round=rounds, valid_sets=[d3_cal], callbacks=c3,
+            focal_params, d3_train, num_boost_round=rounds, valid_sets=[d3_cal], 
+            callbacks=c3, fobj=custom_focal_obj, feval=custom_focal_eval
         )
     finally:
         for fn in clean3:
@@ -760,14 +812,14 @@ def train_trade_quality_classifier(
     p_range_mass_cal = rp_cal[:, RANGE_REGIME_INDICES].sum(axis=1)
     p_trade_cal = p_trade_cal * (1.0 - 0.7 * p_range_mass_cal)
     
-    # 2. Threshold Search: Prioritize Precision via F0.5 score + strict Precision floor >= 15%
+    # 2. Threshold Search: Prioritize Precision via F0.5 score + strict Precision floor >= 10%
     best_f05, best_thr = 0.0, 0.7
-    for thr_c in np.arange(0.2, 0.95, 0.02):
+    for thr_c in np.arange(0.15, 0.95, 0.02):
         pr = (p_trade_cal >= thr_c).astype(int)
         f05 = fbeta_score(y_trade_cal, pr, beta=0.5, zero_division=0)
         prec = precision_score(y_trade_cal, pr, zero_division=0)
-        # Require 15% precision floor to stop 100k CHOP leak
-        if f05 > best_f05 and prec >= 0.15:
+        # Relaxed precision floor from 15% to 10% to improve recall for rare A_LONG / A_SHORT opportunities
+        if f05 > best_f05 and prec >= 0.10:
             best_f05, best_thr = f05, thr_c
     thr_trade_cal = best_thr if best_f05 > 0 else 0.85
     
@@ -778,7 +830,7 @@ def train_trade_quality_classifier(
     n_trade_pred_cal = int(pr_cal.sum())
     rec_cal_thr = recall_score(y_trade_cal, pr_cal, zero_division=0)
     prec_cal_thr = precision_score(y_trade_cal, pr_cal, zero_division=0)
-    thr_rule_note = f"binary gate: opt F0.5 thr={thr_trade_cal:.2f} (prec>=0.15)"
+    thr_rule_note = f"binary gate: opt F0.5 thr={thr_trade_cal:.2f} (prec>=0.10)"
     print(
         f"  Step1 cal: {thr_rule_note}  "
         f"F1={f1_cal_at_thr:.4f}  recall={rec_cal_thr:.3f}  precision={prec_cal_thr:.4f}  "
