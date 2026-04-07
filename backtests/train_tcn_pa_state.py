@@ -21,9 +21,8 @@ from __future__ import annotations
 
 import os
 import pickle
-import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import time as _time
 import warnings
 
@@ -95,13 +94,6 @@ TCN_ES_PATIENCE = max(1, int(os.environ.get("TCN_ES_PATIENCE", "20")))
 
 # OOF cross-validation fold count (train index only). Override: TCN_OOF_FOLDS=3.
 TCN_OOF_FOLDS = max(2, int(os.environ.get("TCN_OOF_FOLDS", "3")))
-# Concurrent OOF folds: each fold runs in a fresh Python subprocess (macOS-safe).
-# Worker cap matches fold count. On MPS/single-GPU, children often default to CPU.
-TCN_OOF_WORKERS = max(1, min(TCN_OOF_FOLDS, int(os.environ.get("TCN_OOF_WORKERS", "1"))))
-
-TCN_OOF_SHARED_PKL = "tcn_oof_shared.pkl"
-TCN_OOF_Y_NPY = "tcn_oof_y.npy"
-TCN_OOF_TRAIN_IDX_NPY = "tcn_oof_train_idx.npy"
 
 STATE_NAMES = {
     0: "same",
@@ -572,189 +564,6 @@ def _train_tcn_model(
     return model
 
 
-def _write_oof_shared(
-    mmap_path: str,
-    mm_shape: tuple[int, ...],
-    y: np.ndarray,
-    train_idx: np.ndarray,
-    n_folds: int,
-) -> None:
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    y_path = os.path.join(MODEL_DIR, TCN_OOF_Y_NPY)
-    idx_path = os.path.join(MODEL_DIR, TCN_OOF_TRAIN_IDX_NPY)
-    np.save(y_path, y)
-    np.save(idx_path, train_idx)
-    shared = {
-        "mmap_path": mmap_path,
-        "mm_shape": tuple(int(x) for x in mm_shape),
-        "y_path": y_path,
-        "train_idx_path": idx_path,
-        "n_folds": int(n_folds),
-        "n_features": int(mm_shape[2]),
-        "max_epochs": TCN_MAX_EPOCHS,
-        "patience": TCN_ES_PATIENCE,
-    }
-    with open(os.path.join(MODEL_DIR, TCN_OOF_SHARED_PKL), "wb") as f:
-        pickle.dump(shared, f)
-
-
-def run_oof_fold_child(fold_id: int) -> None:
-    """One OOF fold in a fresh interpreter (env TCN_INTERNAL_OOF_FOLD + TCN_INTERNAL_OOF_DEVICE)."""
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
-    shared_path = os.path.join(MODEL_DIR, TCN_OOF_SHARED_PKL)
-    with open(shared_path, "rb") as f:
-        shared = pickle.load(f)
-    y = np.load(shared["y_path"])
-    train_idx = np.load(shared["train_idx_path"])
-    mmap_path = str(shared["mmap_path"])
-    mm_shape = tuple(shared["mm_shape"])
-    X_mm = np.memmap(mmap_path, dtype=np.float32, mode="r", shape=mm_shape)
-    n_folds = int(shared["n_folds"])
-    n_features = int(shared["n_features"])
-    fold_size = len(train_idx) // n_folds
-    start_idx = fold_id * fold_size
-    end_idx = (fold_id + 1) * fold_size if fold_id < n_folds - 1 else len(train_idx)
-    val_fold_idx = train_idx[start_idx:end_idx]
-    train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
-
-    dev_str = os.environ.get("TCN_INTERNAL_OOF_DEVICE", "cpu").strip() or "cpu"
-    dev = torch.device(dev_str)
-
-    desc_str = f"TCN OOF Fold {fold_id + 1}/{n_folds} [subprocess]"
-    model = _train_tcn_model(
-        X_mm,
-        y,
-        train_fold_idx,
-        val_fold_idx,
-        n_features,
-        desc_str=desc_str,
-        device=dev,
-        max_epochs=int(shared["max_epochs"]),
-        patience=int(shared["patience"]),
-        show_model_summary=False,
-    )
-
-    X_t = torch.from_numpy(X_mm)
-    val_ds = TensorDataset(X_t[val_fold_idx])
-    val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False)
-    fold_embs, fold_rp = [], []
-    with torch.inference_mode():
-        for (xb,) in val_dl:
-            xb = xb.to(dev)
-            r_log, emb = model.forward_with_embedding(xb)
-            fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
-            fold_embs.append(emb.cpu().numpy())
-    embs = np.concatenate(fold_embs, axis=0)
-    r_prob = np.concatenate(fold_rp, axis=0)
-    out_npz = os.path.join(MODEL_DIR, f"tcn_oof_part_{fold_id}.npz")
-    np.savez_compressed(
-        out_npz,
-        start_idx=start_idx,
-        end_idx=end_idx,
-        embs=embs,
-        regime_probs=r_prob,
-    )
-    print(f"  [OOF child] fold {fold_id} -> {out_npz}", flush=True)
-
-
-def _oof_device_for_child_slot(
-    batch_index: int,
-    slot_in_batch: int,
-    batch_len: int,
-) -> str:
-    """Pick device string for one OOF subprocess. Avoid piling many procs on one GPU."""
-    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if DEVICE.type == "mps":
-        return "cpu"
-    if DEVICE.type == "cuda" and n_gpus > 0:
-        if batch_len <= n_gpus:
-            return f"cuda:{(batch_index + slot_in_batch) % n_gpus}"
-        return "cpu"
-    return "cpu"
-
-
-def _run_oof_subprocesses(repo_root: str, script_path: str, n_folds: int, max_parallel: int) -> None:
-    fold_ids = list(range(n_folds))
-    i = 0
-    print(
-        f"  OOF parallelism: TCN_OOF_WORKERS={max_parallel} "
-        f"(subprocess / fold; parent device={DEVICE})",
-        flush=True,
-    )
-    with _pbar(
-        total=n_folds,
-        desc="OOF CV folds",
-        unit="fold",
-        dynamic_ncols=True,
-        file=sys.stderr,
-    ) as fold_pbar:
-        while i < n_folds:
-            batch = fold_ids[i : i + max_parallel]
-            procs: list[tuple[int, subprocess.Popen]] = []
-            for slot, fold_id in enumerate(batch):
-                dev_assign = _oof_device_for_child_slot(i, slot, len(batch))
-                env = os.environ.copy()
-                env["TCN_INTERNAL_OOF_FOLD"] = str(fold_id)
-                env["TCN_INTERNAL_OOF_DEVICE"] = dev_assign
-                env["TCN_OOF_WORKERS"] = "1"
-                print(f"    spawn fold {fold_id} on {dev_assign}", flush=True)
-                procs.append(
-                    (
-                        fold_id,
-                        subprocess.Popen(
-                            [sys.executable, script_path],
-                            env=env,
-                            cwd=repo_root,
-                        ),
-                    )
-                )
-            fut_to_fold: dict = {}
-            with ThreadPoolExecutor(max_workers=len(procs)) as ex:
-                for fold_id, proc in procs:
-                    fut_to_fold[ex.submit(proc.wait)] = fold_id
-                for fut in as_completed(fut_to_fold):
-                    fold_done = fut_to_fold[fut]
-                    rc = fut.result()
-                    if rc != 0:
-                        raise RuntimeError(
-                            f"OOF fold {fold_done} subprocess failed: return code={rc}"
-                        )
-                    fold_pbar.update(1)
-            i += max_parallel
-
-
-def _merge_oof_parts(n_folds: int, train_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    emb_dim = TCN_BOTTLENECK_DIM
-    oof_embeds = np.zeros((len(train_idx), emb_dim), dtype=np.float32)
-    oof_regime_probs = np.zeros((len(train_idx), NUM_REGIME_CLASSES), dtype=np.float32)
-    for fold_id in range(n_folds):
-        part_path = os.path.join(MODEL_DIR, f"tcn_oof_part_{fold_id}.npz")
-        part = np.load(part_path)
-        s, e = int(part["start_idx"]), int(part["end_idx"])
-        oof_embeds[s:e] = part["embs"]
-        oof_regime_probs[s:e] = part["regime_probs"]
-    return oof_embeds, oof_regime_probs
-
-
-def _cleanup_oof_artifacts(n_folds: int) -> None:
-    for fold_id in range(n_folds):
-        p = os.path.join(MODEL_DIR, f"tcn_oof_part_{fold_id}.npz")
-        if os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-    for name in (TCN_OOF_SHARED_PKL, TCN_OOF_Y_NPY, TCN_OOF_TRAIN_IDX_NPY):
-        p = os.path.join(MODEL_DIR, name)
-        if os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-
 def train_tcn(
     X_mm: np.memmap,
     y: np.ndarray,
@@ -767,7 +576,6 @@ def train_tcn(
 ):
     n_folds = TCN_OOF_FOLDS
     fold_size = len(train_idx) // n_folds
-    oof_workers = min(TCN_OOF_WORKERS, n_folds)
 
     print("\n" + "=" * 70, flush=True)
     print(
@@ -782,66 +590,45 @@ def train_tcn(
         flush=True,
     )
     print(
-        f"  OOF folds={TCN_OOF_FOLDS} (env TCN_OOF_FOLDS), "
-        f"parallel workers={oof_workers} (cap env TCN_OOF_WORKERS)",
+        f"  OOF folds={TCN_OOF_FOLDS} (env TCN_OOF_FOLDS) — running sequentially in-process",
         flush=True,
     )
 
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    script_path = os.path.abspath(__file__)
-    _fn = getattr(X_mm, "filename", None)
-    if _fn is not None:
-        mmap_path_str = _fn.decode("utf-8") if isinstance(_fn, (bytes, bytearray)) else str(_fn)
-    else:
-        mmap_path_str = ""
+    oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
+    oof_regime_probs = np.zeros((len(train_idx), NUM_REGIME_CLASSES), dtype=np.float32)
 
-    if oof_workers > 1:
-        if not mmap_path_str or not os.path.isfile(mmap_path_str):
-            raise RuntimeError(
-                "Parallel OOF requires a file-backed memmap path (X_mm.filename). "
-                "Cannot run TCN_OOF_WORKERS>1 on in-memory array."
-            )
-        _cleanup_oof_artifacts(n_folds)
-        _write_oof_shared(mmap_path_str, tuple(X_mm.shape), y, train_idx, n_folds)
-        _run_oof_subprocesses(repo_root, script_path, n_folds, oof_workers)
-        oof_embeds, oof_regime_probs = _merge_oof_parts(n_folds, train_idx)
-        _cleanup_oof_artifacts(n_folds)
-    else:
-        oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
-        oof_regime_probs = np.zeros((len(train_idx), NUM_REGIME_CLASSES), dtype=np.float32)
+    print("  Building torch view + starting in-process OOF (first line may take ~1–3 min on MPS)…", flush=True)
+    X_tseq = torch.from_numpy(X_mm)
+    for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
+        start_idx = fold * fold_size
+        end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
 
-        print("  Building torch view + starting in-process OOF (first line may take ~1–3 min on MPS)…", flush=True)
-        X_tseq = torch.from_numpy(X_mm)
-        for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
-            start_idx = fold * fold_size
-            end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
+        val_fold_idx = train_idx[start_idx:end_idx]
+        train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
 
-            val_fold_idx = train_idx[start_idx:end_idx]
-            train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
+        fold_model = _train_tcn_model(
+            X_mm,
+            y,
+            train_fold_idx,
+            val_fold_idx,
+            n_features,
+            desc_str=f"TCN OOF Fold {fold + 1}/{n_folds}",
+            show_model_summary=False,
+        )
 
-            fold_model = _train_tcn_model(
-                X_mm,
-                y,
-                train_fold_idx,
-                val_fold_idx,
-                n_features,
-                desc_str=f"TCN OOF Fold {fold + 1}/{n_folds}",
-                show_model_summary=False,
-            )
+        val_ds = TensorDataset(X_tseq[val_fold_idx])
+        val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False)
 
-            val_ds = TensorDataset(X_tseq[val_fold_idx])
-            val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False)
+        fold_embs, fold_rp = [], []
+        with torch.inference_mode():
+            for (xb,) in val_dl:
+                xb = xb.to(DEVICE)
+                r_log, emb = fold_model.forward_with_embedding(xb)
+                fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
+                fold_embs.append(emb.cpu().numpy())
 
-            fold_embs, fold_rp = [], []
-            with torch.inference_mode():
-                for (xb,) in val_dl:
-                    xb = xb.to(DEVICE)
-                    r_log, emb = fold_model.forward_with_embedding(xb)
-                    fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
-                    fold_embs.append(emb.cpu().numpy())
-
-            oof_embeds[start_idx:end_idx] = np.concatenate(fold_embs, axis=0)
-            oof_regime_probs[start_idx:end_idx] = np.concatenate(fold_rp, axis=0)
+        oof_embeds[start_idx:end_idx] = np.concatenate(fold_embs, axis=0)
+        oof_regime_probs[start_idx:end_idx] = np.concatenate(fold_rp, axis=0)
 
     # Save OOF
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -906,11 +693,6 @@ def train_tcn(
 # ───────────────────────────────────────────────────────────────────────
 
 def main():
-    _oof_only = os.environ.get("TCN_INTERNAL_OOF_FOLD")
-    if _oof_only is not None:
-        run_oof_fold_child(int(_oof_only.strip()))
-        return
-
     print("=" * 70)
     print("  TCN — Future Transition Signal (binary, +15 bars)")
     print("=" * 70)
