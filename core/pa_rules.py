@@ -2940,7 +2940,106 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 15. Leading Indicator Features (Pre-emptive State Switches)
+# 15. Advanced Math & Statistical Models (Kalman, Hurst, Entropy, Jump)
+# ─────────────────────────────────────────────────────────────────
+
+def _kalman_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
+    """
+    1D Steady-State Kalman Filter tracking core trend.
+    Generates: pa_kalman_mean, pa_kalman_residual, pa_kalman_velocity
+    """
+    close = bars_5m["close"].to_numpy(dtype=float)
+    n = len(close)
+    out = pd.DataFrame(index=bars_5m.index)
+    out["time_key"] = bars_5m["time_key"].values
+    if n == 0: return out
+    
+    kf_mean = np.zeros(n, dtype=float)
+    kf_var = np.zeros(n, dtype=float)
+    
+    Q = 1e-4  # process noise
+    R = 1e-2  # measurement noise
+    
+    kf_mean[0] = close[0]
+    kf_var[0] = 1.0
+    
+    for i in range(1, n):
+        prior_mean = kf_mean[i-1]
+        prior_var = kf_var[i-1] + Q
+        K = prior_var / (prior_var + R)  # Kalman gain
+        kf_mean[i] = prior_mean + K * (close[i] - prior_mean)
+        kf_var[i] = (1 - K) * prior_var
+        
+    out["pa_kalman_mean"] = kf_mean
+    out["pa_kalman_residual"] = close - kf_mean
+    out["pa_kalman_velocity"] = np.diff(kf_mean, prepend=kf_mean[0])
+    return out
+
+
+def _hurst_features(bars_5m: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Variance Ratio approximation of the Hurst Exponent (Fractal dimension).
+    >0.6 = Trend persisting, <0.4 = Mean reverting.
+    """
+    out = pd.DataFrame(index=bars_5m.index)
+    out["time_key"] = bars_5m["time_key"].values
+    if len(bars_5m) == 0: return out
+    
+    s_close = bars_5m["close"]
+    log_ret = np.log(s_close / s_close.shift(1).bfill())
+    
+    var_1 = log_ret.rolling(window, min_periods=1).var().fillna(1e-8)
+    ret_2 = log_ret + log_ret.shift(1).fillna(0)
+    var_2 = ret_2.rolling(window, min_periods=1).var().fillna(1e-8)
+    
+    hurst = 0.5 * np.log(np.maximum(var_2, 1e-8) / np.maximum(var_1 * 2, 1e-8)) / np.log(2) + 0.5
+    out["pa_hurst_20"] = np.clip(hurst.values, 0.0, 1.0)
+    return out
+
+
+def _entropy_features(bars_5m: pd.DataFrame, window: int = 15) -> pd.DataFrame:
+    """
+    Shannon Entropy of return signs over a rolling window.
+    Measures disorder/indecision vs consensus in the market.
+    """
+    out = pd.DataFrame(index=bars_5m.index)
+    out["time_key"] = bars_5m["time_key"].values
+    if len(bars_5m) == 0: return out
+    
+    signs = np.sign(bars_5m["close"].diff().fillna(0))
+    p_up = (signs > 0).rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    p_dn = (signs < 0).rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    p_fl = (signs == 0).rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    
+    entropy = - (p_up * np.log2(p_up) + p_dn * np.log2(p_dn) + p_fl * np.log2(p_fl))
+    out["pa_entropy_15"] = entropy.values
+    return out
+
+
+def _jump_diffusion_features(bars_5m: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Merton Jump-Diffusion style tail-risk detection.
+    Isolates jumps > 2.5 sigma from normal diffusion to track tail risk intensity.
+    """
+    out = pd.DataFrame(index=bars_5m.index)
+    out["time_key"] = bars_5m["time_key"].values
+    if len(bars_5m) == 0: return out
+    
+    ret = bars_5m["close"].pct_change().fillna(0)
+    roll_mean = ret.rolling(window, min_periods=1).mean()
+    roll_std = ret.rolling(window, min_periods=1).std().clip(lower=1e-8)
+    
+    z_score = (ret - roll_mean) / roll_std
+    jumps = np.where(np.abs(z_score) > 2.5, np.abs(z_score) - 2.5, 0.0)
+    jump_intensity = pd.Series(jumps).ewm(span=10, adjust=False).mean()
+    
+    out["pa_jump_tail_risk"] = jump_intensity.values
+    out["pa_jump_z_score"] = z_score.values
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# 16. Leading Indicator Features (Pre-emptive State Switches)
 # ─────────────────────────────────────────────────────────────────
 
 def _leading_indicator_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
@@ -3098,6 +3197,11 @@ def add_pa_features(
     vol_feats = _volume_features(bars_5m, atr_5m)
     hmm_garch_feats = _hmm_garch_features(bars_5m)
     leading_feats = _leading_indicator_features(bars_5m)
+    
+    kalman_feats = _kalman_features(bars_5m)
+    hurst_feats = _hurst_features(bars_5m)
+    entropy_feats = _entropy_features(bars_5m)
+    jump_feats = _jump_diffusion_features(bars_5m)
 
     # ── Merge all 5m features ──
     all_5m_parts = [
@@ -3110,6 +3214,7 @@ def add_pa_features(
         vol_bo, hs, para_wedge, prev_day, open_pat,
         bo_strength, tr_mm, vol_climax,
         htf_feats, struct_feats, ma_feats, vol_feats, hmm_garch_feats, leading_feats,
+        kalman_feats, hurst_feats, entropy_feats, jump_feats,
     ]
 
     feature_cols = []
