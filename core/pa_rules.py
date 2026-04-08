@@ -1525,6 +1525,9 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
     dates = times.dt.date
     bar_time = times.dt.time
 
+    dates_arr = dates.to_numpy()
+    bar_time_arr = bar_time.to_numpy()
+
     n = len(df)
     highs = df["high"].to_numpy(dtype=float)
     lows = df["low"].to_numpy(dtype=float)
@@ -1541,8 +1544,8 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
     running_low = np.nan
 
     for i in range(n):
-        d = dates.iloc[i]
-        t = bar_time.iloc[i]
+        d = dates_arr[i]
+        t = bar_time_arr[i]
 
         if d != cur_date:
             cur_date = d
@@ -1559,7 +1562,7 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
         or_range[i] = running_high - running_low if np.isfinite(running_high) else np.nan
 
     vol_mean = pd.Series(volume).rolling(20, min_periods=1).mean().to_numpy()
-    after_or = (~in_or) & np.array([t >= _OR_END_TIME for t in bar_time])
+    after_or = (~in_or) & (bar_time >= _OR_END_TIME).to_numpy()
     breakout_up = after_or & (close_arr > or_high) & np.isfinite(or_high)
     breakout_down = after_or & (close_arr < or_low) & np.isfinite(or_low)
     vol_breakout = (breakout_up | breakout_down) & (volume > vol_mean)
