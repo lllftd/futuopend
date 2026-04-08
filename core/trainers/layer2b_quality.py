@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix, precision_score, recall_score, fbeta_score, classification_report
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
