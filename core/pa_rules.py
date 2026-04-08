@@ -99,7 +99,6 @@ def _append_htf_regime_from_1m(result: pd.DataFrame, times_1m: pd.DatetimeIndex)
     """
     last_ts = pd.to_datetime(times_1m.max())
     for rule, tag in (
-        ("5min", "pa_htf_5min"),
         ("15min", "pa_htf_15min"),
         ("60min", "pa_htf_60min"),
     ):
@@ -123,6 +122,13 @@ def _append_htf_regime_from_1m(result: pd.DataFrame, times_1m: pd.DatetimeIndex)
         mapped = _map_htf_closed_to_1min(htf, times_1m, cols)
         result[col_state] = mapped[col_state].astype("string").values
         result[col_score] = mapped[col_score].to_numpy(dtype=float)
+        
+    # Add trend_alignment based on 15m and 60m trend_score
+    if "pa_htf_15min_trend_score" in result.columns and "pa_htf_60min_trend_score" in result.columns:
+        score_15m = result["pa_htf_15min_trend_score"].fillna(0).to_numpy(dtype=float)
+        score_60m = result["pa_htf_60min_trend_score"].fillna(0).to_numpy(dtype=float)
+        # +2 if both bullish, -2 if both bearish, 0 if mixed/neutral
+        result["pa_htf_trend_alignment"] = np.sign(score_15m) + np.sign(score_60m)
 
 
 def _map_5min_to_1min(
@@ -142,60 +148,6 @@ def _map_5min_to_1min(
 
 _OR_END_TIME = time(11, 0)  # first 90 min = 9:30 → 11:00 ET
 _OR_START_TIME = time(9, 30)
-
-
-def compute_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFrame:
-    """
-    For each trading day compute the Opening Range (first 90 one-minute bars,
-    equivalent to 18 five-minute bars).
-
-    Returns DataFrame aligned to *df* with columns:
-        or_high, or_low, or_range, or_period (bool – still inside OR window),
-        or_breakout_up, or_breakout_down, or_volume_breakout, or_vs_atr_ratio, or_wide
-    """
-    times = pd.to_datetime(df["time_key"])
-    dates = times.dt.date
-    bar_time = times.dt.time
-
-    in_or = (bar_time >= _OR_START_TIME) & (bar_time < _OR_END_TIME)
-
-    or_high_map: dict = {}
-    or_low_map: dict = {}
-    for d, grp in df.groupby(dates):
-        mask = in_or.loc[grp.index]
-        or_bars = grp.loc[mask]
-        if or_bars.empty:
-            or_high_map[d] = np.nan
-            or_low_map[d] = np.nan
-        else:
-            or_high_map[d] = float(or_bars["high"].max())
-            or_low_map[d] = float(or_bars["low"].min())
-
-    or_high = dates.map(or_high_map).astype(float)
-    or_low = dates.map(or_low_map).astype(float)
-    or_range = or_high - or_low
-
-    vol_mean = df["volume"].rolling(20, min_periods=1).mean()
-
-    after_or = ~in_or & (bar_time >= _OR_END_TIME)
-    breakout_up = after_or & (df["close"].to_numpy() > or_high.to_numpy())
-    breakout_down = after_or & (df["close"].to_numpy() < or_low.to_numpy())
-    vol_breakout = (breakout_up | breakout_down) & (df["volume"] > vol_mean)
-
-    atr_daily = daily_atr.groupby(dates).transform("last")
-    ratio = or_range / atr_daily.replace(0, np.nan)
-
-    result = pd.DataFrame(index=df.index)
-    result["or_high"] = or_high.values
-    result["or_low"] = or_low.values
-    result["or_range"] = or_range.values
-    result["or_period"] = in_or.values
-    result["or_breakout_up"] = breakout_up.values
-    result["or_breakout_down"] = breakout_down.values
-    result["or_volume_breakout"] = vol_breakout.values
-    result["or_vs_atr_ratio"] = ratio.values
-    result["or_wide"] = (ratio > 0.5).values
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1565,7 +1517,10 @@ def _opening_patterns(bars: pd.DataFrame) -> pd.DataFrame:
 # ── Causal opening range … leading indicators ──
 
 def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFrame:
-    """OR high/low are RUNNING values: at bar t, OR_high = max(high[9:30..t])."""
+    """
+    OR high/low are RUNNING values: at bar t, OR_high = max(high[9:30..t]).
+    Outputs compressed, normalized features instead of absolute prices.
+    """
     times = pd.to_datetime(df["time_key"])
     dates = times.dt.date
     bar_time = times.dt.time
@@ -1613,16 +1568,16 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(atr_daily > 0, or_range / atr_daily, np.nan)
 
+    # pa_or_position = (close - or_low) / or_range
+    safe_range = np.where((np.isfinite(or_range)) & (or_range > 1e-8), or_range, 1e-8)
+    or_position = np.where(np.isfinite(or_range), (close_arr - or_low) / safe_range, np.nan)
+
     result = pd.DataFrame(index=df.index)
-    result["or_high"] = or_high
-    result["or_low"] = or_low
-    result["or_range"] = or_range
-    result["or_period"] = in_or
+    result["pa_or_position"] = or_position
     result["or_breakout_up"] = breakout_up
     result["or_breakout_down"] = breakout_down
     result["or_volume_breakout"] = vol_breakout
     result["or_vs_atr_ratio"] = ratio
-    result["or_wide"] = ratio > 0.5
     return result
 
 
@@ -2375,79 +2330,6 @@ def _resample_higher_tf(bars_5m: pd.DataFrame, period: str) -> pd.DataFrame:
     return resampled.reset_index(drop=True)
 
 
-def _cross_timeframe_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
-    """
-    Multi-timeframe features: 15m, 30m trend direction, momentum, ATR ratio.
-    All strictly causal — higher TF bar is only used after its close.
-    """
-    n = len(bars_5m)
-    times_5m = pd.to_datetime(bars_5m["time_key"])
-    close_5m = bars_5m["close"].to_numpy(dtype=float)
-    atr_5m = (bars_5m["high"] - bars_5m["low"]).ewm(span=14, min_periods=5).mean().to_numpy(dtype=float)
-
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
-
-    for period, label in [("15min", "15m"), ("30min", "30m"), ("1h", "1h")]:
-        htf = _resample_higher_tf(bars_5m, period)
-        if htf.empty or len(htf) < 20:
-            for col in [f"pa_htf_{label}_trend", f"pa_htf_{label}_mom",
-                        f"pa_htf_{label}_atr_ratio", f"pa_htf_{label}_body_ratio",
-                        f"pa_htf_{label}_close_vs_ema20"]:
-                out[col] = 0.0
-            continue
-
-        htf_close = htf["close"].to_numpy(dtype=float)
-        htf_high = htf["high"].to_numpy(dtype=float)
-        htf_low = htf["low"].to_numpy(dtype=float)
-        htf_open = htf["open"].to_numpy(dtype=float)
-        htf_rng = np.maximum(htf_high - htf_low, 1e-12)
-        htf_body = np.abs(htf_close - htf_open)
-        htf_body_ratio = htf_body / htf_rng
-
-        htf_ema20 = _ema(pd.Series(htf_close), 20).to_numpy(dtype=float)
-        htf_atr = pd.Series(htf_rng).ewm(span=14, min_periods=5).mean().to_numpy(dtype=float)
-        htf_roc5 = np.zeros(len(htf))
-        for j in range(5, len(htf)):
-            if htf_close[j - 5] > 0:
-                htf_roc5[j] = (htf_close[j] / htf_close[j - 5] - 1.0) * 100
-
-        # trend direction: +1 if close > ema20, -1 if below
-        htf_trend = np.where(htf_close > htf_ema20, 1.0,
-                             np.where(htf_close < htf_ema20, -1.0, 0.0))
-        # close vs ema20 distance normalized by ATR
-        htf_close_vs_ema = np.where(htf_atr > 1e-12,
-                                    (htf_close - htf_ema20) / htf_atr, 0.0)
-
-        # Map back to 5m: use completed bar (no shift needed because label="right")
-        htf_times = pd.to_datetime(htf["time_key"])
-        trend_series = pd.Series(htf_trend, index=htf_times)
-        mom_series = pd.Series(htf_roc5, index=htf_times)
-        atr_ratio_series = pd.Series(htf_atr, index=htf_times)
-        body_ratio_series = pd.Series(htf_body_ratio, index=htf_times)
-        close_vs_ema_series = pd.Series(htf_close_vs_ema, index=htf_times)
-
-        # Forward-fill into 5m index
-        idx_5m = times_5m.values
-        out[f"pa_htf_{label}_trend"] = trend_series.reindex(idx_5m, method="ffill").fillna(0).values
-        out[f"pa_htf_{label}_mom"] = mom_series.reindex(idx_5m, method="ffill").fillna(0).values
-
-        atr_htf_mapped = atr_ratio_series.reindex(idx_5m, method="ffill").fillna(0).values
-        safe_atr_5m = np.where(atr_5m > 1e-12, atr_5m, 1e-12)
-        out[f"pa_htf_{label}_atr_ratio"] = np.where(
-            safe_atr_5m > 0, atr_htf_mapped / safe_atr_5m, 1.0)
-        out[f"pa_htf_{label}_body_ratio"] = body_ratio_series.reindex(idx_5m, method="ffill").fillna(0).values
-        out[f"pa_htf_{label}_close_vs_ema20"] = close_vs_ema_series.reindex(idx_5m, method="ffill").fillna(0).values
-
-    # Trend alignment score: +3 if all 3 TFs agree bull, -3 if all bear
-    t15 = out["pa_htf_15m_trend"].to_numpy(dtype=float)
-    t30 = out["pa_htf_30m_trend"].to_numpy(dtype=float)
-    t1h = out["pa_htf_1h_trend"].to_numpy(dtype=float)
-    out["pa_htf_trend_alignment"] = np.sign(t15) + np.sign(t30) + np.sign(t1h)
-
-    return out
-
-
 # ─────────────────────────────────────────────────────────────────
 # 14. Structure Features (HH/HL/LH/LL, swing range, break)
 # ─────────────────────────────────────────────────────────────────
@@ -2559,8 +2441,8 @@ def _structure_features(bars_5m: pd.DataFrame, atr_5m: pd.Series, confirm_len: i
 
 def _ma_relationship_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
     """
-    MA fan, slopes, price-to-MA distance, crossovers.
-    MAs: EMA8, EMA20, EMA50, SMA200.
+    MA compression (squeeze). Other legacy MA features (slopes, distances, fan) 
+    have been removed in favor of Kalman and PA Composite features.
     """
     n = len(bars_5m)
     close = bars_5m["close"].astype(float)
@@ -2570,44 +2452,6 @@ def _ma_relationship_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.Da
     ema8 = _ema(close, 8).to_numpy(dtype=float)
     ema20 = _ema(close, 20).to_numpy(dtype=float)
     ema50 = _ema(close, 50).to_numpy(dtype=float)
-    sma200 = close.rolling(200, min_periods=50).mean().to_numpy(dtype=float)
-    close_arr = close.to_numpy(dtype=float)
-
-    # Price distance to each MA (normalized by ATR)
-    dist_ema8 = (close_arr - ema8) / safe_atr
-    dist_ema20 = (close_arr - ema20) / safe_atr
-    dist_ema50 = (close_arr - ema50) / safe_atr
-    dist_sma200 = np.where(np.isfinite(sma200),
-                           (close_arr - sma200) / safe_atr, 0.0)
-
-    # MA slopes (5-bar change normalized by ATR)
-    def _slope(ma, lookback=5):
-        s = np.zeros(n, dtype=float)
-        for j in range(lookback, n):
-            if safe_atr[j] > 0:
-                s[j] = (ma[j] - ma[j - lookback]) / safe_atr[j]
-        return s
-
-    slope_ema8 = _slope(ema8)
-    slope_ema20 = _slope(ema20)
-    slope_ema50 = _slope(ema50)
-
-    # MA fan score: ordered = strong trend
-    # Bull fan: ema8 > ema20 > ema50 > sma200 → +4
-    # Bear fan: ema8 < ema20 < ema50 < sma200 → -4
-    fan_score = np.zeros(n, dtype=float)
-    for j in range(n):
-        s = 0.0
-        if ema8[j] > ema20[j]: s += 1.0
-        else: s -= 1.0
-        if ema20[j] > ema50[j]: s += 1.0
-        else: s -= 1.0
-        if np.isfinite(sma200[j]):
-            if ema50[j] > sma200[j]: s += 1.0
-            else: s -= 1.0
-            if close_arr[j] > sma200[j]: s += 1.0
-            else: s -= 1.0
-        fan_score[j] = s
 
     # MA compression: std of [ema8, ema20, ema50] / ATR
     ma_compress = np.zeros(n, dtype=float)
@@ -2616,53 +2460,9 @@ def _ma_relationship_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.Da
         if all(np.isfinite(v) for v in vals) and safe_atr[j] > 0:
             ma_compress[j] = np.std(vals) / safe_atr[j]
 
-    # EMA crossover signals
-    ema8_cross_ema20_up = np.zeros(n, dtype=bool)
-    ema8_cross_ema20_down = np.zeros(n, dtype=bool)
-    ema20_cross_ema50_up = np.zeros(n, dtype=bool)
-    ema20_cross_ema50_down = np.zeros(n, dtype=bool)
-    for j in range(1, n):
-        if ema8[j] > ema20[j] and ema8[j - 1] <= ema20[j - 1]:
-            ema8_cross_ema20_up[j] = True
-        if ema8[j] < ema20[j] and ema8[j - 1] >= ema20[j - 1]:
-            ema8_cross_ema20_down[j] = True
-        if ema20[j] > ema50[j] and ema20[j - 1] <= ema50[j - 1]:
-            ema20_cross_ema50_up[j] = True
-        if ema20[j] < ema50[j] and ema20[j - 1] >= ema50[j - 1]:
-            ema20_cross_ema50_down[j] = True
-
-    # Bars since last golden/death cross (ema20 x ema50)
-    bars_since_golden = np.full(n, 999, dtype=float)
-    bars_since_death = np.full(n, 999, dtype=float)
-    last_golden = -999
-    last_death = -999
-    for j in range(1, n):
-        if ema20_cross_ema50_up[j]:
-            last_golden = j
-        if ema20_cross_ema50_down[j]:
-            last_death = j
-        if last_golden >= 0:
-            bars_since_golden[j] = j - last_golden
-        if last_death >= 0:
-            bars_since_death[j] = j - last_death
-
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
-    out["pa_ma_dist_ema8"] = dist_ema8
-    out["pa_ma_dist_ema20"] = dist_ema20
-    out["pa_ma_dist_ema50"] = dist_ema50
-    out["pa_ma_dist_sma200"] = dist_sma200
-    out["pa_ma_slope_ema8"] = slope_ema8
-    out["pa_ma_slope_ema20"] = slope_ema20
-    out["pa_ma_slope_ema50"] = slope_ema50
-    out["pa_ma_fan_score"] = fan_score
     out["pa_ma_compress"] = ma_compress
-    out["pa_ma_ema8x20_up"] = ema8_cross_ema20_up
-    out["pa_ma_ema8x20_down"] = ema8_cross_ema20_down
-    out["pa_ma_ema20x50_up"] = ema20_cross_ema50_up
-    out["pa_ma_ema20x50_down"] = ema20_cross_ema50_down
-    out["pa_ma_bars_since_golden"] = bars_since_golden
-    out["pa_ma_bars_since_death"] = bars_since_death
     return out
 
 
@@ -2672,8 +2472,8 @@ def _ma_relationship_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.Da
 
 def _volume_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
     """
-    Volume analysis: RVOL, up/down ratio, OBV trend, VWAP distance,
-    volume-price correlation, volume momentum.
+    Volume analysis focused on extreme relative levels (RVOL), volume trends, 
+    and significant climactic events.
     """
     n = len(bars_5m)
     close = bars_5m["close"].to_numpy(dtype=float)
@@ -2681,8 +2481,6 @@ def _volume_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
     high = bars_5m["high"].to_numpy(dtype=float)
     low = bars_5m["low"].to_numpy(dtype=float)
     vol = bars_5m["volume"].to_numpy(dtype=float)
-    atr_arr = atr_5m.to_numpy(dtype=float)
-    safe_atr = np.where(atr_arr > 1e-12, atr_arr, 1e-12)
 
     vol_s = pd.Series(vol)
 
@@ -2695,105 +2493,26 @@ def _volume_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
     vol_sma5 = vol_s.rolling(5, min_periods=2).mean().to_numpy(dtype=float)
     vol_trend = np.where(safe_vol_sma20 > 0, vol_sma5 / safe_vol_sma20, 1.0)
 
-    # Up-volume and down-volume (rolling 10-bar)
-    up_vol = np.where(close > opn, vol, 0.0)
-    down_vol = np.where(close < opn, vol, 0.0)
-    up_vol_sum = pd.Series(up_vol).rolling(10, min_periods=3).sum().to_numpy(dtype=float)
-    down_vol_sum = pd.Series(down_vol).rolling(10, min_periods=3).sum().to_numpy(dtype=float)
-    total_vol_sum = up_vol_sum + down_vol_sum
-    safe_total = np.where(total_vol_sum > 0, total_vol_sum, 1.0)
-    up_vol_ratio = up_vol_sum / safe_total
-
-    # OBV (On-Balance Volume) and its slope
-    obv = np.zeros(n, dtype=float)
-    for j in range(1, n):
-        if close[j] > close[j - 1]:
-            obv[j] = obv[j - 1] + vol[j]
-        elif close[j] < close[j - 1]:
-            obv[j] = obv[j - 1] - vol[j]
-        else:
-            obv[j] = obv[j - 1]
-
-    obv_ema10 = _ema(pd.Series(obv), 10).to_numpy(dtype=float)
-    obv_slope = np.zeros(n, dtype=float)
-    for j in range(5, n):
-        denom = abs(obv_ema10[j]) if abs(obv_ema10[j]) > 1e-6 else 1e-6
-        obv_slope[j] = (obv_ema10[j] - obv_ema10[j - 5]) / denom
-
-    # VWAP (session-based) distance
-    times = pd.to_datetime(bars_5m["time_key"])
-    dates = times.dt.date
-    typical_price = (high + low + close) / 3.0
-    cum_tp_vol = np.zeros(n, dtype=float)
-    cum_vol = np.zeros(n, dtype=float)
-    vwap = np.zeros(n, dtype=float)
-
-    cur_date = None
-    for j in range(n):
-        d = dates.iloc[j]
-        if d != cur_date:
-            cur_date = d
-            cum_tp_vol[j] = typical_price[j] * vol[j]
-            cum_vol[j] = vol[j]
-        else:
-            cum_tp_vol[j] = cum_tp_vol[j - 1] + typical_price[j] * vol[j]
-            cum_vol[j] = cum_vol[j - 1] + vol[j]
-        vwap[j] = cum_tp_vol[j] / cum_vol[j] if cum_vol[j] > 0 else close[j]
-
-    vwap_dist = (close - vwap) / safe_atr
-
-    # Volume-price correlation (rolling 20 bars)
-    vol_price_corr = np.zeros(n, dtype=float)
-    price_chg = np.zeros(n, dtype=float)
-    price_chg[1:] = close[1:] - close[:-1]
-    for j in range(20, n):
-        window_vol = vol[j - 19:j + 1]
-        window_chg = price_chg[j - 19:j + 1]
-        if np.std(window_vol) > 0 and np.std(window_chg) > 0:
-            vol_price_corr[j] = np.corrcoef(window_vol, window_chg)[0, 1]
-
     # Volume climax: vol > 3× SMA20 AND large body
     body = np.abs(close - opn)
     rng = np.maximum(high - low, 1e-12)
     body_ratio = body / rng
     vol_climax = (rvol > 3.0) & (body_ratio > 0.5)
 
-    # Dry-up: vol < 0.5× SMA20
-    vol_dryup = rvol < 0.5
-
-    # Volume momentum: SMA5(vol) rate of change over 10 bars
-    vol_mom = np.zeros(n, dtype=float)
-    for j in range(15, n):
-        if vol_sma5[j - 10] > 0:
-            vol_mom[j] = (vol_sma5[j] / vol_sma5[j - 10]) - 1.0
-
-    # Effort vs Result (EVR) - Order Flow concept
-    # High volume but small range -> Absorption / Stopping Volume
-    rng_safe = np.maximum(high - low, 1e-12)
-    evr = vol / rng_safe
-    evr_sma20 = pd.Series(evr).rolling(20, min_periods=5).mean().to_numpy(dtype=float)
-    evr_ratio = evr / np.where(evr_sma20 > 1e-12, evr_sma20, 1.0)
-    
-    # Absorption: High volume, small body, long wick
+    # Net Absorption (Bullish vs Bearish long wick absorption on high volume)
+    # +1 if bullish absorption (buying tail), -1 if bearish absorption (selling tail), 0 otherwise
     upper_wick = high - np.maximum(opn, close)
     lower_wick = np.minimum(opn, close) - low
     absorption_bull = (rvol > 1.5) & (lower_wick > body * 1.5) & (body_ratio < 0.4)
     absorption_bear = (rvol > 1.5) & (upper_wick > body * 1.5) & (body_ratio < 0.4)
+    net_absorption = absorption_bull.astype(float) - absorption_bear.astype(float)
 
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
     out["pa_vol_rvol"] = rvol
     out["pa_vol_trend"] = vol_trend
-    out["pa_vol_up_ratio"] = up_vol_ratio
-    out["pa_vol_obv_slope"] = obv_slope
-    out["pa_vol_vwap_dist"] = vwap_dist
-    out["pa_vol_price_corr"] = vol_price_corr
     out["pa_vol_climax"] = vol_climax
-    out["pa_vol_dryup"] = vol_dryup
-    out["pa_vol_momentum"] = vol_mom
-    out["pa_vol_evr_ratio"] = evr_ratio
-    out["pa_vol_absorption_bull"] = absorption_bull.astype(bool)
-    out["pa_vol_absorption_bear"] = absorption_bear.astype(bool)
+    out["pa_vol_net_absorption"] = net_absorption
     return out
 
 
@@ -2801,7 +2520,7 @@ def _volume_features(bars_5m: pd.DataFrame, atr_5m: pd.Series) -> pd.DataFrame:
 # 14. HMM-style + GARCH-style volatility features (causal)
 # ─────────────────────────────────────────────────────────────────
 
-def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
+def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     """
     Add lightweight state-space/volatility features without external deps.
 
@@ -2813,7 +2532,7 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
       - Recursive variance estimate: var_t = w + a*r_{t-1}^2 + b*var_{t-1}
       - Volatility ratio / z-score / shock / vol-of-vol
     """
-    close = bars_5m["close"].to_numpy(dtype=float)
+    close = df_1m["close"].to_numpy(dtype=float)
     n = len(close)
     eps = 1e-10
 
@@ -2915,25 +2634,15 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
     if n > 1:
         garch_vol_of_vol[1:] = np.abs(np.diff(garch_vol)) / garch_vol_ma[1:]
 
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
 
-    # 10 HMM-style features
-    out["pa_hmm_prob_state_0"] = probs[:, 0]
-    out["pa_hmm_prob_state_1"] = probs[:, 1]
-    out["pa_hmm_prob_state_2"] = probs[:, 2]
-    out["pa_hmm_prob_state_3"] = probs[:, 3]
-    out["pa_hmm_prob_state_4"] = probs[:, 4]
-    out["pa_hmm_prob_state_5"] = probs[:, 5]
+    # HMM-style features
     out["pa_hmm_state"] = hmm_state
-    out["pa_hmm_state_conf"] = hmm_conf
     out["pa_hmm_transition_pressure"] = hmm_transition_pressure
-    out["pa_hmm_state_persistence"] = hmm_persist
 
-    # 5 GARCH-style features
+    # GARCH-style features
     out["pa_garch_vol"] = garch_vol
-    out["pa_garch_vol_ratio"] = garch_vol_ratio
-    out["pa_garch_vol_z"] = garch_vol_z
     out["pa_garch_shock"] = garch_shock
     out["pa_garch_vol_of_vol"] = garch_vol_of_vol
     return out
@@ -2943,15 +2652,15 @@ def _hmm_garch_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
 # 15. Advanced Math & Statistical Models (Kalman, Hurst, Entropy, Jump)
 # ─────────────────────────────────────────────────────────────────
 
-def _kalman_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
+def _kalman_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     """
     1D Steady-State Kalman Filter tracking core trend.
     Generates: pa_kalman_mean, pa_kalman_residual, pa_kalman_velocity
     """
-    close = bars_5m["close"].to_numpy(dtype=float)
+    close = df_1m["close"].to_numpy(dtype=float)
     n = len(close)
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
     if n == 0: return out
     
     kf_mean = np.zeros(n, dtype=float)
@@ -2976,20 +2685,21 @@ def _kalman_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _hurst_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
+def _hurst_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     """
     Variance Ratio approximation of the Hurst Exponent (Fractal dimension).
     >0.6 = Trend persisting, <0.4 = Mean reverting.
     Uses multi-window (20 and 60) with EMA smoothing to reduce estimation noise.
     """
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
-    if len(bars_5m) == 0: return out
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
     
-    s_close = bars_5m["close"]
+    s_close = df_1m["close"]
     log_ret = np.log(s_close / s_close.shift(1).bfill())
     ret_2 = log_ret + log_ret.shift(1).fillna(0)
     
+    # 20m = micro trend, 60m = 1h trend
     for w in [20, 60]:
         var_1 = log_ret.rolling(w, min_periods=1).var().fillna(1e-8)
         var_2 = ret_2.rolling(w, min_periods=1).var().fillna(1e-8)
@@ -3006,18 +2716,18 @@ def _hurst_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _entropy_features(bars_5m: pd.DataFrame, window: int = 15) -> pd.DataFrame:
+def _entropy_features(df_1m: pd.DataFrame, window: int = 75) -> pd.DataFrame:
     """
     Shannon Entropy of 5-state return distribution over a rolling window.
     States: Huge Up, Up, Flat, Down, Huge Down
     Measures disorder/indecision vs consensus in the market with higher information density.
     Normalized to [0, 1] range (max entropy = log2(5)).
     """
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
-    if len(bars_5m) == 0: return out
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
     
-    ret = bars_5m["close"].pct_change().fillna(0)
+    ret = df_1m["close"].pct_change().fillna(0)
     
     # Dynamic volatility threshold for state classification
     vol = ret.rolling(window * 4, min_periods=1).std().clip(lower=1e-5)
@@ -3046,21 +2756,21 @@ def _entropy_features(bars_5m: pd.DataFrame, window: int = 15) -> pd.DataFrame:
     )
     
     # Normalize to [0, 1]
-    out["pa_entropy_15"] = (entropy / np.log2(5)).values
+    out[f"pa_entropy_{window}"] = (entropy / np.log2(5)).values
     return out
 
 
-def _jump_diffusion_features(bars_5m: pd.DataFrame, window: int = 20, tail_window: int = 100) -> pd.DataFrame:
+def _jump_diffusion_features(df_1m: pd.DataFrame, window: int = 100, tail_window: int = 500) -> pd.DataFrame:
     """
     Merton Jump-Diffusion style tail-risk detection.
     Isolates jumps exceeding a dynamic rolling 99th percentile threshold to track tail risk intensity.
     Adaptively protects against black swans without over-triggering in volatile markets.
     """
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
-    if len(bars_5m) == 0: return out
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
     
-    ret = bars_5m["close"].pct_change().fillna(0)
+    ret = df_1m["close"].pct_change().fillna(0)
     abs_ret = np.abs(ret)
     
     roll_mean = ret.rolling(window, min_periods=1).mean()
@@ -3082,66 +2792,261 @@ def _jump_diffusion_features(bars_5m: pd.DataFrame, window: int = 20, tail_windo
 
 
 # ─────────────────────────────────────────────────────────────────
-# 16. Leading Indicator Features (Pre-emptive State Switches)
+# 17. Realized Volatility System Features
 # ─────────────────────────────────────────────────────────────────
 
-def _leading_indicator_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
-    """
-    Features designed to detect early state shifts before K-Means centers catch up.
-    - MACD Histogram slope (2nd derivative of price momentum)
-    - Short-term Price Bias (distance to MA5)
-    - RSI extremes & KDJ
-    """
-    close = bars_5m["close"].to_numpy(dtype=float)
-    high = bars_5m["high"].to_numpy(dtype=float)
-    low = bars_5m["low"].to_numpy(dtype=float)
-    n = len(close)
+def _realized_volatility_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
+
+    c = df_1m["close"].astype(float)
+    h = df_1m["high"].astype(float)
+    l = df_1m["low"].astype(float)
+    o = df_1m["open"].astype(float)
+
+    # rv_cc 多尺度
+    ret = c.pct_change().fillna(0)
+    out["pa_rv_cc_10"] = ret.rolling(10, min_periods=2).std().fillna(0)
+    out["pa_rv_cc_20"] = ret.rolling(20, min_periods=2).std().fillna(0)
+
+    # rv_parkinson
+    hl_ratio = np.log(h / l.replace(0, np.nan)).fillna(0)
+    parkinson = np.sqrt((1.0 / (4.0 * np.log(2.0))) * hl_ratio**2)
+    out["pa_rv_parkinson_20"] = parkinson.rolling(20, min_periods=2).mean().fillna(0)
+
+    # rv_garman_klass
+    log_hl = np.log(h / l.replace(0, np.nan)).fillna(0)
+    log_co = np.log(c / o.replace(0, np.nan)).fillna(0)
+    # clip to avoid negative inside sqrt due to floating point error
+    gk_var = (0.5 * log_hl**2 - (2.0 * np.log(2.0) - 1.0) * log_co**2).clip(lower=0)
+    gk = np.sqrt(gk_var).fillna(0)
+    out["pa_rv_gk_20"] = gk.rolling(20, min_periods=2).mean().fillna(0)
+
+    # vol_term_slope
+    out["pa_vol_term_slope"] = (out["pa_rv_cc_10"] - out["pa_rv_cc_20"]).fillna(0)
+
+    # vol_estimator_ratio (Garman-Klass vs Close-to-Close)
+    # Encodes whether volatility is driven by intraday action (GK) or overnight/gap gaps (CC)
+    out["pa_vol_estimator_ratio"] = (out["pa_rv_gk_20"] / (out["pa_rv_cc_20"] + 1e-8)).fillna(0)
+
+    # vol_of_vol
+    out["pa_vol_of_vol_20"] = out["pa_rv_cc_20"].rolling(20, min_periods=2).std().fillna(0)
+
+    # vol_momentum
+    out["pa_vol_momentum"] = out["pa_rv_cc_20"].diff(5).fillna(0)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# 18. Intraday Time Structure Features
+# ─────────────────────────────────────────────────────────────────
+
+def _intraday_time_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
+
+    times = pd.to_datetime(df_1m["time_key"])
+    dates = times.dt.date
     
+    vol = df_1m["volume"].astype(float)
+    c = df_1m["close"].astype(float)
+
+    # minutes_to_close (assuming 16:00 close)
+    close_times = times.dt.normalize() + pd.Timedelta(hours=16)
+    mins_to_close = (close_times - times).dt.total_seconds() / 60.0
+    out["pa_minutes_to_close"] = mins_to_close.clip(lower=0).values
+
+    # from_open_return
+    first_open = df_1m["open"].groupby(dates).transform("first").astype(float)
+    out["pa_from_open_return"] = ((c - first_open) / (first_open + 1e-8)).fillna(0).values
+
+    # vol_time_deviation & volume_time_ratio
+    avg_vol_20 = vol.rolling(20, min_periods=2).mean().fillna(0)
+    out["pa_volume_time_ratio"] = (vol / (avg_vol_20 + 1e-8)).fillna(0).values
+    
+    daily_vol_mean = vol.groupby(dates).transform(lambda x: x.expanding().mean())
+    out["pa_vol_time_deviation"] = (vol - daily_vol_mean).fillna(0).values
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# 19. Realized Higher Moments
+# ─────────────────────────────────────────────────────────────────
+
+def _realized_moments_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
+
+    ret = df_1m["close"].astype(float).pct_change().fillna(0)
+
+    out["pa_realized_skew_20"] = ret.rolling(20, min_periods=5).skew().fillna(0)
+    out["pa_realized_kurt_20"] = ret.rolling(20, min_periods=5).kurt().fillna(0)
+    out["pa_skew_change_10"] = out["pa_realized_skew_20"].diff(10).fillna(0)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# 20. Volume Microstructure Features
+# ─────────────────────────────────────────────────────────────────
+
+def _volume_microstructure_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
+
+    c = df_1m["close"].astype(float)
+    v = df_1m["volume"].astype(float)
+    h = df_1m["high"].astype(float)
+    l = df_1m["low"].astype(float)
+    times = pd.to_datetime(df_1m["time_key"])
+    dates = times.dt.date
+
+    # vwap_deviation
+    typ_price = (h + l + c) / 3.0
+    cum_pv = (typ_price * v).groupby(dates).cumsum()
+    cum_v = v.groupby(dates).cumsum()
+    vwap = (cum_pv / (cum_v + 1e-8)).fillna(c)
+    out["pa_vwap_deviation"] = ((c - vwap) / (vwap + 1e-8)).fillna(0).values
+
+    # vol_price_diverge (Correlation between price change and volume)
+    ret = c.pct_change().fillna(0)
+    out["pa_vol_price_diverge"] = ret.rolling(20, min_periods=5).corr(v).fillna(0).values
+
+    # volume_acceleration
+    v_ma = v.rolling(10, min_periods=2).mean()
+    out["pa_volume_acceleration"] = (v.diff() / (v_ma + 1e-8)).fillna(0).values
+
+    # amihud_illiq
+    out["pa_amihud_illiq_20"] = (ret.abs() / (v + 1e-8)).rolling(20, min_periods=2).mean().fillna(0).values
+
+    # obv_slope
+    direction = np.sign(ret)
+    obv = (v * direction).cumsum()
+    out["pa_obv_slope_10"] = obv.diff(10).fillna(0).values
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# 21. Wavelet Decomposition Approximation
+# ─────────────────────────────────────────────────────────────────
+
+def _wavelet_approx_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
+
+    c = df_1m["close"].astype(float)
+
+    # Use EWMA to approximate low-pass (trend) and high-pass (noise) filters
+    trend_20 = c.ewm(span=20, adjust=False).mean()
+    noise_20 = c - trend_20
+
+    # trend_ratio (Signal-to-Noise Ratio proxy)
+    trend_var = trend_20.diff().abs().rolling(20, min_periods=2).mean()
+    noise_var = noise_20.abs().rolling(20, min_periods=2).mean()
+    out["pa_trend_ratio"] = (trend_var / (noise_var + 1e-8)).fillna(0).values
+
+    # noise_ratio
+    out["pa_noise_ratio"] = (noise_var / (trend_var + noise_var + 1e-8)).fillna(0).values
+
+    # trend_slope
+    out["pa_trend_slope"] = trend_20.diff(5).fillna(0).values
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# 22. Hawkes Self-Excitation
+# ─────────────────────────────────────────────────────────────────
+
+def _hawkes_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0: return out
+
+    ret = df_1m["close"].astype(float).pct_change().fillna(0)
+    abs_ret = ret.abs()
+
+    # Identify jumps (extreme returns)
+    roll_std = abs_ret.rolling(20, min_periods=2).std().fillna(0.001).clip(lower=1e-5)
+    jump_events = (abs_ret > 3 * roll_std).astype(float) * abs_ret
+
+    # hawkes_intensity: exponentially decaying sum of jumps
+    intensity = jump_events.ewm(alpha=0.1, adjust=False).mean()
+    out["pa_hawkes_intensity"] = intensity.values
+
+    # hawkes_clustering: rolling count of jump events
+    out["pa_hawkes_clustering_20"] = (jump_events > 0).rolling(20, min_periods=1).sum().fillna(0).values
+
+    return out
+
+
+def _compressed_pa_features(bars_5m: pd.DataFrame, pullback_feats: pd.DataFrame, regime_feats: pd.DataFrame, pressure_feats: pd.DataFrame, struct_feats: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compress granular PA features into 5 core continuous scores.
+    """
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
+    if len(bars_5m) == 0: return out
+
+    # 1. pa_reversal_composite: Combo of pressure divergence and structural breaks
+    # net_pressure is theoretically [-100, 100], so net_pressure/100 is in [-1, 1].
+    # Apply np.tanh to net_pressure / 50.0 to smoothly map and squash extreme values to [-1, 1].
+    # struct_break is bool (0 or 1), we weight it to match the compressed pressure.
+    net_pressure = pressure_feats["pa_net_pressure"].fillna(0).values
+    norm_pressure = np.tanh(net_pressure / 50.0) 
+    struct_break_up = struct_feats["pa_struct_break_up"].fillna(False).astype(float).values
+    struct_break_dn = struct_feats["pa_struct_break_down"].fillna(False).astype(float).values
     
-    if n == 0:
-        return out
-        
-    s_close = pd.Series(close)
+    # Weight: 60% pressure component, 40% structural break component
+    out["pa_reversal_composite"] = np.clip(
+        (norm_pressure * 0.6) + (struct_break_up - struct_break_dn) * 0.4, -1.0, 1.0
+    )
+
+    # 2. pa_continuation_composite: Combo of trend direction, inertia, and pullback completion
+    trend_dir = regime_feats["pa_env_trend_dir"].fillna(0).values
+    inertia = regime_feats["pa_env_trend_inertia"].fillna(0.5).values
+    # PB stage gives confidence: H1/H2 (1/2) is good continuation, >=3 starts to fail
+    h_count = pullback_feats["pa_h_count"].fillna(0).values
+    l_count = pullback_feats["pa_l_count"].fillna(0).values
     
-    # 1. MACD Histogram Slope
-    ema12 = s_close.ewm(span=12, adjust=False, min_periods=1).mean()
-    ema26 = s_close.ewm(span=26, adjust=False, min_periods=1).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False, min_periods=1).mean()
-    macd_hist = macd - signal
-    hist_slope = macd_hist - macd_hist.shift(1).fillna(0)
-    out["pa_lead_macd_hist"] = macd_hist.values
-    out["pa_lead_macd_hist_slope"] = hist_slope.values
+    cont_score = np.zeros(len(bars_5m), dtype=float)
+    for i in range(len(bars_5m)):
+        if trend_dir[i] > 0:
+            pb_discount = max(0, 1.0 - h_count[i] * 0.25)
+            cont_score[i] = inertia[i] * pb_discount
+        elif trend_dir[i] < 0:
+            pb_discount = max(0, 1.0 - l_count[i] * 0.25)
+            cont_score[i] = -inertia[i] * pb_discount
+            
+    out["pa_continuation_composite"] = cont_score
+
+    # 3. pa_structure_clarity: Meta-feature measuring if structure is clean or messy
+    # Less legs (e.g. 1-2) = clean trend; More legs (e.g. 5+) = messy chop.
+    # struct_score tracks HH/HL counts vs LH/LL counts. We take its absolute magnitude.
+    leg_count = struct_feats["pa_struct_leg_count"].fillna(0).values
+    struct_score = struct_feats["pa_struct_score"].fillna(0).values
     
-    # 2. Bias (Short-term Deviation)
-    ma5 = s_close.rolling(5, min_periods=1).mean()
-    bias = (s_close - ma5) / (ma5 + 1e-8) * 1000
-    out["pa_lead_bias_5"] = bias.values
+    # Map leg count to a clarity multiplier: 0-2 legs -> 1.0 (clean), 5+ legs -> near 0 (messy)
+    leg_clarity = np.clip(1.0 - (leg_count / 8.0), 0.1, 1.0)
+    # Normalize struct_score (assume max typical score is around 10)
+    norm_struct = np.clip(np.abs(struct_score) / 10.0, 0.0, 1.0)
     
-    # 3. RSI (14)
-    delta = s_close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=1).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=1).mean()
-    rs = gain / (loss + 1e-8)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    out["pa_lead_rsi_14"] = rsi.values
-    
-    # 4. Stochastic Oscillator (KDJ 9,3,3)
-    s_high = pd.Series(high)
-    s_low = pd.Series(low)
-    roll_low = s_low.rolling(9, min_periods=1).min()
-    roll_high = s_high.rolling(9, min_periods=1).max()
-    
-    rsv = (s_close - roll_low) / (roll_high - roll_low + 1e-8) * 100.0
-    k = rsv.ewm(com=2, adjust=False, min_periods=1).mean()
-    d = k.ewm(com=2, adjust=False, min_periods=1).mean()
-    j = 3 * k - 2 * d
-    
-    out["pa_lead_kdj_k"] = k.values
-    out["pa_lead_kdj_j"] = j.values
-    
+    out["pa_structure_clarity"] = leg_clarity * norm_struct
+
+    # 4. pa_pressure_score: Forward the normalized net pressure directly
+    out["pa_pressure_score"] = np.clip(net_pressure / 100.0, -1.0, 1.0)
+
+    # 5. pa_pullback_stage: -4 to 4 (L4 to H4 simplified)
+    out["pa_pullback_stage"] = np.clip(h_count - l_count, -4.0, 4.0)
+
     return out
 
 
@@ -3234,30 +3139,47 @@ def add_pa_features(
     ct_quality = _counter_trend_quality_5m(bars_5m, regime, signal_scores)
 
     # ── New feature groups (v2) ──
-    htf_feats = _cross_timeframe_features(bars_5m)
     struct_feats = _structure_features(bars_5m, atr_5m)
     ma_feats = _ma_relationship_features(bars_5m, atr_5m)
     vol_feats = _volume_features(bars_5m, atr_5m)
     hmm_garch_feats = _hmm_garch_features(bars_5m)
-    leading_feats = _leading_indicator_features(bars_5m)
     
-    kalman_feats = _kalman_features(bars_5m)
-    hurst_feats = _hurst_features(bars_5m)
-    entropy_feats = _entropy_features(bars_5m)
-    jump_feats = _jump_diffusion_features(bars_5m)
+    # ── Compute 1m specific features directly on result ──
+    realized_vol_feats = _realized_volatility_features(result)
+    intraday_time_feats = _intraday_time_features(result)
+    realized_moments_feats = _realized_moments_features(result)
+    vol_microstructure_feats = _volume_microstructure_features(result)
+    wavelet_approx_feats = _wavelet_approx_features(result)
+    hawkes_feats = _hawkes_features(result)
+    
+    kalman_feats = _kalman_features(result)
+    hurst_feats = _hurst_features(result)
+    entropy_feats = _entropy_features(result)
+    jump_feats = _jump_diffusion_features(result)
+    
+    new_1m_parts = [
+        realized_vol_feats.drop(columns=["time_key"], errors="ignore"),
+        intraday_time_feats.drop(columns=["time_key"], errors="ignore"),
+        realized_moments_feats.drop(columns=["time_key"], errors="ignore"),
+        vol_microstructure_feats.drop(columns=["time_key"], errors="ignore"),
+        wavelet_approx_feats.drop(columns=["time_key"], errors="ignore"),
+        hawkes_feats.drop(columns=["time_key"], errors="ignore"),
+        kalman_feats.drop(columns=["time_key"], errors="ignore"),
+        hurst_feats.drop(columns=["time_key"], errors="ignore"),
+        entropy_feats.drop(columns=["time_key"], errors="ignore"),
+        jump_feats.drop(columns=["time_key"], errors="ignore"),
+    ]
+    result = pd.concat([result] + new_1m_parts, axis=1)
+
+    # ── Compress 5m features ──
+    compressed_feats = _compressed_pa_features(
+        bars_5m, pullback, regime, pressure, struct_feats
+    )
 
     # ── Merge all 5m features ──
     all_5m_parts = [
-        bar_class, pullback, mag, inside, regime, twenty,
-        pressure, mm, gaps, stops,
-        adv_triggers, signal_scores, outside_eng, sr,
-        double_tb, mtr, climax, final_flag, tbtl,
-        momentum, trail_mom, ct_quality, channel_z,
-        endless_pb, gap_enh, triangle, session, cycle,
-        vol_bo, hs, para_wedge, prev_day, open_pat,
-        bo_strength, tr_mm, vol_climax,
-        htf_feats, struct_feats, ma_feats, vol_feats, hmm_garch_feats, leading_feats,
-        kalman_feats, hurst_feats, entropy_feats, jump_feats,
+        compressed_feats,
+        ma_feats, vol_feats, hmm_garch_feats,
     ]
 
     feature_cols = []
