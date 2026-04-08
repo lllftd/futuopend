@@ -3050,21 +3050,30 @@ def _entropy_features(bars_5m: pd.DataFrame, window: int = 15) -> pd.DataFrame:
     return out
 
 
-def _jump_diffusion_features(bars_5m: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+def _jump_diffusion_features(bars_5m: pd.DataFrame, window: int = 20, tail_window: int = 100) -> pd.DataFrame:
     """
     Merton Jump-Diffusion style tail-risk detection.
-    Isolates jumps > 2.5 sigma from normal diffusion to track tail risk intensity.
+    Isolates jumps exceeding a dynamic rolling 99th percentile threshold to track tail risk intensity.
+    Adaptively protects against black swans without over-triggering in volatile markets.
     """
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
     if len(bars_5m) == 0: return out
     
     ret = bars_5m["close"].pct_change().fillna(0)
+    abs_ret = np.abs(ret)
+    
     roll_mean = ret.rolling(window, min_periods=1).mean()
     roll_std = ret.rolling(window, min_periods=1).std().clip(lower=1e-8)
-    
     z_score = (ret - roll_mean) / roll_std
-    jumps = np.where(np.abs(z_score) > 2.5, np.abs(z_score) - 2.5, 0.0)
+    
+    # Adaptive threshold: 99th percentile of recent absolute returns, floored at 3 standard deviations
+    # to avoid false positives during dead-flat regimes.
+    roll_99th = abs_ret.rolling(tail_window, min_periods=1).quantile(0.99).fillna(1e-8)
+    dynamic_thr = np.maximum(roll_99th, roll_std * 3.0)
+    
+    # Jump magnitude: how much it exceeds the threshold (normalized)
+    jumps = np.where(abs_ret > dynamic_thr, (abs_ret - dynamic_thr) / dynamic_thr, 0.0)
     jump_intensity = pd.Series(jumps).ewm(span=10, adjust=False).mean()
     
     out["pa_jump_tail_risk"] = jump_intensity.values
