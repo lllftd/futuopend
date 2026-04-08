@@ -1570,7 +1570,7 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
 
     # pa_or_position = (close - or_low) / or_range
     safe_range = np.where((np.isfinite(or_range)) & (or_range > 1e-8), or_range, 1e-8)
-    or_position = np.where(np.isfinite(or_range), (close_arr - or_low) / safe_range, np.nan)
+    or_position = np.where(np.isfinite(or_range), (close_arr - or_low) / safe_range, 0.5)
 
     result = pd.DataFrame(index=df.index)
     result["pa_or_position"] = or_position
@@ -2543,7 +2543,7 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
         log_ret[1:] = np.log(cur / prev)
 
     ret_s = pd.Series(log_ret)
-    trend_mu = ret_s.ewm(span=20, adjust=False, min_periods=5).mean().to_numpy(dtype=float)
+    trend_mu = ret_s.ewm(span=20, adjust=False, min_periods=5).mean().fillna(0.0).to_numpy(dtype=float)
     trend_sd = ret_s.ewm(span=20, adjust=False, min_periods=5).std().fillna(0.0).to_numpy(dtype=float)
     trend_sd = np.where(trend_sd > eps, trend_sd, eps)
     trend_strength = trend_mu / trend_sd
@@ -2730,7 +2730,7 @@ def _entropy_features(df_1m: pd.DataFrame, window: int = 75) -> pd.DataFrame:
     ret = df_1m["close"].pct_change().fillna(0)
     
     # Dynamic volatility threshold for state classification
-    vol = ret.rolling(window * 4, min_periods=1).std().clip(lower=1e-5)
+    vol = ret.rolling(window * 4, min_periods=1).std().fillna(1e-5).clip(lower=1e-5)
     
     # 5-state distribution mapping
     state_huge_dn = (ret < -1.5 * vol).astype(float)
@@ -2773,9 +2773,9 @@ def _jump_diffusion_features(df_1m: pd.DataFrame, window: int = 100, tail_window
     ret = df_1m["close"].pct_change().fillna(0)
     abs_ret = np.abs(ret)
     
-    roll_mean = ret.rolling(window, min_periods=1).mean()
-    roll_std = ret.rolling(window, min_periods=1).std().clip(lower=1e-8)
-    z_score = (ret - roll_mean) / roll_std
+    roll_mean = ret.rolling(window, min_periods=1).mean().fillna(0)
+    roll_std = ret.rolling(window, min_periods=1).std().fillna(0).clip(lower=1e-8)
+    z_score = ((ret - roll_mean) / roll_std).fillna(0)
     
     # Adaptive threshold: 99th percentile of recent absolute returns, floored at 3 standard deviations
     # to avoid false positives during dead-flat regimes.

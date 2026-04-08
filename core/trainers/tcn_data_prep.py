@@ -63,7 +63,7 @@ def _pa_feature_cols(df: pd.DataFrame) -> list[str]:
         "max_favorable", "max_adverse", "exit_bar", "reward_risk",
         "stop_", "nearest_", "target", "retrace", "round_number",
         "double_top", "double_bottom", "wedge", "overshoot", "channel_reversal",
-        "head_shoulders", "or_", "pa_struct_break", "pa_hmm_", "prev_day"
+        "head_shoulders", "pa_struct_break", "pa_hmm_", "prev_day"
     ]
     
     continuous_cols = []
