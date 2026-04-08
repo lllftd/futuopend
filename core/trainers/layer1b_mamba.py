@@ -69,8 +69,17 @@ def _train_mamba_model(
     train_ds = Subset(base_ds, train_idx)
     cal_ds = Subset(base_ds, cal_idx)
 
-    train_dl = DataLoader(train_ds, batch_size=4096, shuffle=True, drop_last=True)
-    cal_dl = DataLoader(cal_ds, batch_size=4096, shuffle=False)
+    nw = int(os.environ.get("TORCH_NUM_WORKERS", "4")) if sys.platform != "win32" else 0
+    pin = (dev.type in ("cuda", "mps"))
+
+    train_dl = DataLoader(
+        train_ds, batch_size=4096, shuffle=True, drop_last=True, 
+        num_workers=nw, pin_memory=pin, persistent_workers=(nw > 0)
+    )
+    cal_dl = DataLoader(
+        cal_ds, batch_size=4096, shuffle=False,
+        num_workers=nw, pin_memory=pin, persistent_workers=(nw > 0)
+    )
 
     model = PAStateMamba(
         input_size=n_features,
