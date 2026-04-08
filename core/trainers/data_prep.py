@@ -661,10 +661,16 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     df = _compute_tcn_derived_features(df, feat_cols)
     feat_cols = _unique_cols(feat_cols + _tcn_derived_feature_names())
 
-    # Add Mamba features if model exists
-    if os.path.exists(os.path.join(MODEL_DIR, "mamba_state_classifier_6c.pt")):
+    # Mamba columns (optional): requires weights unless explicitly disabled
+    disable_mamba = os.environ.get("DISABLE_MAMBA_FEATURES", "").strip().lower() in ("1", "true", "yes")
+    mamba_ckpt = os.path.join(MODEL_DIR, "mamba_state_classifier_6c.pt")
+    if disable_mamba:
+        print("  Mamba-derived features skipped (DISABLE_MAMBA_FEATURES=1).", flush=True)
+    elif os.path.exists(mamba_ckpt):
         df = _compute_mamba_derived_features(df, feat_cols)
         feat_cols = _unique_cols(feat_cols + _mamba_derived_feature_names())
+    else:
+        print("  No Mamba checkpoint; continuing with TCN (+PA) features only.", flush=True)
 
     base_feats, hmm_feats, garch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")

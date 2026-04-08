@@ -67,7 +67,9 @@ class MambaBlock(nn.Module):
         
         delta = F.softplus(delta)
         delta = torch.clamp(delta, max=20.0)
-        delta = self.dt_proj(delta) # (B, L, d_inner)
+        delta = self.dt_proj(delta)
+        # Keep discretization bounded (MPS/float32 SSM scan often blows up otherwise)
+        delta = torch.clamp(delta, min=1e-5, max=1.0)
         
         A = -torch.exp(self.A_log.float()) # (d_inner, d_state)
         D = self.D.float()
@@ -88,6 +90,7 @@ class MambaBlock(nn.Module):
             
             x_t = x_hidden[:, t].unsqueeze(-1)
             h = dA * h + dB * x_t
+            h = torch.clamp(h, min=-80.0, max=80.0)
             
             y_t = (h * C_proj[:, t].unsqueeze(1)).sum(dim=-1)
             y[:, t] = y_t + D * x_hidden[:, t]

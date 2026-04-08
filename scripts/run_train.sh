@@ -9,17 +9,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 START_LAYER="${1:-layer1}"
-VALID_LAYERS="layer1 layer1a layer1b layer2a layer2b layer3 layer4"
+# layer2 = layer2a (train LGBM from regime; skips TCN/Mamba). To ignore Mamba weights if present:
+#   DISABLE_MAMBA_FEATURES=1 ./scripts/run_train.sh layer2
+VALID_LAYERS="layer1 layer1a layer1b layer2 layer2a layer2b layer3 layer4"
 
 if [[ ! " $VALID_LAYERS " =~ " $START_LAYER " ]]; then
     echo "Error: Invalid start layer '$START_LAYER'."
-    echo "Valid options: layer1, layer1a, layer1b, layer2a, layer2b, layer3, layer4"
+    echo "Valid options: layer1, layer1a, layer1b, layer2, layer2a, layer2b, layer3, layer4"
     exit 1
 fi
 
 echo "================================================================="
 echo "  Starting Unified Training Pipeline from: $START_LAYER"
 echo "  Log files will be written to: $ROOT/logs/"
+if [[ "$START_LAYER" == "layer2" || "$START_LAYER" == "layer2a" ]]; then
+  echo "  (TCN+meta must exist under lgbm_models/.) Mamba: auto if checkpoint present;"
+  echo "   to force no Mamba columns: DISABLE_MAMBA_FEATURES=1 $0 $START_LAYER"
+fi
 echo "================================================================="
 
 mkdir -p "$ROOT/logs"

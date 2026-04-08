@@ -286,21 +286,22 @@ def main():
     parser.add_argument(
         "--start-from", 
         type=str, 
-        choices=["layer1", "layer1a", "layer1b", "layer2a", "layer2b", "layer3", "layer4"], 
-        default="layer1", 
-        help="Skip earlier layers and load their models from disk for hot-starting."
+        choices=["layer1", "layer1a", "layer1b", "layer2", "layer2a", "layer2b", "layer3", "layer4"],
+        default="layer1",
+        help="Skip earlier layers. layer2 is an alias for layer2a (LGBM from regime head).",
     )
     args = parser.parse_args()
-    
-    if args.start_from == "layer1" or args.start_from == "layer1a":
+    start = "layer2a" if args.start_from == "layer2" else args.start_from
+
+    if start == "layer1" or start == "layer1a":
         run_layer1a_tcn()
-    if args.start_from == "layer1" or args.start_from == "layer1b":
+    if start == "layer1" or start == "layer1b":
         run_layer1b_mamba()
-    
-    if args.start_from in ["layer1", "layer1a", "layer1b"]:
+
+    if start in ["layer1", "layer1a", "layer1b"]:
         run_lgbm_layers("layer2a")
     else:
-        run_lgbm_layers(args.start_from)
+        run_lgbm_layers(start)
 
 if __name__ == "__main__":
     main()

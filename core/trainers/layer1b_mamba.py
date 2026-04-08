@@ -4,8 +4,9 @@ import gc
 import os
 import pickle
 import sys
+import time
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -42,7 +43,7 @@ def _resolve_mamba_device() -> torch.device:
 
 
 def _train_mamba_model(
-    X_mm: np.memmap,
+    X_seq_cpu: Union[np.memmap, torch.Tensor],
     y: np.ndarray,
     train_idx: np.ndarray,
     cal_idx: np.ndarray,
@@ -53,6 +54,7 @@ def _train_mamba_model(
     max_epochs: int | None = None,
     patience: int | None = None,
     show_model_summary: bool = False,
+    _retry_cpu_after_mps: bool = False,
 ):
     dev = device if device is not None else _resolve_mamba_device()
     me = TCN_MAX_EPOCHS if max_epochs is None else int(max_epochs)
@@ -63,7 +65,17 @@ def _train_mamba_model(
         flush=True,
     )
 
-    X_t = torch.from_numpy(np.array(X_mm))
+    if isinstance(X_seq_cpu, torch.Tensor):
+        X_t = X_seq_cpu
+    else:
+        print("  Materializing memmap → tensor (slow on first use only)…", flush=True)
+        t0 = time.perf_counter()
+        X_t = torch.from_numpy(np.ascontiguousarray(np.array(X_seq_cpu)))
+        print(
+            f"  Loaded shape={tuple(X_t.shape)} in {time.perf_counter() - t0:.1f}s",
+            flush=True,
+        )
+
     y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
     base_ds = TensorDataset(X_t, y_t)
     train_ds = Subset(base_ds, train_idx)
@@ -81,6 +93,7 @@ def _train_mamba_model(
         num_workers=nw, pin_memory=pin, persistent_workers=(nw > 0)
     )
 
+    noise_std = float(os.environ.get("MAMBA_INPUT_NOISE", "0.02"))
     model = PAStateMamba(
         input_size=n_features,
         d_model=64,
@@ -88,6 +101,7 @@ def _train_mamba_model(
         dropout=TCN_DROPOUT,
         bottleneck_dim=TCN_BOTTLENECK_DIM,
         num_classes=MAMBA_HEAD_NUM_CLASSES,
+        noise_std=noise_std,
     ).to(dev)
 
     if show_model_summary:
@@ -121,7 +135,8 @@ def _train_mamba_model(
     if lr_env:
         lr = float(lr_env)
     else:
-        lr = 2e-4 if dev.type == "mps" else 8e-4
+        # Mamba SSM + residuals diverge at TCN-like 8e-4; keep defaults conservative.
+        lr = 1e-4 if dev.type == "mps" else 2e-4
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-5)
@@ -131,21 +146,57 @@ def _train_mamba_model(
     patience_counter = 0
     log_epochs = _tqdm_disabled()
 
+    batch_log = os.environ.get("MAMBA_TRAIN_BATCH_LOG", "").strip().lower()
+    if batch_log in {"", "auto"}:
+        log_train_batches = dev.type == "cpu"
+    else:
+        log_train_batches = batch_log in ("1", "true", "yes")
+    n_train_batches = len(train_dl)
+    batch_log_every = max(1, min(50, n_train_batches // 10 or 1))
+
     for epoch in _tq(range(me), desc=f"Epochs {desc_str}", unit="ep", leave=False, file=sys.stderr):
         model.train()
         train_loss = 0.0
         n_batches = 0
+        if epoch == 0 and log_train_batches:
+            print(
+                f"    Epoch 1/{me}: {n_train_batches} train batches — "
+                "first batch on CPU can take many minutes (SSM time loop); not stuck.",
+                flush=True,
+            )
         for xb, yb in train_dl:
             xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
             logits = model(xb)
             loss = criterion_train(logits, yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
-            train_loss += loss.item()
+            li = loss.item()
+            if not np.isfinite(li):
+                print(
+                    f"  Non-finite loss at epoch {epoch + 1} batch {n_batches + 1}/{n_train_batches} — stopping. "
+                    f"Try MAMBA_LR=1e-4 or MAMBA_INPUT_NOISE=0",
+                    flush=True,
+                )
+                train_loss = float("nan")
+                break
+            train_loss += li
+            if log_train_batches and (n_batches % batch_log_every == 0 or n_batches == 0):
+                print(
+                    f"    … {desc_str}  epoch {epoch + 1}/{me}  "
+                    f"train batch {n_batches + 1}/{n_train_batches}",
+                    flush=True,
+                )
             n_batches += 1
         train_loss /= max(n_batches, 1)
+
+        if not np.isfinite(train_loss):
+            print(
+                "  Non-finite train loss — training diverged. Try MAMBA_LR=1e-4, MAMBA_INPUT_NOISE=0, or smaller batch (patch).",
+                flush=True,
+            )
+            break
 
         model.eval()
         cal_loss = 0.0
@@ -162,7 +213,11 @@ def _train_mamba_model(
         scheduler.step()
 
         if not np.isfinite(cal_loss):
-            print("  Model parameters became NaN or Inf! Training diverged. Try MAMBA_USE_MPS=0 or lower MAMBA_LR.")
+            print(
+                "  Non-finite calibration loss ( logits or weights hit NaN/Inf on this device ). "
+                "Common on Apple MPS for this SSM. Try lower MAMBA_LR, or training will retry on CPU if enabled.",
+                flush=True,
+            )
             break
 
         if cal_loss < best_cal_loss:
@@ -182,7 +237,32 @@ def _train_mamba_model(
             )
 
     if best_state is None:
-        raise RuntimeError("Training failed (best_state is None).")
+        fb = os.environ.get("MAMBA_CPU_FALLBACK", "1").strip().lower()
+        cpu_fallback = fb not in ("0", "false", "no")
+        if dev.type == "mps" and cpu_fallback and not _retry_cpu_after_mps:
+            print(
+                "  MPS run did not produce a valid checkpoint; retrying on CPU "
+                "(disable: MAMBA_CPU_FALLBACK=0).",
+                flush=True,
+            )
+            return _train_mamba_model(
+                X_seq_cpu,
+                y,
+                train_idx,
+                cal_idx,
+                n_features,
+                desc_str=f"{desc_str} [CPU after MPS non-finite loss]",
+                device=torch.device("cpu"),
+                max_epochs=max_epochs,
+                patience=patience,
+                show_model_summary=show_model_summary,
+                _retry_cpu_after_mps=True,
+            )
+        raise RuntimeError(
+            "Training failed (best_state is None): no finite train/cal loss before stop. "
+            "Try MAMBA_LR=1e-4, MAMBA_INPUT_NOISE=0, omit MAMBA_USE_MPS if retrying CPU after MPS, "
+            "or MAMBA_CPU_FALLBACK=1 after MPS NaN."
+        )
 
     model.load_state_dict(best_state)
     model.eval()
@@ -214,8 +294,14 @@ def train_mamba(
     oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
     oof_regime_probs = np.zeros((len(train_idx), MAMBA_HEAD_NUM_CLASSES), dtype=np.float32)
 
-    print("  Loading memmap into RAM for fast Mamba training…", flush=True)
-    X_tseq = torch.from_numpy(np.array(X_mm))
+    print("  Loading memmap into RAM once (shared by all folds)…", flush=True)
+    t_load = time.perf_counter()
+    X_tseq = torch.from_numpy(np.ascontiguousarray(np.array(X_mm)))
+    print(
+        f"  Dense tensor ready shape={tuple(X_tseq.shape)} in {time.perf_counter() - t_load:.1f}s. "
+        f"CPU Mamba is slow per epoch; epoch bar stays at 0% until the first epoch finishes.",
+        flush=True,
+    )
     for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
         start_idx = fold * fold_size
         end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
@@ -224,14 +310,16 @@ def train_mamba(
         train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
 
         fold_model = _train_mamba_model(
-            X_mm,
+            X_tseq,
             y,
             train_fold_idx,
             val_fold_idx,
             n_features,
             desc_str=f"Mamba OOF Fold {fold + 1}/{n_folds}",
+            device=dev,
             show_model_summary=False,
         )
+        fold_infer_dev = next(fold_model.parameters()).device
 
         val_ds = TensorDataset(X_tseq[val_fold_idx])
         val_dl = DataLoader(val_ds, batch_size=4096, shuffle=False)
@@ -239,7 +327,7 @@ def train_mamba(
         fold_embs, fold_rp = [], []
         with torch.inference_mode():
             for (xb,) in val_dl:
-                xb = xb.to(dev)
+                xb = xb.to(fold_infer_dev)
                 r_log, emb = fold_model.forward_with_embedding(xb)
                 fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
                 fold_embs.append(emb.cpu().numpy())
@@ -260,29 +348,29 @@ def train_mamba(
         pickle.dump(oof_cache, f)
     print(f"\n  Saved OOF cache -> {MODEL_DIR}/mamba_oof_cache.pkl")
 
-    X_t = torch.from_numpy(np.array(X_mm))
-
-    # 2. Final Model Training
+    # 2. Final Model Training (reuse same CPU tensor — no second memmap copy)
     final_model = _train_mamba_model(
-        X_mm,
+        X_tseq,
         y,
         train_idx,
         cal_idx,
         n_features,
         desc_str="Final Mamba Model",
+        device=dev,
         show_model_summary=True,
     )
+    final_infer_dev = next(final_model.parameters()).device
 
     # Evaluate on test set
     y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
-    test_ds = TensorDataset(X_t, y_t)
+    test_ds = TensorDataset(X_tseq, y_t)
     test_ds_sub = Subset(test_ds, test_idx)
     test_dl = DataLoader(test_ds_sub, batch_size=4096, shuffle=False)
 
     all_preds, all_labels = [], []
     with torch.no_grad():
         for xb, yb in test_dl:
-            xb, yb = xb.to(dev), yb.to(dev)
+            xb, yb = xb.to(final_infer_dev), yb.to(final_infer_dev)
             logits = final_model(xb)
             all_preds.append(logits.argmax(1).cpu().numpy())
             all_labels.append(yb.cpu().numpy())
