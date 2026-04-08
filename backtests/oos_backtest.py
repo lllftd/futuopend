@@ -31,11 +31,12 @@ from backtests.pa_pipeline_infer import (
     load_layered_pa_pipeline,
     materialize_layer3_features_v2,
 )
-from backtests.train_lgbm_pa_state import (
+from core.trainers.constants import (
     BO_FEAT_COLS,
     REGIME_NOW_PROB_COLS,
     TCN_REGIME_FUT_PROB_COLS,
-    NUM_REGIME_CLASSES,
+)
+from core.trainers.data_prep import (
     _create_tcn_windows,
     compute_breakout_features,
 )

@@ -22,6 +22,15 @@ from core.tcn_pa_state import PAStateTCN, FocalLoss
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.data_prep import *
+from core.trainers.layer2b_quality import (
+    _layer3_fill_p_trade_from_regression,
+    _l2b_nested_opp_models,
+    _compute_opportunity_triplet,
+    _l2b_triplet_from_trade_prob,
+    _apply_cp_skip,
+    _reconstruct_quality_classes,
+    _build_trade_quality_targets,
+)
 
 def _layer3_fill_regime_calibrated(
     regime_model: lgb.Booster,

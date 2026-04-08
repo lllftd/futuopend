@@ -291,6 +291,11 @@ def _optuna_search_params(
     _require_lgb_matrix_matches_names(X_train, feat_cols, "Layer 2a Optuna search")
 
     # Limit search space for faster processing when FAST_TRAIN_MODE is enabled
+    if FAST_TRAIN_MODE:
+        print("  → FAST_TRAIN_MODE is enabled. Skipping Optuna search and using default values.")
+        best_defaults = {"num_leaves": 31, "learning_rate": 0.05}
+        return {**base_params, **best_defaults}
+
     actual_trials = min(10, n_trials) if FAST_TRAIN_MODE else n_trials
 
     # We evaluate on Cal, so we want to be very careful not to overfit it
