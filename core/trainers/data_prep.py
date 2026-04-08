@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
+from core.mamba_pa_state import PAStateMamba
 from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 from core.trainers.constants import *
@@ -411,12 +412,18 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     df = _compute_tcn_derived_features(df, feat_cols)
     feat_cols = _unique_cols(feat_cols + _tcn_derived_feature_names())
 
-    base_feats, hmm_feats, garch_feats, tcn_feats = _split_feature_groups(feat_cols)
+    # Add Mamba features if model exists
+    if os.path.exists(os.path.join(MODEL_DIR, "mamba_state_classifier_6c.pt")):
+        df = _compute_mamba_derived_features(df, feat_cols)
+        feat_cols = _unique_cols(feat_cols + _mamba_derived_feature_names())
+
+    base_feats, hmm_feats, garch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")
     print(f"    Base PA/OR:  {len(base_feats)}")
     print(f"    HMM-style:   {len(hmm_feats)}")
     print(f"    GARCH-style: {len(garch_feats)}")
     print(f"    TCN-derived: {len(tcn_feats)}")
+    print(f"    Mamba-derived: {len(mamba_feats)}")
     _log_tcn_feature_health(df, tcn_feats)
     print(f"  Total rows: {len(df):,}")
     print(f"  Date range: {df['time_key'].min()} → {df['time_key'].max()}")

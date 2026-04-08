@@ -35,6 +35,7 @@ from core.trainers.constants import (
     BO_FEAT_COLS,
     REGIME_NOW_PROB_COLS,
     TCN_REGIME_FUT_PROB_COLS,
+    MAMBA_REGIME_FUT_PROB_COLS,
 )
 from core.trainers.data_prep import (
     _create_tcn_windows,
@@ -89,6 +90,34 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         df[col] = regime_probs_arr[:, j]
     eps = 1e-9
     df["tcn_regime_fut_entropy"] = -np.sum(regime_probs_arr * np.log(np.maximum(regime_probs_arr, eps)), axis=1)
+
+    if p.get("mamba"):
+        m_feats = p["mamba_meta"]["feat_cols"]
+        m_raw = df[m_feats].values.astype(np.float32)
+        m_norm = np.nan_to_num((m_raw - p["mamba_meta"]["mean"]) / p["mamba_meta"]["std"], nan=0.0).astype(np.float32)
+        m_win, m_end_idx = _create_tcn_windows(m_norm, p["mamba_meta"]["seq_len"])
+        m_emb_dim = int(p["mamba_meta"].get("bottleneck_dim", 8))
+        m_embeddings = np.full((n_bars, m_emb_dim), np.nan, dtype=np.float32)
+        m_regime_probs = np.full((n_bars, len(MAMBA_REGIME_FUT_PROB_COLS)), np.nan, dtype=np.float32)
+        
+        if len(m_win) > 0:
+            with torch.inference_mode():
+                batch_starts = range(0, len(m_win), batch_size)
+                for i in _tq(batch_starts, desc=f"Mamba batches [{symbol}]", unit="batch", total=n_batches):
+                    xb = torch.from_numpy(np.ascontiguousarray(m_win[i : i + batch_size])).to(device)
+                    r_log, emb = p["mamba"].forward_with_embedding(xb)
+                    sl = slice(i, i + batch_size)
+                    m_regime_probs[m_end_idx[sl]] = torch.softmax(r_log, dim=1).cpu().numpy()
+                    m_embeddings[m_end_idx[sl]] = emb.detach().cpu().numpy()
+        
+        m_embeddings = pd.DataFrame(m_embeddings).ffill().bfill().values.astype(np.float32)
+        m_regime_probs = pd.DataFrame(m_regime_probs).ffill().bfill().values.astype(np.float32)
+        
+        for j in range(m_emb_dim):
+            df[f"mamba_emb_{j}"] = m_embeddings[:, j]
+        for j, col in enumerate(MAMBA_REGIME_FUT_PROB_COLS):
+            df[col] = m_regime_probs[:, j]
+        df["mamba_regime_fut_entropy"] = -np.sum(m_regime_probs * np.log(np.maximum(m_regime_probs, eps)), axis=1)
 
     df = df[df["time_key"] >= pd.Timestamp(OOS_START)].reset_index(drop=True)
     if len(df) == 0:

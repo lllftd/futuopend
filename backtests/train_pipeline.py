@@ -20,6 +20,7 @@ from core.trainers.tcn_constants import (
 )
 from core.trainers.tcn_data_prep import prepare_data as prepare_tcn_data
 from core.trainers.layer1_tcn import train_tcn
+from core.trainers.layer1_mamba import train_mamba, MAMBA_STATE_CLASSIFIER_FILE
 
 # Layer 2-4 (LGBM) Imports
 from core.trainers.constants import (
@@ -133,6 +134,67 @@ def run_layer1_tcn():
     finally:
         logger.close()
 
+def run_layer1_mamba():
+    logger = setup_logger("layer1_mamba")
+    try:
+        print("\n" + "=" * 70)
+        print("  [1b] Mamba — Future Transition Signal (binary, +15 bars)")
+        print("=" * 70)
+        print(f"  Device: {DEVICE}  (override: TORCH_DEVICE=cuda:0 | mps | cpu)")
+
+        mm = None
+        mmap_path = ""
+        try:
+            mm, y, train_idx, cal_idx, test_idx, norm_stats = prepare_tcn_data()
+            mmap_path = str(norm_stats.get("memmap_path", ""))
+            n_features = int(mm.shape[2])
+            print("  Starting optimization (batches stream from memmap)…", flush=True)
+
+            mamba_model = train_mamba(
+                mm, y, train_idx, cal_idx, test_idx, n_features,
+                norm_stats["ts"], norm_stats["syms"]
+            )
+
+            os.makedirs(TCN_MODEL_DIR, exist_ok=True)
+            torch.save(mamba_model.state_dict(), os.path.join(TCN_MODEL_DIR, MAMBA_STATE_CLASSIFIER_FILE))
+
+            meta = {
+                "mean": norm_stats["mean"],
+                "std": norm_stats["std"],
+                "feat_cols": norm_stats["feat_cols"],
+                "seq_len": int(norm_stats.get("seq_len_used", SEQ_LEN)),
+                "input_size": n_features,
+                "d_model": 64,
+                "n_layers": 4,
+                "dropout": TCN_DROPOUT,
+                "bottleneck_dim": TCN_BOTTLENECK_DIM,
+                "is_dual_head": False,
+                "mamba_head": "regime_transition_15_bottleneck",
+                "num_regime_classes": len(TCN_REGIME_FUT_PROB_COLS),
+                "state_names": ["same", "transition"],
+            }
+            with open(os.path.join(TCN_MODEL_DIR, "mamba_meta.pkl"), "wb") as f:
+                pickle.dump(meta, f)
+
+            print(f"\n  Mamba binary future-transition model saved → {TCN_MODEL_DIR}/{MAMBA_STATE_CLASSIFIER_FILE}")
+            print(f"  Meta saved → {TCN_MODEL_DIR}/mamba_meta.pkl")
+        finally:
+            if mm is not None:
+                try:
+                    mm._mmap.close()
+                except Exception:
+                    pass
+                del mm
+            if mmap_path and os.path.isfile(mmap_path) and not os.environ.get("TCN_KEEP_MEMMAP"):
+                try:
+                    os.remove(mmap_path)
+                    print(f"  Removed temp memmap {mmap_path}", flush=True)
+                except OSError as exc:
+                    print(f"  Warning: could not remove memmap {mmap_path}: {exc}", flush=True)
+    finally:
+        logger.close()
+
+
 def load_layer2a_artifacts():
     model_path = os.path.join(MODEL_DIR, STATE_CLASSIFIER_FILE)
     if not os.path.exists(model_path):
@@ -232,6 +294,7 @@ def main():
     
     if args.start_from == "layer1":
         run_layer1_tcn()
+        run_layer1_mamba()
         run_lgbm_layers("layer2a")
     else:
         run_lgbm_layers(args.start_from)

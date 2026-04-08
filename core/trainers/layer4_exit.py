@@ -85,6 +85,7 @@ def train_exit_manager_layer4(
     y_time_target = np.clip(work.get("exit_bar", np.zeros(n)).fillna(0).values, 1, 30).astype(np.float32)
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
+    mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
     pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
 
     inter_blk = (l2b_opp.astype(np.float64)[:, None] * cal_regime.astype(np.float64)).astype(np.float32, copy=False)
@@ -93,15 +94,16 @@ def train_exit_manager_layer4(
     regime_blk = np.hstack([cal_regime, sc_conf]).astype(np.float32, copy=False)
 
     tcn_mat = work[tcn_prob_cols].to_numpy(dtype=np.float32, copy=False) if tcn_prob_cols else np.empty((n, 0), np.float32)
+    mamba_mat = work[mamba_prob_cols].to_numpy(dtype=np.float32, copy=False) if mamba_prob_cols else np.empty((n, 0), np.float32)
     pa_mat = work[pa_key_cols].to_numpy(dtype=np.float32, copy=False) if pa_key_cols else np.empty((n, 0), np.float32)
     g_mat = work[garch_cols].to_numpy(dtype=np.float32, copy=False) if garch_cols else np.empty((n, 0), dtype=np.float32)
 
-    X = np.hstack([triplet_blk, regime_blk, tcn_mat, g_mat, pa_mat, inter_blk])
+    X = np.hstack([triplet_blk, regime_blk, tcn_mat, mamba_mat, g_mat, pa_mat, inter_blk])
     exec_feat_cols = (
         ["l2b_opportunity_score", "l2b_pred_mfe", "l2b_pred_mae"]
         + REGIME_NOW_PROB_COLS
         + ["regime_now_conf"]
-        + tcn_prob_cols + garch_cols + pa_key_cols + L2B_OPP_X_REGIME_COLS
+        + tcn_prob_cols + mamba_prob_cols + garch_cols + pa_key_cols + L2B_OPP_X_REGIME_COLS
     )
 
     t = df["time_key"].values

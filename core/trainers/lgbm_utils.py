@@ -36,11 +36,25 @@ def _tcn_bottleneck_dim_from_meta() -> int:
         m = pickle.load(f)
     return int(m.get("bottleneck_dim", TCN_BOTTLENECK_DIM))
 
+def _mamba_bottleneck_dim_from_meta() -> int:
+    meta_path = os.path.join(MODEL_DIR, "mamba_meta.pkl")
+    if not os.path.isfile(meta_path):
+        return TCN_BOTTLENECK_DIM
+    import pickle
+
+    with open(meta_path, "rb") as f:
+        m = pickle.load(f)
+    return int(m.get("bottleneck_dim", TCN_BOTTLENECK_DIM))
 
 def _tcn_derived_feature_names(bottleneck_dim: int | None = None) -> list[str]:
     bd = int(bottleneck_dim) if bottleneck_dim is not None else _tcn_bottleneck_dim_from_meta()
     emb = [f"tcn_emb_{i}" for i in range(bd)]
     return TCN_REGIME_FUT_PROB_COLS + ["tcn_regime_fut_entropy"] + emb
+
+def _mamba_derived_feature_names(bottleneck_dim: int | None = None) -> list[str]:
+    bd = int(bottleneck_dim) if bottleneck_dim is not None else _mamba_bottleneck_dim_from_meta()
+    emb = [f"mamba_emb_{i}" for i in range(bd)]
+    return MAMBA_REGIME_FUT_PROB_COLS + ["mamba_regime_fut_entropy"] + emb
 
 
 def configure_compute_threads() -> None:
@@ -159,20 +173,21 @@ def _lgbm_booster_feature_names(model: lgb.Booster) -> list[str]:
     return names
 
 
-def _split_feature_groups(feat_cols: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
+def _split_feature_groups(feat_cols: list[str]) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
     hmm = [c for c in feat_cols if c.startswith("pa_hmm_")]
     garch = [c for c in feat_cols if c.startswith("pa_garch_")]
     tcn = [c for c in feat_cols if c.startswith("tcn_")]
-    base = [c for c in feat_cols if c not in set(hmm + garch + tcn)]
-    return base, hmm, garch, tcn
+    mamba = [c for c in feat_cols if c.startswith("mamba_")]
+    base = [c for c in feat_cols if c not in set(hmm + garch + tcn + mamba)]
+    return base, hmm, garch, tcn, mamba
 
 
 def _regime_lgbm_feature_cols(feat_cols: list[str]) -> list[str]:
-    """PA + GARCH only for regime head / L2b regime predict (no TCN, no pa_hmm_* — avoids label leakage)."""
+    """PA + GARCH only for regime head / L2b regime predict (no TCN, no Mamba, no pa_hmm_* — avoids label leakage)."""
     return [
         c
         for c in feat_cols
-        if not c.startswith("tcn_") and not c.startswith("pa_hmm_")
+        if not c.startswith("tcn_") and not c.startswith("mamba_") and not c.startswith("pa_hmm_")
     ]
 
 

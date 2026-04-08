@@ -190,6 +190,7 @@ def train_execution_sizer(
     y_sl_target = np.clip(work["max_adverse"].values / safe_atr, 0.0, 3.0)
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
+    mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
     pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
 
     # Routed scalar opp (this bar's argmax regime head) × each regime's probability — 6 L3 interaction cols.
@@ -206,25 +207,27 @@ def train_execution_sizer(
     regime_blk = np.hstack([cal_regime, sc_conf]).astype(np.float32, copy=False)
 
     tcn_mat = work[tcn_prob_cols].to_numpy(dtype=np.float32, copy=False) if tcn_prob_cols else np.empty((n, 0), np.float32)
+    mamba_mat = work[mamba_prob_cols].to_numpy(dtype=np.float32, copy=False) if mamba_prob_cols else np.empty((n, 0), np.float32)
     pa_mat = work[pa_key_cols].to_numpy(dtype=np.float32, copy=False) if pa_key_cols else np.empty((n, 0), np.float32)
     if garch_cols:
         g_mat = work[garch_cols].to_numpy(dtype=np.float32, copy=False)
     else:
         g_mat = np.empty((n, 0), dtype=np.float32)
 
-    X = np.hstack([triplet_blk, regime_blk, tcn_mat, g_mat, pa_mat, inter_blk])
+    X = np.hstack([triplet_blk, regime_blk, tcn_mat, mamba_mat, g_mat, pa_mat, inter_blk])
     exec_feat_cols = (
         ["l2b_opportunity_score", "l2b_pred_mfe", "l2b_pred_mae"]
         + REGIME_NOW_PROB_COLS
         + ["regime_now_conf"]
         + tcn_prob_cols
+        + mamba_prob_cols
         + garch_cols
         + pa_key_cols
         + L2B_OPP_X_REGIME_COLS
     )
     _require_lgb_matrix_matches_names(X, exec_feat_cols, "Layer 3 (execution sizer v2)")
 
-    del triplet_blk, regime_blk, tcn_mat, pa_mat, g_mat, inter_blk, cal_regime
+    del triplet_blk, regime_blk, tcn_mat, mamba_mat, pa_mat, g_mat, inter_blk, cal_regime
     del p_trade, p_long, p_a, sc_conf, work
     del l2b_opp, l2b_mfe, l2b_mae
     gc.collect()

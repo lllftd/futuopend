@@ -19,7 +19,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from core.tcn_pa_state import PAStateTCN
+from core.mamba_pa_state import PAStateMamba
 from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
+from core.trainers.layer1_mamba import MAMBA_STATE_CLASSIFIER_FILE
 
 OOS_PRED_CHUNK = max(4096, int(os.environ.get("OOS_PRED_CHUNK", "65536")))
 
@@ -203,6 +205,31 @@ def load_layered_pa_pipeline():
     )
     tcn_model.eval()
 
+    # Mamba
+    mamba_model = None
+    mamba_meta = None
+    mamba_meta_path = os.path.join(MODEL_DIR, "mamba_meta.pkl")
+    if os.path.exists(mamba_meta_path):
+        with open(mamba_meta_path, "rb") as f:
+            mamba_meta = pickle.load(f)
+        n_cls_mamba = int(mamba_meta.get("num_regime_classes", mamba_meta.get("num_classes", 2)))
+        mamba_model = PAStateMamba(
+            input_size=mamba_meta["input_size"],
+            d_model=int(mamba_meta.get("d_model", 64)),
+            n_layers=int(mamba_meta.get("n_layers", 4)),
+            dropout=0.0,
+            bottleneck_dim=int(mamba_meta.get("bottleneck_dim", 8)),
+            num_classes=n_cls_mamba,
+        ).to(device)
+        mamba_model.load_state_dict(
+            torch.load(
+                os.path.join(MODEL_DIR, MAMBA_STATE_CLASSIFIER_FILE),
+                map_location=device,
+                weights_only=True,
+            )
+        )
+        mamba_model.eval()
+
     l2a_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, "state_classifier_6c.txt"))
     with open(os.path.join(MODEL_DIR, "state_calibrators.pkl"), "rb") as f:
         l2a_cals = pickle.load(f)
@@ -278,6 +305,8 @@ def load_layered_pa_pipeline():
     return {
         "tcn": tcn_model,
         "tcn_meta": tcn_meta,
+        "mamba": mamba_model,
+        "mamba_meta": mamba_meta,
         "device": device,
         "l2a_model": l2a_model,
         "l2a_cals": l2a_cals,
