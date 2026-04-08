@@ -1574,9 +1574,9 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
 
     result = pd.DataFrame(index=df.index)
     result["pa_or_position"] = or_position
-    result["or_breakout_up"] = breakout_up
-    result["or_breakout_down"] = breakout_down
-    result["or_volume_breakout"] = vol_breakout
+    result["or_breakout_up"] = breakout_up.astype(np.int8)
+    result["or_breakout_down"] = breakout_down.astype(np.int8)
+    result["or_volume_breakout"] = vol_breakout.astype(np.int8)
     result["or_vs_atr_ratio"] = ratio
     return result
 
