@@ -45,9 +45,9 @@ EXECUTION_SIZER_LEGACY_V1_FILE = "execution_sizer_v1.txt"
 
 BO_FEAT_COLS = [
     "bo_body_atr", "bo_range_atr", "bo_vol_spike", "bo_close_extremity",
-    "bo_dist_ema20", "bo_dist_ema50", "bo_dist_vwap", "bo_pressure_diff",
-    "bo_or_dist", "bo_bb_width", "bo_atr_zscore", "bo_wick_imbalance",
-    "bo_range_compress", "bo_volume_compress"
+    "bo_wick_imbalance", "bo_range_compress", "bo_body_growth", "bo_gap_signal",
+    "bo_consec_dir", "bo_inside_prior", "bo_pressure_diff", "bo_or_dist",
+    "bo_bb_width", "bo_atr_zscore",
 ]
 
 L2B_OPP_X_REGIME_COLS = [f"l2b_opp_x_{r}" for r in REGIME_NOW_PROB_COLS]

@@ -435,7 +435,7 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
 
 
 def compute_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
-    """12 breakout-specific features computable for any bar (causal).
+    """Breakout / bar-context features computable for any bar (causal).
     Uses OHLCV from raw data + PA columns where available."""
     n = len(df)
     close = df["close"].values
