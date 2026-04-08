@@ -404,6 +404,8 @@ __all__ = [
     "_split_feature_groups",
     "_tcn_bottleneck_dim_from_meta",
     "_tcn_derived_feature_names",
+    "_mamba_bottleneck_dim_from_meta",
+    "_mamba_derived_feature_names",
     "_tcn_inference_device",
     "_tq",
     "_unique_cols",
