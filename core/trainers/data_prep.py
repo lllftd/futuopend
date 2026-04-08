@@ -369,7 +369,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
 
     if not (os.path.exists(meta_path) and os.path.exists(model_path)):
         raise RuntimeError(
-            f"Missing Mamba checkpoint under {MODEL_DIR}: need mamba_meta.pkl and {"mamba_state_classifier_6c.pt"!r} "
+            f"Missing Mamba checkpoint under {MODEL_DIR}: need mamba_meta.pkl and {os.path.basename(model_path)!r} "
             "(from Layer 1 / backtests.train_pipeline). Retrain: ./scripts/run_train.sh layer1"
         )
 
