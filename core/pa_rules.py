@@ -2976,10 +2976,11 @@ def _kalman_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _hurst_features(bars_5m: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+def _hurst_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
     """
     Variance Ratio approximation of the Hurst Exponent (Fractal dimension).
     >0.6 = Trend persisting, <0.4 = Mean reverting.
+    Uses multi-window (20 and 60) with EMA smoothing to reduce estimation noise.
     """
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
@@ -2987,13 +2988,21 @@ def _hurst_features(bars_5m: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     
     s_close = bars_5m["close"]
     log_ret = np.log(s_close / s_close.shift(1).bfill())
-    
-    var_1 = log_ret.rolling(window, min_periods=1).var().fillna(1e-8)
     ret_2 = log_ret + log_ret.shift(1).fillna(0)
-    var_2 = ret_2.rolling(window, min_periods=1).var().fillna(1e-8)
     
-    hurst = 0.5 * np.log(np.maximum(var_2, 1e-8) / np.maximum(var_1 * 2, 1e-8)) / np.log(2) + 0.5
-    out["pa_hurst_20"] = np.clip(hurst.values, 0.0, 1.0)
+    for w in [20, 60]:
+        var_1 = log_ret.rolling(w, min_periods=1).var().fillna(1e-8)
+        var_2 = ret_2.rolling(w, min_periods=1).var().fillna(1e-8)
+        
+        hurst = 0.5 * np.log(np.maximum(var_2, 1e-8) / np.maximum(var_1 * 2, 1e-8)) / np.log(2) + 0.5
+        hurst = np.clip(hurst, 0.0, 1.0)
+        
+        # Smooth with EMA to reduce noise
+        span = 5 if w == 20 else 10
+        hurst_smooth = pd.Series(hurst).ewm(span=span, adjust=False).mean()
+        
+        out[f"pa_hurst_{w}"] = hurst_smooth.values
+        
     return out
 
 
