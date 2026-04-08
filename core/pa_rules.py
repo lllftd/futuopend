@@ -3008,20 +3008,45 @@ def _hurst_features(bars_5m: pd.DataFrame) -> pd.DataFrame:
 
 def _entropy_features(bars_5m: pd.DataFrame, window: int = 15) -> pd.DataFrame:
     """
-    Shannon Entropy of return signs over a rolling window.
-    Measures disorder/indecision vs consensus in the market.
+    Shannon Entropy of 5-state return distribution over a rolling window.
+    States: Huge Up, Up, Flat, Down, Huge Down
+    Measures disorder/indecision vs consensus in the market with higher information density.
+    Normalized to [0, 1] range (max entropy = log2(5)).
     """
     out = pd.DataFrame(index=bars_5m.index)
     out["time_key"] = bars_5m["time_key"].values
     if len(bars_5m) == 0: return out
     
-    signs = np.sign(bars_5m["close"].diff().fillna(0))
-    p_up = (signs > 0).rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
-    p_dn = (signs < 0).rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
-    p_fl = (signs == 0).rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    ret = bars_5m["close"].pct_change().fillna(0)
     
-    entropy = - (p_up * np.log2(p_up) + p_dn * np.log2(p_dn) + p_fl * np.log2(p_fl))
-    out["pa_entropy_15"] = entropy.values
+    # Dynamic volatility threshold for state classification
+    vol = ret.rolling(window * 4, min_periods=1).std().clip(lower=1e-5)
+    
+    # 5-state distribution mapping
+    state_huge_dn = (ret < -1.5 * vol).astype(float)
+    state_dn = ((ret >= -1.5 * vol) & (ret < -0.25 * vol)).astype(float)
+    state_fl = ((ret >= -0.25 * vol) & (ret <= 0.25 * vol)).astype(float)
+    state_up = ((ret > 0.25 * vol) & (ret <= 1.5 * vol)).astype(float)
+    state_huge_up = (ret > 1.5 * vol).astype(float)
+    
+    # Calculate probabilities within the window
+    p_huge_dn = state_huge_dn.rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    p_dn = state_dn.rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    p_fl = state_fl.rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    p_up = state_up.rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    p_huge_up = state_huge_up.rolling(window, min_periods=1).mean().clip(1e-8, 1.0)
+    
+    # Shannon Entropy formula
+    entropy = - (
+        p_huge_dn * np.log2(p_huge_dn) +
+        p_dn * np.log2(p_dn) +
+        p_fl * np.log2(p_fl) +
+        p_up * np.log2(p_up) +
+        p_huge_up * np.log2(p_huge_up)
+    )
+    
+    # Normalize to [0, 1]
+    out["pa_entropy_15"] = (entropy / np.log2(5)).values
     return out
 
 
