@@ -21,7 +21,7 @@ if _REPO_ROOT not in sys.path:
 from core.tcn_pa_state import PAStateTCN
 from core.mamba_pa_state import PAStateMamba
 from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
-from core.trainers.layer1_mamba import MAMBA_STATE_CLASSIFIER_FILE
+from core.trainers.layer1b_mamba import MAMBA_STATE_CLASSIFIER_FILE
 
 OOS_PRED_CHUNK = max(4096, int(os.environ.get("OOS_PRED_CHUNK", "65536")))
 

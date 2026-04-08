@@ -19,8 +19,8 @@ from core.trainers.tcn_constants import (
     TCN_BOTTLENECK_DIM,
 )
 from core.trainers.tcn_data_prep import prepare_data as prepare_tcn_data
-from core.trainers.layer1_tcn import train_tcn
-from core.trainers.layer1_mamba import train_mamba, MAMBA_STATE_CLASSIFIER_FILE
+from core.trainers.layer1a_tcn import train_tcn
+from core.trainers.layer1b_mamba import train_mamba, MAMBA_STATE_CLASSIFIER_FILE
 
 # Layer 2-4 (LGBM) Imports
 from core.trainers.constants import (
@@ -74,8 +74,8 @@ def setup_logger(layer_name):
     print(f"\n>> Redirecting output to: {log_file}")
     return Logger(log_file)
 
-def run_layer1_tcn():
-    logger = setup_logger("layer1")
+def run_layer1a_tcn():
+    logger = setup_logger("layer1a_tcn")
     try:
         print("\n" + "=" * 70)
         print("  [1] TCN — Future Transition Signal (binary, +15 bars)")
@@ -134,8 +134,8 @@ def run_layer1_tcn():
     finally:
         logger.close()
 
-def run_layer1_mamba():
-    logger = setup_logger("layer1_mamba")
+def run_layer1b_mamba():
+    logger = setup_logger("layer1b_mamba")
     try:
         print("\n" + "=" * 70)
         print("  [1b] Mamba — Future Transition Signal (binary, +15 bars)")
@@ -286,15 +286,18 @@ def main():
     parser.add_argument(
         "--start-from", 
         type=str, 
-        choices=["layer1", "layer2a", "layer2b", "layer3", "layer4"], 
+        choices=["layer1", "layer1a", "layer1b", "layer2a", "layer2b", "layer3", "layer4"], 
         default="layer1", 
         help="Skip earlier layers and load their models from disk for hot-starting."
     )
     args = parser.parse_args()
     
-    if args.start_from == "layer1":
-        run_layer1_tcn()
-        run_layer1_mamba()
+    if args.start_from == "layer1" or args.start_from == "layer1a":
+        run_layer1a_tcn()
+    if args.start_from == "layer1" or args.start_from == "layer1b":
+        run_layer1b_mamba()
+    
+    if args.start_from in ["layer1", "layer1a", "layer1b"]:
         run_lgbm_layers("layer2a")
     else:
         run_lgbm_layers(args.start_from)

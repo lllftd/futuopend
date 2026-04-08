@@ -138,7 +138,7 @@ class PAStateMamba(nn.Module):
     def forward_with_embedding(self, x):
         """
         x: (B, seq_len, input_size) or (B, input_size, seq_len)
-        TCN outputs x as (B, seq_len, input_size) but layer1_tcn trainer expects x: (B, seq_len, feat)
+        TCN outputs x as (B, seq_len, input_size) but layer1a_tcn trainer expects x: (B, seq_len, feat)
         """
         # In TCN trainer, data is (B, L, C)
         # Apply Gaussian noise injection for robust sequence learning

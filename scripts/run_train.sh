@@ -9,11 +9,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 START_LAYER="${1:-layer1}"
-VALID_LAYERS="layer1 layer2a layer2b layer3 layer4"
+VALID_LAYERS="layer1 layer1a layer1b layer2a layer2b layer3 layer4"
 
 if [[ ! " $VALID_LAYERS " =~ " $START_LAYER " ]]; then
     echo "Error: Invalid start layer '$START_LAYER'."
-    echo "Valid options: layer1, layer2a, layer2b, layer3, layer4"
+    echo "Valid options: layer1, layer1a, layer1b, layer2a, layer2b, layer3, layer4"
     exit 1
 fi
 
