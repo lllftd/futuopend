@@ -31,6 +31,16 @@ MAMBA_HEAD_TARGET_NAMES = ["same", "transition"]
 MAMBA_STATE_CLASSIFIER_FILE = "mamba_state_classifier_6c.pt"
 
 
+def _resolve_mamba_device() -> torch.device:
+    device = DEVICE
+    if device.type == "mps":
+        use_mps = os.environ.get("MAMBA_USE_MPS", "").strip().lower()
+        if use_mps not in {"1", "true", "yes"}:
+            print("  [Warning] Mamba on MPS often leads to NaN. Falling back to CPU. (Set MAMBA_USE_MPS=1 to force MPS)")
+            return torch.device("cpu")
+    return device
+
+
 def _train_mamba_model(
     X_mm: np.memmap,
     y: np.ndarray,
@@ -44,7 +54,7 @@ def _train_mamba_model(
     patience: int | None = None,
     show_model_summary: bool = False,
 ):
-    dev = device if device is not None else DEVICE
+    dev = device if device is not None else _resolve_mamba_device()
     me = TCN_MAX_EPOCHS if max_epochs is None else int(max_epochs)
     pat = TCN_ES_PATIENCE if patience is None else int(patience)
 
@@ -98,7 +108,13 @@ def _train_mamba_model(
 
     criterion_eval = nn.CrossEntropyLoss(weight=class_weights_t)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=5e-4)
+    lr_env = os.environ.get("MAMBA_LR", "")
+    if lr_env:
+        lr = float(lr_env)
+    else:
+        lr = 2e-4 if dev.type == "mps" else 8e-4
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-5)
 
     best_cal_loss = float("inf")
@@ -136,8 +152,8 @@ def _train_mamba_model(
 
         scheduler.step()
 
-        if np.isnan(cal_loss):
-            print("  Model parameters became NaN! Training diverged.")
+        if not np.isfinite(cal_loss):
+            print("  Model parameters became NaN or Inf! Training diverged. Try MAMBA_USE_MPS=0 or lower MAMBA_LR.")
             break
 
         if cal_loss < best_cal_loss:
@@ -174,6 +190,7 @@ def train_mamba(
     ts: np.ndarray,
     syms: np.ndarray,
 ):
+    dev = _resolve_mamba_device()
     n_folds = TCN_OOF_FOLDS
     fold_size = len(train_idx) // n_folds
 
@@ -213,7 +230,7 @@ def train_mamba(
         fold_embs, fold_rp = [], []
         with torch.inference_mode():
             for (xb,) in val_dl:
-                xb = xb.to(DEVICE)
+                xb = xb.to(dev)
                 r_log, emb = fold_model.forward_with_embedding(xb)
                 fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
                 fold_embs.append(emb.cpu().numpy())
@@ -256,7 +273,7 @@ def train_mamba(
     all_preds, all_labels = [], []
     with torch.no_grad():
         for xb, yb in test_dl:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            xb, yb = xb.to(dev), yb.to(dev)
             logits = final_model(xb)
             all_preds.append(logits.argmax(1).cpu().numpy())
             all_labels.append(yb.cpu().numpy())

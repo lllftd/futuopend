@@ -66,6 +66,7 @@ class MambaBlock(nn.Module):
         delta, B_proj, C_proj = torch.split(x_proj, [1, self.d_state, self.d_state], dim=-1)
         
         delta = F.softplus(delta)
+        delta = torch.clamp(delta, max=20.0)
         delta = self.dt_proj(delta) # (B, L, d_inner)
         
         A = -torch.exp(self.A_log.float()) # (d_inner, d_state)
@@ -78,6 +79,7 @@ class MambaBlock(nn.Module):
         for t in range(L):
             dt_t = delta[:, t].unsqueeze(-1)
             A_t = dt_t * A
+            A_t = torch.clamp(A_t, max=0.0)
             B_t = dt_t * B_proj[:, t].unsqueeze(1)
             
             # Zero-order hold approximation

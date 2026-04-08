@@ -32,6 +32,14 @@ NUM_REGIME_CLASSES = len(STATE_NAMES)
 
 STATE_CLASSIFIER_FILE = "tcn_state_classifier_6c"
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-)
+def _default_torch_device() -> torch.device:
+    forced = os.environ.get("TORCH_DEVICE", "").strip()
+    if forced:
+        return torch.device(forced)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+DEVICE = _default_torch_device()
