@@ -2854,21 +2854,19 @@ def _intraday_time_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     vol = df_1m["volume"].astype(float)
     c = df_1m["close"].astype(float)
 
-    # minutes_to_close (assuming 16:00 close)
-    close_times = times.dt.normalize() + pd.Timedelta(hours=16)
-    mins_to_close = (close_times - times).dt.total_seconds() / 60.0
-    out["pa_minutes_to_close"] = mins_to_close.clip(lower=0).values
+    # session_progress [0, 1] (assuming 9:30 to 16:00 is 390 mins)
+    # Better than absolute minutes_to_close across varying day lengths
+    open_times = times.dt.normalize() + pd.Timedelta(hours=9, minutes=30)
+    mins_from_open = (times - open_times).dt.total_seconds() / 60.0
+    out["pa_time_session_progress"] = (mins_from_open / 390.0).clip(0, 1).values
 
     # from_open_return
     first_open = df_1m["open"].groupby(dates).transform("first").astype(float)
-    out["pa_from_open_return"] = ((c - first_open) / (first_open + 1e-8)).fillna(0).values
+    out["pa_time_from_open_return"] = ((c - first_open) / (first_open + 1e-8)).fillna(0).values
 
-    # vol_time_deviation & volume_time_ratio
-    avg_vol_20 = vol.rolling(20, min_periods=2).mean().fillna(0)
-    out["pa_volume_time_ratio"] = (vol / (avg_vol_20 + 1e-8)).fillna(0).values
-    
+    # vol_time_deviation
     daily_vol_mean = vol.groupby(dates).transform(lambda x: x.expanding().mean())
-    out["pa_vol_time_deviation"] = (vol - daily_vol_mean).fillna(0).values
+    out["pa_time_vol_time_deviation"] = (vol - daily_vol_mean).fillna(0).values
 
     return out
 
