@@ -207,9 +207,20 @@ def load_layer2a_artifacts():
         raise FileNotFoundError(f"Missing Layer 2a calibrators at {cal_path}. Cannot skip Layer 2a.")
         
     with open(cal_path, "rb") as f:
-        meta = pickle.load(f)
-        regime_cal = meta["calibrators"]
-        thr_cp = meta.get("thr_cp", 0.95)
+        obj = pickle.load(f)
+        
+        if isinstance(obj, dict):
+            regime_cal = obj["calibrators"]
+            thr_cp = obj.get("thr_cp", 0.95)
+        else:
+            # Fallback for old format
+            regime_cal = obj
+            thr_cp = float(os.environ.get("LAYER2A_THR_CP", "0.95"))
+            print(
+                f"\n  [WARN] Legacy state_calibrators.pkl format detected. "
+                f"Using LAYER2A_THR_CP={thr_cp:.2f}. Please re-run layer2a to embed thr_cp.",
+                flush=True
+            )
     
     return regime_model, regime_cal, thr_cp
 

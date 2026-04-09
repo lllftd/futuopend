@@ -214,7 +214,10 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
     model.save_model(os.path.join(MODEL_DIR, STATE_CLASSIFIER_FILE))
     import pickle
     with open(os.path.join(MODEL_DIR, "state_calibrators.pkl"), "wb") as f:
-        pickle.dump(calibrators, f)
+        pickle.dump({
+            "calibrators": calibrators,
+            "thr_cp": float(thr_cp)
+        }, f)
     print(f"\n  Model saved → {MODEL_DIR}/{STATE_CLASSIFIER_FILE}")
     print(f"  Calibrators saved → {MODEL_DIR}/state_calibrators.pkl")
 
