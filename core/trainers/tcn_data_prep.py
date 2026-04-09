@@ -97,9 +97,7 @@ def _count_sequences(df_1m: pd.DataFrame, seq_len: int) -> int:
         grp = grp.sort_values("time_key").reset_index(drop=True)
         dates = pd.to_datetime(grp["time_key"].values).date
         
-        start_dates = dates[:-seq_len + 1]
-        end_dates = dates[seq_len - 1:]
-        valid_mask = start_dates == end_dates
+        valid_mask = np.ones(len(dates) - seq_len + 1, dtype=bool)
         n += valid_mask.sum()
     return n
 
@@ -136,10 +134,10 @@ def _fill_sequences_memmap(
         # Vectorized sliding window
         windows = sliding_window_view(feats, window_shape=(seq_len, feats.shape[1])).squeeze(axis=1)
         
-        # Valid day boundary mask
-        start_dates = dates[:-seq_len + 1]
-        end_dates = dates[seq_len - 1:]
-        valid_mask = start_dates == end_dates
+        # To allow trading at the open, we MUST allow sequences to cross the overnight gap.
+        # Otherwise, the first `seq_len` minutes of every day will have no predictions!
+        # The PA features are mostly stationary, so crossing the day boundary is perfectly fine.
+        valid_mask = np.ones(len(windows), dtype=bool)
         
         valid_windows = windows[valid_mask]
         n_valid = len(valid_windows)
@@ -258,12 +256,72 @@ def prepare_data():
 
     df = pd.concat(parts, ignore_index=True)
     df = df.sort_values(["symbol", "time_key"]).reset_index(drop=True)
-    # Future regime transition (15 bars ahead).
     ms = pd.to_numeric(df["market_state"], errors="coerce").fillna(4).astype(int)
-    fut_ms = (
-        ms.groupby(df["symbol"]).transform(lambda s: s.shift(-15)).fillna(4).astype(int)
-    )
-    df["state_label"] = (ms != fut_ms).astype(int)
+    
+    # We use 1m resolution for Triple Barrier to be as accurate as possible without missing intra-bar spikes.
+    # The horizon is in minutes (e.g. 45 = 45 minutes).
+    horizon = 45
+    atr_mult = 1.5
+    
+    # Pre-calculate upper and lower barrier prices for each bar
+    closes = df["close"].values
+    atrs = df["atr_5m"].values if "atr_5m" in df.columns else df["atr_1m"].values if "atr_1m" in df.columns else np.zeros_like(closes)
+    # Fallback if ATR is somehow missing (though add_pa_features usually computes it)
+    if atrs.sum() == 0:
+        atrs = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean().fillna(0).values
+    
+    upper_barriers = closes + atr_mult * atrs
+    lower_barriers = closes - atr_mult * atrs
+    
+    highs = df["high"].values
+    lows = df["low"].values
+    n_rows = len(df)
+    labels = np.full(n_rows, 2, dtype=np.int64) # Default to 2 (Time Stop / Chop)
+    
+    # We must ensure we don't look ahead across different symbols
+    sym_boundaries = df.groupby("symbol").size().cumsum().values
+    sym_starts = np.insert(sym_boundaries[:-1], 0, 0)
+    
+    print(f"  Applying Triple Barrier Labeling (Horizon={horizon}, ATR_mult={atr_mult})...", flush=True)
+    # Fast vectorized-compatible loop over symbols
+    for start_idx, end_idx in zip(sym_starts, sym_boundaries):
+        for i in range(start_idx, end_idx):
+            # Check if this is the end of a trading day.
+            # If the gap to the next bar is > 4 hours (e.g. overnight), we shouldn't scan across the gap
+            # to hit a barrier on the next day's open.
+            win_end = min(i + horizon + 1, end_idx)
+            
+            # Find actual valid end index for scanning without crossing overnight
+            # (We only look for barrier hits WITHIN the same trading day)
+            valid_win_end = i + 1
+            for k in range(i + 1, win_end):
+                time_diff = (df["time_key"].iloc[k] - df["time_key"].iloc[k-1]).total_seconds()
+                if time_diff > 14400: # 4 hours
+                    break
+                valid_win_end = k + 1
+            
+            upper_limit = upper_barriers[i]
+            lower_limit = lower_barriers[i]
+            
+            # Scan future horizon for barrier hits
+            for j in range(i + 1, valid_win_end):
+                hit_up = highs[j] >= upper_limit
+                hit_dn = lows[j] <= lower_limit
+                
+                if hit_up and hit_dn:
+                    # Rare: both hit in same bar. Check open/close proxy or favor the one it crossed more deeply.
+                    # Simple heuristic: assume the trend direction won
+                    labels[i] = 2 # Mark as chop if it's wildly oscillating
+                    break
+                elif hit_up:
+                    labels[i] = 0 # Bullish Hit
+                    break
+                elif hit_dn:
+                    labels[i] = 1 # Bearish Hit
+                    break
+                # If neither hit, continue scanning. If loop finishes without hit, it remains 2.
+
+    df["state_label"] = labels
 
     feat_cols, bool_cols = _pa_feature_cols(df)
     print(f"  PA features: {len(feat_cols) - len(bool_cols)} continuous + {len(bool_cols)} boolean = {len(feat_cols)} total")
