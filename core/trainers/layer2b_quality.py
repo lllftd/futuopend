@@ -794,14 +794,16 @@ def train_trade_quality_classifier(
     def custom_focal_eval(preds, dtrain): return focal_loss_lgb_eval_error(preds, dtrain, alpha=0.75, gamma=2.0)
     
     focal_params = common_params.copy()
-    # Remove standard objective/metric to use custom ones
+    # LightGBM >= 4.0: custom objective goes in params (fobj kwarg removed from train()).
     focal_params.pop("objective", None)
     focal_params.pop("metric", None)
-    
+    focal_params["objective"] = custom_focal_obj
+    focal_params["metric"] = "None"
+
     try:
         step3_model = lgb.train(
-            focal_params, d3_train, num_boost_round=rounds, valid_sets=[d3_cal], 
-            callbacks=c3, fobj=custom_focal_obj, feval=custom_focal_eval
+            focal_params, d3_train, num_boost_round=rounds, valid_sets=[d3_cal],
+            callbacks=c3, feval=custom_focal_eval,
         )
     finally:
         for fn in clean3:

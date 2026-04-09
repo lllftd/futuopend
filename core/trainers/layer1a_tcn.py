@@ -79,7 +79,7 @@ def _train_tcn_model(
 
     if show_model_summary:
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"  Model params: {n_params:,}  (target ~70K)")
+        print(f"  Model params: {n_params:,}  (SLIM_CHANNELS={SLIM_CHANNELS})")
         print(f"  Architecture: channels={SLIM_CHANNELS}, kernel={TCN_KERNEL_SIZE}, dropout={TCN_DROPOUT}")
 
     y_tr = y[train_idx]
