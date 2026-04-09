@@ -30,4 +30,9 @@ echo "================================================================="
 
 mkdir -p "$ROOT/logs"
 
-FORCE_TQDM=1 python3 -m backtests.train_pipeline --start-from "$START_LAYER"
+PY="${ROOT}/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="python3"
+fi
+
+FORCE_TQDM=1 "$PY" -m backtests.train_pipeline --start-from "$START_LAYER"
