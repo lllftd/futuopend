@@ -318,8 +318,17 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
     mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
     mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
-    rr = mfe / np.maximum(mae, 0.1)
     hold_time = np.maximum(df["exit_bar"].fillna(0).values.astype(float), 0.0)
+    
+    # ---------------------------------------------------------
+    # OPTIONS GAMMA SCALPING: Time-decay on MFE
+    # ---------------------------------------------------------
+    # If a trade takes longer than 3 bars (15 mins) to reach its MFE, the option theta/IV crush
+    # destroys the premium. We artificially decay the MFE so KMeans correctly labels slow trades as CHOP.
+    gamma_decay = np.exp(-np.maximum(hold_time - 3, 0) / 3.0)
+    mfe = mfe * gamma_decay
+    
+    rr = mfe / np.maximum(mae, 0.1)
     # Right-skewed hold lengths: log1p before Z-score so K-Means isn't dominated by rare long holds
     log_hold_time = np.log1p(hold_time)
 

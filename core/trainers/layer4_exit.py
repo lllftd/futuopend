@@ -79,12 +79,12 @@ def train_exit_manager_layer4(
     mfe_atr = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
     mae_atr = np.clip(work["max_adverse"].values / safe_atr, 0.0, 4.0)
     
-    # Bins: 0: <0.5, 1: 0.5-1.2, 2: 1.2-2.5, 3: >2.5
-    y_tp_target = np.digitize(mfe_atr, bins=[0.5, 1.2, 2.5]).astype(np.int32)
-    # Bins: 0: <0.5, 1: 0.5-1.0, 2: 1.0-1.5, 3: >1.5
-    y_sl_target = np.digitize(mae_atr, bins=[0.5, 1.0, 1.5]).astype(np.int32)
-    # Time target (Survival): predict expected duration of the trade
-    y_time_target = np.clip(work.get("exit_bar", np.zeros(n)).fillna(0).values, 1, 30).astype(np.float32)
+    # Bins for Gamma Scalping: 0: <0.5, 1: 0.5-1.0, 2: 1.0-1.5, 3: >1.5
+    y_tp_target = np.digitize(mfe_atr, bins=[0.5, 1.0, 1.5]).astype(np.int32)
+    # Bins for Gamma Scalping SL: 0: <0.3, 1: 0.3-0.6, 2: 0.6-1.0, 3: >1.0
+    y_sl_target = np.digitize(mae_atr, bins=[0.3, 0.6, 1.0]).astype(np.int32)
+    # Time target (Survival): predict expected duration of the trade. Max 6 bars (30 mins) for fast options scalping.
+    y_time_target = np.clip(work.get("exit_bar", np.zeros(n)).fillna(0).values, 1, 6).astype(np.float32)
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
@@ -118,7 +118,7 @@ def train_exit_manager_layer4(
     y_time_train, y_time_test = y_time_target[cal_mask], y_time_target[test_mask]
     
     # We only care about training TP/SL on actual trades that passed the gate!
-    thr_long = trade_quality_models["thresholds"]["long"]
+3    thr_long = trade_quality_models["thresholds"]["long"]
     thr_short = trade_quality_models["thresholds"]["short"]
     gate_mask_train = (p_long_gate[cal_mask] >= thr_long) | (p_short_gate[cal_mask] >= thr_short)
     gate_mask_test = (p_long_gate[test_mask] >= thr_long) | (p_short_gate[test_mask] >= thr_short)
@@ -221,8 +221,8 @@ def train_exit_manager_layer4(
         "l4_schema": 3,
         "type": "exit_manager_ordinal_evt_bocpd_hawkes",
         "feature_cols": exec_feat_cols,
-        "tp_bins": [0.5, 1.2, 2.5],
-        "sl_bins": [0.5, 1.0, 1.5],
+        "tp_bins": [0.5, 1.0, 1.5],
+        "sl_bins": [0.3, 0.6, 1.0],
         "evt_tp_max": evt_tp_max,
         "evt_sl_max": evt_sl_max,
         "model_files": {

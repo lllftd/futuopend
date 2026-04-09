@@ -214,8 +214,9 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         tp_p_exact = np.column_stack([1.0 - tp_probs[:, 0], tp_probs[:, 0] - tp_probs[:, 1], tp_probs[:, 1] - tp_probs[:, 2], tp_probs[:, 2]])
         sl_p_exact = np.column_stack([1.0 - sl_probs[:, 0], sl_probs[:, 0] - sl_probs[:, 1], sl_probs[:, 1] - sl_probs[:, 2], sl_probs[:, 2]])
         
-        tp_centers = np.array([0.25, 0.85, 1.85, 3.5])
-        sl_centers = np.array([0.25, 0.75, 1.25, 2.0])
+        # Adjusted centers for Gamma Scalping Bins
+        tp_centers = np.array([0.25, 0.75, 1.25, 2.0])
+        sl_centers = np.array([0.15, 0.45, 0.8, 1.5])
         
         pred_tp_atr = np.sum(tp_p_exact * tp_centers, axis=1)
         pred_sl_atr = np.sum(sl_p_exact * sl_centers, axis=1)
@@ -232,8 +233,9 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         pred_sl_prob = _chunked_booster_predict(p["l4_sl"], l3_x, OOS_PRED_CHUNK, desc=f"L4 SL [{symbol}]")
         pred_time = _chunked_booster_predict(p["l4_time"], l3_x, OOS_PRED_CHUNK, desc=f"L4 Time [{symbol}]")
         
-        tp_centers = np.array([0.25, 0.85, 1.85, 3.5])
-        sl_centers = np.array([0.25, 0.75, 1.25, 2.0])
+        # Adjusted centers for Gamma Scalping Bins
+        tp_centers = np.array([0.25, 0.75, 1.25, 2.0])
+        sl_centers = np.array([0.15, 0.45, 0.8, 1.5])
         
         pred_tp_atr = np.sum(pred_tp_prob * tp_centers, axis=1)
         pred_sl_atr = np.sum(pred_sl_prob * sl_centers, axis=1)
@@ -243,9 +245,9 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         pred_time = np.full(len(df), 30.0)
 
     df["exec_size"] = exec_size
-    df["pred_tp_atr"] = np.clip(pred_tp_atr, 0.1, 10.0)
-    df["pred_sl_atr"] = np.clip(pred_sl_atr, 0.1, 5.0)
-    df["pred_time"] = np.clip(pred_time, 2.0, 100.0)
+    df["pred_tp_atr"] = np.clip(pred_tp_atr, 0.1, 3.0) # Scalping max TP 3 ATR
+    df["pred_sl_atr"] = np.clip(pred_sl_atr, 0.1, 2.0) # Scalping max SL 2 ATR
+    df["pred_time"] = np.clip(pred_time, 1.0, 6.0) # Gamma scalping max hold 6 bars (30 mins)
     df["atr_5m"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean()
     tp_arr = df["pred_tp_atr"].values
     sl_arr = df["pred_sl_atr"].values
