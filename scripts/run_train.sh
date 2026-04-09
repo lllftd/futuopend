@@ -11,6 +11,8 @@ cd "$ROOT"
 START_LAYER="${1:-layer1}"
 # layer2 = layer2a (train LGBM from regime; skips TCN/Mamba). To ignore Mamba weights if present:
 #   DISABLE_MAMBA_FEATURES=1 ./scripts/run_train.sh layer2
+# TCN OOF already done and tcn_oof_cache.pkl exists — train final TCN only (saves time & RAM):
+#   TCN_SKIP_OOF=1 ./scripts/run_train.sh layer1
 VALID_LAYERS="layer1 layer1a layer1b layer2 layer2a layer2b layer3 layer4"
 
 if [[ ! " $VALID_LAYERS " =~ " $START_LAYER " ]]; then

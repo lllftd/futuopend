@@ -173,6 +173,10 @@ def _train_tcn_model(
     return model
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
 def train_tcn(
     X_mm: np.memmap,
     y: np.ndarray,
@@ -183,74 +187,93 @@ def train_tcn(
     ts: np.ndarray,
     syms: np.ndarray,
 ):
-    n_folds = TCN_OOF_FOLDS
-    fold_size = len(train_idx) // n_folds
+    skip_oof = _env_truthy("TCN_SKIP_OOF")
+    oof_path = os.path.join(MODEL_DIR, "tcn_oof_cache.pkl")
 
     print("\n" + "=" * 70, flush=True)
-    print(
-        f"  Training TCN — {TCN_OOF_FOLDS}-fold OOF "
-        f"(future triple barrier hit, +15 bars, 1.5 ATR)",
-        flush=True,
-    )
+    if skip_oof:
+        print(
+            "  Training TCN — OOF skipped (TCN_SKIP_OOF=1); final model + test eval only",
+            flush=True,
+        )
+        if not os.path.isfile(oof_path):
+            raise FileNotFoundError(
+                f"TCN_SKIP_OOF=1 requires an existing OOF cache at {oof_path}. "
+                "Run a full TCN train once without TCN_SKIP_OOF, then retry."
+            )
+        print(f"  Keeping on-disk OOF cache (not rewritten): {oof_path}", flush=True)
+    else:
+        print(
+            f"  Training TCN — {TCN_OOF_FOLDS}-fold OOF "
+            f"(future triple barrier hit, +15 bars, 1.5 ATR)",
+            flush=True,
+        )
     print("=" * 70, flush=True)
     print(
         f"  Scheme A: OOF and final use the same max_epochs={TCN_MAX_EPOCHS}, "
         f"patience={TCN_ES_PATIENCE} (override: TCN_MAX_EPOCHS / TCN_ES_PATIENCE)",
         flush=True,
     )
-    print(
-        f"  OOF folds={TCN_OOF_FOLDS} (env TCN_OOF_FOLDS) — running sequentially in-process",
-        flush=True,
-    )
-
-    oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
-    oof_regime_probs = np.zeros((len(train_idx), TCN_HEAD_NUM_CLASSES), dtype=np.float32)
-
-    print("  Loading memmap into RAM for fast training…", flush=True)
-    X_tseq = torch.from_numpy(np.array(X_mm))
-    for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
-        start_idx = fold * fold_size
-        end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
-
-        val_fold_idx = train_idx[start_idx:end_idx]
-        train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
-
-        fold_model = _train_tcn_model(
-            X_mm,
-            y,
-            train_fold_idx,
-            val_fold_idx,
-            n_features,
-            desc_str=f"TCN OOF Fold {fold + 1}/{n_folds}",
-            show_model_summary=False,
+    if not skip_oof:
+        print(
+            f"  OOF folds={TCN_OOF_FOLDS} (env TCN_OOF_FOLDS) — running sequentially in-process",
+            flush=True,
         )
 
-        val_ds = TensorDataset(X_tseq[val_fold_idx])
-        val_dl = DataLoader(val_ds, batch_size=4096, shuffle=False)
+    if not skip_oof:
+        n_folds = TCN_OOF_FOLDS
+        fold_size = len(train_idx) // n_folds
 
-        fold_embs, fold_rp = [], []
-        with torch.inference_mode():
-            for (xb,) in val_dl:
-                xb = xb.to(DEVICE)
-                r_log, emb = fold_model.forward_with_embedding(xb)
-                fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
-                fold_embs.append(emb.cpu().numpy())
+        oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
+        oof_regime_probs = np.zeros((len(train_idx), TCN_HEAD_NUM_CLASSES), dtype=np.float32)
 
-        oof_embeds[start_idx:end_idx] = np.concatenate(fold_embs, axis=0)
-        oof_regime_probs[start_idx:end_idx] = np.concatenate(fold_rp, axis=0)
+        print("  Loading memmap into RAM for fast training…", flush=True)
+        X_tseq = torch.from_numpy(np.array(X_mm))
+        for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
+            start_idx = fold * fold_size
+            end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
 
-    # Save OOF
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    oof_cache = {
-        "train_idx": train_idx,
-        "ts": ts[train_idx],
-        "syms": syms[train_idx],
-        "embeds": oof_embeds,
-        "regime_probs": oof_regime_probs,
-    }
-    with open(os.path.join(MODEL_DIR, "tcn_oof_cache.pkl"), "wb") as f:
-        pickle.dump(oof_cache, f)
-    print(f"\n  Saved OOF cache -> {MODEL_DIR}/tcn_oof_cache.pkl")
+            val_fold_idx = train_idx[start_idx:end_idx]
+            train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
+
+            fold_model = _train_tcn_model(
+                X_mm,
+                y,
+                train_fold_idx,
+                val_fold_idx,
+                n_features,
+                desc_str=f"TCN OOF Fold {fold + 1}/{n_folds}",
+                show_model_summary=False,
+            )
+
+            val_ds = TensorDataset(X_tseq[val_fold_idx])
+            val_dl = DataLoader(val_ds, batch_size=4096, shuffle=False)
+
+            fold_embs, fold_rp = [], []
+            with torch.inference_mode():
+                for (xb,) in val_dl:
+                    xb = xb.to(DEVICE)
+                    r_log, emb = fold_model.forward_with_embedding(xb)
+                    fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
+                    fold_embs.append(emb.cpu().numpy())
+
+            oof_embeds[start_idx:end_idx] = np.concatenate(fold_embs, axis=0)
+            oof_regime_probs[start_idx:end_idx] = np.concatenate(fold_rp, axis=0)
+
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        oof_cache = {
+            "train_idx": train_idx,
+            "ts": ts[train_idx],
+            "syms": syms[train_idx],
+            "embeds": oof_embeds,
+            "regime_probs": oof_regime_probs,
+        }
+        with open(oof_path, "wb") as f:
+            pickle.dump(oof_cache, f)
+        print(f"\n  Saved OOF cache -> {oof_path}")
+
+        del X_tseq
+        gc.collect()
 
     X_t = torch.from_numpy(np.array(X_mm))
 

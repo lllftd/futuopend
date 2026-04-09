@@ -118,7 +118,7 @@ def train_exit_manager_layer4(
     y_time_train, y_time_test = y_time_target[cal_mask], y_time_target[test_mask]
     
     # We only care about training TP/SL on actual trades that passed the gate!
-3    thr_long = trade_quality_models["thresholds"]["long"]
+    thr_long = trade_quality_models["thresholds"]["long"]
     thr_short = trade_quality_models["thresholds"]["short"]
     gate_mask_train = (p_long_gate[cal_mask] >= thr_long) | (p_short_gate[cal_mask] >= thr_short)
     gate_mask_test = (p_long_gate[test_mask] >= thr_long) | (p_short_gate[test_mask] >= thr_short)
