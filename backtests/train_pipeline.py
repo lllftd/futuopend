@@ -328,7 +328,8 @@ def main():
     if start == "layer1" or start == "layer1a":
         run_layer1a_tcn()
     if start == "layer1" or start == "layer1b":
-        run_layer1b_mamba()
+        print("\n  [1b] --- Skipping Layer 1b Mamba (Disabled) ---")
+        # run_layer1b_mamba()
 
     if start in ["layer1", "layer1a", "layer1b"]:
         run_lgbm_layers("layer2a")
