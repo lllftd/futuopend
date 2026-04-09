@@ -120,7 +120,7 @@ class PAStateTCN(nn.Module):
         dropout: float,
         bottleneck_dim: int | None = None,
         num_classes: int = 6,
-        noise_std: float = 0.05,
+        noise_std: float = 0.02,
     ):
         super().__init__()
         self.noise_std = noise_std

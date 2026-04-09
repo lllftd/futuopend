@@ -23,9 +23,9 @@ from core.trainers.constants import TCN_REGIME_FUT_PROB_COLS
 from core.trainers.tcn_constants import *
 from core.trainers.tcn_utils import _tq, _tqdm_disabled
 
-# Layer 1 label is binary transition (see tcn_data_prep.prepare_data); not NUM_REGIME_CLASSES (6).
+# Layer 1 label is Triple Barrier (Up, Down, TimeStop).
 TCN_HEAD_NUM_CLASSES = len(TCN_REGIME_FUT_PROB_COLS)
-TCN_HEAD_TARGET_NAMES = ["same", "transition"]
+TCN_HEAD_TARGET_NAMES = ["Bull_Hit", "Bear_Hit", "Chop_Timeout"]
 
 
 def _train_tcn_model(
@@ -91,7 +91,7 @@ def _train_tcn_model(
     class_weights_t = torch.tensor(class_weights, dtype=torch.float32).to(dev)
 
     focal_gamma = float(os.environ.get("FOCAL_GAMMA", "0.0"))
-    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", "0.10"))
+    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", "0.02"))
     
     if focal_gamma > 0.0:
         # Note: focal loss implementation doesn't currently use label smoothing directly in our custom class, 
@@ -107,7 +107,8 @@ def _train_tcn_model(
     criterion_eval = nn.CrossEntropyLoss(weight=class_weights_t)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=8e-4, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-5)
+    # Changed from WarmRestarts to standard Cosine to prevent violent loss spikes triggering Early Stopping
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=me, eta_min=1e-5)
 
     best_cal_loss = float("inf")
     best_state = None
@@ -188,7 +189,7 @@ def train_tcn(
     print("\n" + "=" * 70, flush=True)
     print(
         f"  Training TCN — {TCN_OOF_FOLDS}-fold OOF "
-        f"(future transition signal, +15 bars)",
+        f"(future triple barrier hit, +15 bars, 1.5 ATR)",
         flush=True,
     )
     print("=" * 70, flush=True)
@@ -281,8 +282,8 @@ def train_tcn(
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
     acc = accuracy_score(y_true, y_pred)
-    print(f"\n  Test Accuracy — future transition (binary): {acc:.4f}")
-    print("\n  Classification Report — future transition (+15 bars):")
+    print(f"\n  Test Accuracy — future triple barrier (3-class): {acc:.4f}")
+    print("\n  Classification Report — future barrier (+15 bars, 1.5 ATR):")
     print(
         classification_report(
             y_true, y_pred,

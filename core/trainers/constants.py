@@ -18,7 +18,7 @@ STATE_CLASSIFIER_FILE = "state_classifier_6c.txt"
 REGIME_NOW_PROB_COLS = ["bull_conv", "bull_div", "bear_conv", "bear_div", "range_conv", "range_div"]
 REGIME_PROB_COLS = REGIME_NOW_PROB_COLS
 RANGE_REGIME_INDICES = [4, 5]
-TCN_REGIME_FUT_PROB_COLS = ["tcn_transition_same", "tcn_transition_prob"]
+TCN_REGIME_FUT_PROB_COLS = ["tcn_barrier_hit_up", "tcn_barrier_hit_dn", "tcn_barrier_chop"]
 MAMBA_REGIME_FUT_PROB_COLS = ["mamba_transition_same", "mamba_transition_prob"]
 TCN_BOTTLENECK_DIM = max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
 
