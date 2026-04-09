@@ -259,9 +259,10 @@ def prepare_data():
     ms = pd.to_numeric(df["market_state"], errors="coerce").fillna(4).astype(int)
     
     # We use 1m resolution for Triple Barrier to be as accurate as possible without missing intra-bar spikes.
-    # The horizon is in minutes (e.g. 45 = 45 minutes).
-    horizon = 45
-    atr_mult = 1.5
+    # The horizon is in minutes. For intraday options (gamma scalping), 15 minutes is ideal.
+    horizon = 15
+    # To catch a gamma burst in 15 mins, we expect a fast 1.0 ATR_5m move (approx. 1 average 5m bar's range).
+    atr_mult = 1.0
     
     # Pre-calculate upper and lower barrier prices for each bar
     closes = df["close"].values
