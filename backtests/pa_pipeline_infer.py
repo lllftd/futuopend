@@ -232,7 +232,11 @@ def load_layered_pa_pipeline():
 
     l2a_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, "state_classifier_6c.txt"))
     with open(os.path.join(MODEL_DIR, "state_calibrators.pkl"), "rb") as f:
-        l2a_cals = pickle.load(f)
+        l2a_cals_obj = pickle.load(f)
+        if isinstance(l2a_cals_obj, dict):
+            l2a_cals = l2a_cals_obj["calibrators"]
+        else:
+            l2a_cals = l2a_cals_obj
 
     with open(os.path.join(MODEL_DIR, "trade_quality_meta.pkl"), "rb") as f:
         tq_meta = pickle.load(f)
@@ -263,8 +267,8 @@ def load_layered_pa_pipeline():
         raise FileNotFoundError(
             "L2b regression Step1: no opp models loaded; check regression_gate.model_files.",
         )
-    l2b_step1 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_gate_step1.txt"))
-    l2b_step2 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_dir_step2.txt"))
+    l2b_step1_long = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_gate_long.txt"))
+    l2b_step1_short = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_gate_short.txt"))
     l2b_step3 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_grade_step3.txt"))
 
     with open(os.path.join(MODEL_DIR, "execution_sizer_meta.pkl"), "rb") as f:
@@ -313,8 +317,8 @@ def load_layered_pa_pipeline():
         "tq_meta": tq_meta,
         "l2b_opp": l2b_opp,
         "l2b_opp_thr_vec": l2b_opp_thr_vec,
-        "l2b_s1": l2b_step1,
-        "l2b_s2": l2b_step2,
+        "l2b_s1_long": l2b_step1_long,
+        "l2b_s1_short": l2b_step1_short,
         "l2b_s3": l2b_step3,
         "l3_model": l3_model,
         "l3_gate": l3_gate,

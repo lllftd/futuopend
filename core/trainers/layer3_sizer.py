@@ -23,7 +23,7 @@ from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.data_prep import *
 from core.trainers.layer2b_quality import (
-    _layer3_fill_p_trade_from_regression,
+    _layer3_fill_trade_stack_probs_gates,
     _l2b_nested_opp_models,
     _compute_opportunity_triplet,
     _l2b_triplet_from_trade_prob,
@@ -36,7 +36,7 @@ from core.trainers.layer2b_quality import (
 
 def _layer3_fill_regime_calibrated(
     regime_model: lgb.Booster,
-    regime_calibrators: list,
+    regime_calibrators: Any,
     work: pd.DataFrame,
     out: np.ndarray,
     chunk: int,
@@ -49,12 +49,20 @@ def _layer3_fill_regime_calibrated(
         j = min(i + chunk, n)
         x_s = work[regime_cols].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
         raw = regime_model.predict(x_s)
-        row = np.empty((j - i, n_cls), dtype=np.float64)
-        for c in range(n_cls):
-            row[:, c] = regime_calibrators[c].predict(raw[:, c])
-        row = np.maximum(row, 1e-12)
-        row /= row.sum(axis=1, keepdims=True)
-        out[i:j] = row.astype(np.float32, copy=False)
+        
+        if isinstance(regime_calibrators, list):
+            row = np.empty((j - i, n_cls), dtype=np.float64)
+            for c in range(n_cls):
+                row[:, c] = regime_calibrators[c].predict(raw[:, c])
+            row = np.maximum(row, 1e-12)
+            row /= row.sum(axis=1, keepdims=True)
+            out[i:j] = row.astype(np.float32, copy=False)
+        else:
+            eps = 1e-7
+            l_p = np.log(np.clip(raw, eps, 1 - eps))
+            row = regime_calibrators.predict_proba(l_p)
+            out[i:j] = row.astype(np.float32, copy=False)
+            
         del x_s, raw, row
 
 
@@ -69,14 +77,14 @@ def _layer3_fill_trade_stack_probs(
     trade_quality_models: dict,
     work: pd.DataFrame,
     layer2_feats: list[str],
-    p_trade: np.ndarray,
-    p_long: np.ndarray,
+    p_long_gate: np.ndarray,
+    p_short_gate: np.ndarray,
     chunk: int,
 ) -> None:
     if not trade_quality_models.get("step1_regression"):
         raise RuntimeError("Layer 2b Step1 is regression-only; missing step1_regression in model bundle.")
-    _layer3_fill_p_trade_from_regression(
-        trade_quality_models, work, layer2_feats, p_trade, p_long, chunk,
+    _layer3_fill_trade_stack_probs_gates(
+        trade_quality_models, work, layer2_feats, p_long_gate, p_short_gate, chunk,
     )
 
 
@@ -116,7 +124,7 @@ def train_execution_sizer(
     df: pd.DataFrame,
     feat_cols: list[str],
     regime_model: lgb.Booster,
-    regime_calibrators: list,
+    regime_calibrators: Any,
     trade_quality_models: dict,
     thr_cp: float,
 ):
@@ -150,28 +158,31 @@ def train_execution_sizer(
     layer2_feats = trade_quality_models["feature_cols"]
     thr = trade_quality_models["thresholds"]
 
-    p_trade = np.empty(n, dtype=np.float32)
-    p_long = np.empty(n, dtype=np.float32)
+    p_long_gate = np.empty(n, dtype=np.float32)
+    p_short_gate = np.empty(n, dtype=np.float32)
     _layer3_fill_trade_stack_probs(
-        trade_quality_models, work, layer2_feats, p_trade, p_long, chunk,
+        trade_quality_models, work, layer2_feats, p_long_gate, p_short_gate, chunk,
     )
     tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
-    p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp, tcn_transition_prob_all)
+    p_long_gate, _ = _apply_cp_skip(cal_regime, p_long_gate, thr_cp, tcn_transition_prob_all)
+    p_short_gate, _ = _apply_cp_skip(cal_regime, p_short_gate, thr_cp, tcn_transition_prob_all)
+
+    p_trade_max = np.maximum(p_long_gate, p_short_gate)
 
     l2b_opp = np.empty(n, dtype=np.float32)
     l2b_mfe = np.empty(n, dtype=np.float32)
     l2b_mae = np.empty(n, dtype=np.float32)
     _layer3_fill_l2b_triplet_arrays(
-        trade_quality_models, work, layer2_feats, p_trade, l2b_opp, l2b_mfe, l2b_mae, chunk,
+        trade_quality_models, work, layer2_feats, p_trade_max, l2b_opp, l2b_mfe, l2b_mae, chunk,
     )
 
     p_range_mass = cal_regime[:, RANGE_REGIME_INDICES].sum(axis=1)
     y_cls_est = _reconstruct_quality_classes(
-        p_trade=p_trade,
-        p_long=p_long,
+        p_long_gate=p_long_gate,
+        p_short_gate=p_short_gate,
         p_range_mass=p_range_mass,
-        thr_trade=thr["trade"],
         thr_long=thr["long"],
+        thr_short=thr["short"],
     )
 
     y_cls = _build_trade_quality_targets(work)
@@ -298,13 +309,13 @@ def train_execution_sizer(
     }
     d_gate_tr = lgb.Dataset(X_train, label=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
     d_gate_va = lgb.Dataset(X_val, label=y_gate_val, feature_name=exec_feat_cols, free_raw_data=True)
+    gate_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
     model_gate = lgb.train(
         gate_params,
         d_gate_tr,
         num_boost_round=rounds,
         valid_sets=[d_gate_va],
         callbacks=es_cb,
-        fobj=lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0),
         feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
     )
 
@@ -338,7 +349,7 @@ def train_execution_sizer(
         callbacks=es_cb,
     )
 
-    pred_g = model_gate.predict(X_test)
+    pred_g = 1.0 / (1.0 + np.exp(-model_gate.predict(X_test)))
     pred_s = model_size.predict(X_test)
     pred = np.clip(pred_g * pred_s, -1.0, 1.0)
 

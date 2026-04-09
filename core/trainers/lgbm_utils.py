@@ -326,7 +326,8 @@ def _optuna_search_params(
     def objective(trial):
         p = base_params.copy()
         p["num_leaves"] = trial.suggest_int("num_leaves", 15, 63)
-        p["learning_rate"] = trial.suggest_float("learning_rate", 0.03, 0.1, log=True)
+        p["learning_rate"] = trial.suggest_float("learning_rate", 0.01, 0.1, log=True)
+        p["feature_fraction"] = trial.suggest_float("feature_fraction", 0.5, 0.9)
         # Lock all other parameters to base_params to prevent small-data noise
 
         model = lgb.train(
@@ -347,7 +348,8 @@ def _optuna_search_params(
 
     best = study.best_params
     print(f"  → Best Optuna params (n={actual_trials}): num_leaves={best['num_leaves']}  "
-          f"learning_rate={best['learning_rate']:.4f}  logloss={study.best_value:.5f}")
+          f"learning_rate={best['learning_rate']:.4f}  feature_fraction={best['feature_fraction']:.4f}  "
+          f"logloss={study.best_value:.5f}")
 
     return {**base_params, **best}
 

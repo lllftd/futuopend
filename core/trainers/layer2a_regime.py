@@ -10,7 +10,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
     accuracy_score,
@@ -90,7 +90,7 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
     )
     params = {**base_params, **best_combo}
 
-    print(f"\n  Training final model with best params (lr=0.01, colsample=0.7)…")
+    print(f"\n  Training final model with best params: lr={params['learning_rate']:.4f}, colsample={params['feature_fraction']:.4f}…")
     _require_lgb_matrix_matches_names(X_train, pa_only_feats, "Layer 2a final train")
     train_data = lgb.Dataset(X_train, label=y_train, weight=w_train,
                              feature_name=pa_only_feats, free_raw_data=False)
@@ -113,22 +113,20 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
         callbacks=_lgb_train_callbacks(state_es),
     )
 
-    # ── Isotonic calibration per class on the calibration set ──
-    # Index c == L2a class == STATE_NAMES[c] == REGIMES_6[c] (same axis as model.predict columns).
+    # ── Dirichlet Calibration on the calibration set ──
+    # Optimizes logloss and joint distribution, replacing per-class Isotonic which breaks normalization.
     # Use the second half of the calibration set (X_cal_iso) which wasn't used for early stopping
     raw_cal_probs = model.predict(X_cal_iso)   # (n_cal_iso, NUM_REGIME_CLASSES)
-    calibrators = []
-    for c in range(NUM_REGIME_CLASSES):
-        y_binary = (y_cal_iso == c).astype(int)
-        iso = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
-        iso.fit(raw_cal_probs[:, c], y_binary)
-        calibrators.append(iso)
+    
+    eps = 1e-7
+    log_probs = np.log(np.clip(raw_cal_probs, eps, 1 - eps))
+    calibrator = LogisticRegression(multi_class='multinomial', max_iter=2000, C=1.0)
+    calibrator.fit(log_probs, y_cal_iso)
 
     def predict_calibrated(X_in):
         raw = model.predict(X_in)
-        cal = np.column_stack([calibrators[c].predict(raw[:, c]) for c in range(NUM_REGIME_CLASSES)])
-        cal /= cal.sum(axis=1, keepdims=True)  # re-normalise to sum=1
-        return cal
+        l_p = np.log(np.clip(raw, eps, 1 - eps))
+        return calibrator.predict_proba(l_p)
 
     # ── Conformal Prediction Calibration (Score method) ──
     probs_cal = predict_calibrated(X_cal)
@@ -215,12 +213,12 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
     import pickle
     with open(os.path.join(MODEL_DIR, "state_calibrators.pkl"), "wb") as f:
         pickle.dump({
-            "calibrators": calibrators,
+            "calibrators": calibrator,
             "thr_cp": float(thr_cp)
         }, f)
     print(f"\n  Model saved → {MODEL_DIR}/{STATE_CLASSIFIER_FILE}")
     print(f"  Calibrators saved → {MODEL_DIR}/state_calibrators.pkl")
 
-    return model, calibrators, imp_df, float(thr_cp)
+    return model, calibrator, imp_df, float(thr_cp)
 
 

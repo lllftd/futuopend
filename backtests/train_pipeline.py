@@ -225,12 +225,33 @@ def load_layer2a_artifacts():
     return regime_model, regime_cal, thr_cp
 
 def load_layer2b_artifacts():
-    model_path = os.path.join(MODEL_DIR, "trade_gate_step1.txt")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Missing Layer 2b model at {model_path}. Cannot skip Layer 2b.")
+    long_path = os.path.join(MODEL_DIR, "trade_gate_long.txt")
+    if not os.path.exists(long_path):
+        raise FileNotFoundError(f"Missing Layer 2b model at {long_path}. Cannot skip Layer 2b.")
     
-    tq_model = lgb.Booster(model_file=model_path)
-    return tq_model
+    with open(os.path.join(MODEL_DIR, "trade_quality_meta.pkl"), "rb") as f:
+        meta = pickle.load(f)
+    
+    regb = meta.get("regression_gate", {})
+    step1_regression_bundle = {"thr_vec": np.array(regb.get("thr_vec", []))}
+    for regime in regb.get("groups", []):
+        mfe_file = regb["model_files"].get(f"{regime}_mfe", "")
+        mae_file = regb["model_files"].get(f"{regime}_mae", "")
+        if mfe_file and os.path.exists(os.path.join(MODEL_DIR, mfe_file)):
+            step1_regression_bundle[f"{regime}_mfe"] = lgb.Booster(model_file=os.path.join(MODEL_DIR, mfe_file))
+        if mae_file and os.path.exists(os.path.join(MODEL_DIR, mae_file)):
+            step1_regression_bundle[f"{regime}_mae"] = lgb.Booster(model_file=os.path.join(MODEL_DIR, mae_file))
+
+    step1_long_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, meta["model_files"]["step1_long"]))
+    step1_short_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, meta["model_files"]["step1_short"]))
+    
+    return {
+        "step1_regression": step1_regression_bundle,
+        "step1_long": step1_long_model,
+        "step1_short": step1_short_model,
+        "thresholds": meta["hierarchy_thresholds"],
+        "feature_cols": meta["feature_cols"],
+    }
 
 def run_lgbm_layers(start_from="layer2a"):
     configure_compute_threads()

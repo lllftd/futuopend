@@ -245,16 +245,16 @@ def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
-def _layer3_fill_p_trade_from_regression(
+def _layer3_fill_trade_stack_probs_gates(
     trade_quality_models: dict,
     work: pd.DataFrame,
     layer2_feats: list[str],
-    p_trade: np.ndarray,
-    p_long: np.ndarray,
+    p_long_gate: np.ndarray,
+    p_short_gate: np.ndarray,
     chunk: int,
 ) -> None:
-    s1 = trade_quality_models.get("step1_binary")
-    s2 = trade_quality_models["step2"]
+    s1_long = trade_quality_models.get("step1_long")
+    s1_short = trade_quality_models.get("step1_short")
     regb = trade_quality_models.get("step1_regression")
 
     regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
@@ -267,19 +267,21 @@ def _layer3_fill_p_trade_from_regression(
         j = min(i + chunk, n)
         x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
 
-        if s1 is not None:
-            raw_p = s1.predict(x_b)
+        if s1_long is not None and s1_short is not None:
+            pl = 1.0 / (1.0 + np.exp(-s1_long.predict(x_b)))
+            ps = 1.0 / (1.0 + np.exp(-s1_short.predict(x_b)))
             rp = regime_mat[i:j]
             p_rm = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
-            p_trade[i:j] = raw_p * (1.0 - 0.7 * p_rm)
+            p_long_gate[i:j] = pl * (1.0 - 0.7 * p_rm)
+            p_short_gate[i:j] = ps * (1.0 - 0.7 * p_rm)
         else:
             rp = regime_mat[i:j]
             opp = _compute_opportunity_scores(x_b, rp, models)
             gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)
             thr_row = thr_vec[gix]
-            p_trade[i:j] = _opp_to_synthetic_p_trade(opp, thr_row)
-
-        p_long[i:j] = s2.predict(x_b)
+            p_trade = _opp_to_synthetic_p_trade(opp, thr_row)
+            p_long_gate[i:j] = p_trade
+            p_short_gate[i:j] = p_trade
 
 
 def _print_quality_label_outcome_stats(df: pd.DataFrame, y6: np.ndarray) -> None:
@@ -493,22 +495,31 @@ def _binary_weights(y: np.ndarray, timestamps: np.ndarray, pos_boost: float = 1.
 
 
 def _reconstruct_quality_classes(
-    p_trade: np.ndarray,
-    p_long: np.ndarray,
+    p_long_gate: np.ndarray,
+    p_short_gate: np.ndarray,
     p_range_mass: np.ndarray,
-    thr_trade: float = 0.55,
-    thr_long: float = 0.50,
+    thr_long: float = 0.55,
+    thr_short: float = 0.55,
 ) -> np.ndarray:
     """Map hierarchical binary outputs back into 4-class trade-quality space."""
-    pred = np.full(len(p_trade), 1, dtype=int)  # NEUTRAL default
-    skip = p_trade < thr_trade
+    pred = np.full(len(p_long_gate), 1, dtype=int)  # NEUTRAL default
+    
+    is_long = p_long_gate >= thr_long
+    is_short = p_short_gate >= thr_short
+    
+    skip = ~(is_long | is_short)
     pred[skip & (p_range_mass >= 0.50)] = 2  # CHOP when range_* mass is high
     pred[skip & (p_range_mass < 0.50)] = 1   # NEUTRAL when bull/bear mass dominates
 
-    trade = ~skip
-    is_long = p_long >= thr_long
-    pred[trade & is_long] = 0
-    pred[trade & ~is_long] = 3
+    both = is_long & is_short
+    conflict_long = both & (p_long_gate > p_short_gate)
+    conflict_short = both & (p_short_gate >= p_long_gate)
+    
+    pred[is_long & ~both] = 0
+    pred[is_short & ~both] = 3
+    pred[conflict_long] = 0
+    pred[conflict_short] = 3
+    
     return pred
 
 
@@ -535,7 +546,7 @@ def train_trade_quality_classifier(
     df: pd.DataFrame,
     feat_cols: list[str],
     regime_model: lgb.Booster,
-    regime_calibrators: list,
+    regime_calibrators: Any,
     thr_cp: float,
 ):
     print("\n" + "=" * 70)
@@ -611,12 +622,18 @@ def train_trade_quality_classifier(
     ):
         j = min(i + l2b_chunk, n_l2b)
         row = raw_regime[i:j]
-        cal_blk = np.column_stack([
-            regime_calibrators[c].predict(row[:, c]) for c in range(NUM_REGIME_CLASSES)
-        ])
-        cal_blk = np.maximum(cal_blk, 1e-12)
-        cal_blk /= cal_blk.sum(axis=1, keepdims=True)
-        cal_regime[i:j] = cal_blk
+        if isinstance(regime_calibrators, list):
+            cal_blk = np.column_stack([
+                regime_calibrators[c].predict(row[:, c]) for c in range(NUM_REGIME_CLASSES)
+            ])
+            cal_blk = np.maximum(cal_blk, 1e-12)
+            cal_blk /= cal_blk.sum(axis=1, keepdims=True)
+            cal_regime[i:j] = cal_blk
+        else:
+            eps = 1e-7
+            l_p = np.log(np.clip(row, eps, 1 - eps))
+            cal_blk = regime_calibrators.predict_proba(l_p)
+            cal_regime[i:j] = cal_blk
 
     for j, col in enumerate(REGIME_NOW_PROB_COLS):
         work[col] = cal_regime[:, j]
@@ -670,17 +687,18 @@ def train_trade_quality_classifier(
     y_trade_cal = np.isin(y_cal6, list(TRADABLE_CLASS_IDS)).astype(int)
     y_trade_test = np.isin(y_test6, list(TRADABLE_CLASS_IDS)).astype(int)
 
-    tradable_train = y_trade_train == 1
-    tradable_cal = y_trade_cal == 1
-    tradable_test = y_trade_test == 1
+    y_long_train = (y_train6 == 0).astype(int)
+    y_long_cal = (y_cal6 == 0).astype(int)
+    y_long_test = (y_test6 == 0).astype(int)
 
-    y_dir_train = (y_train6[tradable_train] == 0).astype(int)   # 1=LONG, 0=SHORT
-    y_dir_cal = (y_cal6[tradable_cal] == 0).astype(int)
-    y_dir_test = (y_test6[tradable_test] == 0).astype(int)
+    y_short_train = (y_train6 == 3).astype(int)
+    y_short_cal = (y_cal6 == 3).astype(int)
+    y_short_test = (y_test6 == 3).astype(int)
 
     print(f"  Dates — Train: < {TRAIN_END} | Cal: → {CAL_END} | Test: → {TEST_END}")
     print(f"  Train: {len(y_train6):,}  |  Cal: {len(y_cal6):,}  |  Test: {len(y_test6):,}")
-    print(f"  Step1 TRADE rate (train/test): {y_trade_train.mean():.2%} / {y_trade_test.mean():.2%}")
+    print(f"  LONG rate (train/test): {y_long_train.mean():.2%} / {y_long_test.mean():.2%}")
+    print(f"  SHORT rate (train/test): {y_short_train.mean():.2%} / {y_short_test.mean():.2%}")
 
     mc = np.zeros(len(all_bo_feats), dtype=int)
     # Impose monotonic constraints: higher values of these risk features MUST monotonically decrease the quality score.
@@ -694,8 +712,7 @@ def train_trade_quality_classifier(
     mc_tuple = tuple(mc)
 
     common_params = {
-        "objective": "binary",
-        "metric": "binary_logloss",
+        "metric": "None",
         "boosting_type": "gbdt",
         "num_leaves": 127,
         "max_depth": 7,
@@ -714,13 +731,6 @@ def train_trade_quality_classifier(
     }
     rounds = 1800 if FAST_TRAIN_MODE else 4000
     es = 90 if FAST_TRAIN_MODE else 140
-
-    X2_train, X2_cal, X2_test = X_train[tradable_train], X_cal[tradable_cal], X_test[tradable_test]
-    t2_train, t2_cal = t[train_mask][tradable_train], t[cal_mask][tradable_cal]
-    w2_train = _binary_weights(y_dir_train, t2_train, pos_boost=1.0)
-    w2_cal = _binary_weights(y_dir_cal, t2_cal, pos_boost=1.0)
-    d2_train = lgb.Dataset(X2_train, label=y_dir_train, weight=w2_train, feature_name=all_bo_feats, free_raw_data=False)
-    d2_cal = lgb.Dataset(X2_cal, label=y_dir_cal, weight=w2_cal, feature_name=all_bo_feats, free_raw_data=False)
     
     reg_models: dict[str, dict[str, lgb.Booster]] = {}
     thr_vec = np.ones(len(REGIMES_6), dtype=np.float64)
@@ -754,57 +764,87 @@ def train_trade_quality_classifier(
         step1_regression_bundle[f"{regime}_mfe"] = pair["mfe"]
         step1_regression_bundle[f"{regime}_mae"] = pair["mae"]
 
-    print("  [L2b train] Dedicated Step1 TRADE/SKIP binary classifier …", flush=True)
-    c1, clean1 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 Binary")
-    # Massive pos_boost to force model to learn the rare 3% signals instead of predicting CHOP for everything
-    w1_train = _binary_weights(y_trade_train, t[train_mask], pos_boost=8.0)
-    w1_cal = _binary_weights(y_trade_cal, t[cal_mask], pos_boost=4.0)
-    d1_train = lgb.Dataset(X_train, label=y_trade_train, weight=w1_train, feature_name=all_bo_feats, free_raw_data=False)
-    d1_cal = lgb.Dataset(X_cal, label=y_trade_cal, weight=w1_cal, feature_name=all_bo_feats, free_raw_data=False)
+    print("  [L2b train] Dedicated Step1 LONG gate binary classifier …", flush=True)
+    c_long, clean_long = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 LONG")
+    # Massive pos_boost to force model to learn the rare signals instead of predicting CHOP for everything
+    w_long_train = _binary_weights(y_long_train, t[train_mask], pos_boost=8.0)
+    w_long_cal = _binary_weights(y_long_cal, t[cal_mask], pos_boost=4.0)
+    d_long_train = lgb.Dataset(X_train, label=y_long_train, weight=w_long_train, feature_name=all_bo_feats, free_raw_data=False)
+    d_long_cal = lgb.Dataset(X_cal, label=y_long_cal, weight=w_long_cal, feature_name=all_bo_feats, free_raw_data=False)
+    
+    common_params_long = common_params.copy()
+    common_params_long["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
+    
     try:
-        step1_binary_model = lgb.train(
-            common_params, d1_train, num_boost_round=rounds, valid_sets=[d1_cal], callbacks=c1,
+        step1_long_model = lgb.train(
+            common_params_long, d_long_train, num_boost_round=rounds, valid_sets=[d_long_cal], callbacks=c_long,
+            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
     finally:
-        for fn in clean1:
+        for fn in clean_long:
             fn()
 
-    print("  [L2b train] Step2 LONG/SHORT LightGBM …", flush=True)
-    c2, clean2 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step2 LONG/SHORT")
+    print("  [L2b train] Dedicated Step1 SHORT gate binary classifier …", flush=True)
+    c_short, clean_short = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 SHORT")
+    w_short_train = _binary_weights(y_short_train, t[train_mask], pos_boost=8.0)
+    w_short_cal = _binary_weights(y_short_cal, t[cal_mask], pos_boost=4.0)
+    d_short_train = lgb.Dataset(X_train, label=y_short_train, weight=w_short_train, feature_name=all_bo_feats, free_raw_data=False)
+    d_short_cal = lgb.Dataset(X_cal, label=y_short_cal, weight=w_short_cal, feature_name=all_bo_feats, free_raw_data=False)
+    
+    common_params_short = common_params.copy()
+    common_params_short["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
+    
     try:
-        step2_model = lgb.train(
-            common_params, d2_train, num_boost_round=rounds, valid_sets=[d2_cal], callbacks=c2,
+        step1_short_model = lgb.train(
+            common_params_short, d_short_train, num_boost_round=rounds, valid_sets=[d_short_cal], callbacks=c_short,
+            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
     finally:
-        for fn in clean2:
+        for fn in clean_short:
             fn()
     
     rp_cal = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
-    p_trade_cal = step1_binary_model.predict(X_cal)
+    p_long_cal = 1.0 / (1.0 + np.exp(-step1_long_model.predict(X_cal)))
+    p_short_cal = 1.0 / (1.0 + np.exp(-step1_short_model.predict(X_cal)))
     
     # 1. Range Regime Penalty: heavily slash probabilities in range regimes
     p_range_mass_cal = rp_cal[:, RANGE_REGIME_INDICES].sum(axis=1)
-    p_trade_cal = p_trade_cal * (1.0 - 0.7 * p_range_mass_cal)
+    p_long_cal = p_long_cal * (1.0 - 0.7 * p_range_mass_cal)
+    p_short_cal = p_short_cal * (1.0 - 0.7 * p_range_mass_cal)
     
     # 2. Threshold Search: Prioritize Precision via F0.5 score + strict Precision floor >= 10%
-    best_f05, best_thr = 0.0, 0.7
+    best_f05_l, best_thr_l = 0.0, 0.7
     for thr_c in np.arange(0.15, 0.95, 0.02):
-        pr = (p_trade_cal >= thr_c).astype(int)
-        f05 = fbeta_score(y_trade_cal, pr, beta=0.5, zero_division=0)
-        prec = precision_score(y_trade_cal, pr, zero_division=0)
+        pr = (p_long_cal >= thr_c).astype(int)
+        f05 = fbeta_score(y_long_cal, pr, beta=0.5, zero_division=0)
+        prec = precision_score(y_long_cal, pr, zero_division=0)
         # Relaxed precision floor from 15% to 10% to improve recall for rare LONG / SHORT opportunities
-        if f05 > best_f05 and prec >= 0.10:
-            best_f05, best_thr = f05, thr_c
-    thr_trade_cal = best_thr if best_f05 > 0 else 0.85
+        if f05 > best_f05_l and prec >= 0.10:
+            best_f05_l, best_thr_l = f05, thr_c
+    thr_long_cal = best_thr_l if best_f05_l > 0 else 0.85
+
+    best_f05_s, best_thr_s = 0.0, 0.7
+    for thr_c in np.arange(0.15, 0.95, 0.02):
+        pr = (p_short_cal >= thr_c).astype(int)
+        f05 = fbeta_score(y_short_cal, pr, beta=0.5, zero_division=0)
+        prec = precision_score(y_short_cal, pr, zero_division=0)
+        if f05 > best_f05_s and prec >= 0.10:
+            best_f05_s, best_thr_s = f05, thr_c
+    thr_short_cal = best_thr_s if best_f05_s > 0 else 0.85
     
     tcn_transition_prob_cal = work["tcn_transition_prob"].values.astype(np.float32)[cal_mask] if "tcn_transition_prob" in work.columns else None
-    p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp, tcn_transition_prob_cal)
-    pr_cal = (p_trade_cal >= thr_trade_cal).astype(int)
-    f1_cal_at_thr = f1_score(y_trade_cal, pr_cal, zero_division=0)
-    n_trade_pred_cal = int(pr_cal.sum())
-    rec_cal_thr = recall_score(y_trade_cal, pr_cal, zero_division=0)
-    prec_cal_thr = precision_score(y_trade_cal, pr_cal, zero_division=0)
-    thr_rule_note = f"binary gate: opt F0.5 thr={thr_trade_cal:.2f} (prec>=0.10)"
+    p_long_cal, _ = _apply_cp_skip(rp_cal, p_long_cal, thr_cp, tcn_transition_prob_cal)
+    p_short_cal, _ = _apply_cp_skip(rp_cal, p_short_cal, thr_cp, tcn_transition_prob_cal)
+    
+    pr_l_cal = (p_long_cal >= thr_long_cal).astype(int)
+    pr_s_cal = (p_short_cal >= thr_short_cal).astype(int)
+    pr_trade_cal = pr_l_cal | pr_s_cal
+    
+    f1_cal_at_thr = f1_score(y_trade_cal, pr_trade_cal, zero_division=0)
+    n_trade_pred_cal = int(pr_trade_cal.sum())
+    rec_cal_thr = recall_score(y_trade_cal, pr_trade_cal, zero_division=0)
+    prec_cal_thr = precision_score(y_trade_cal, pr_trade_cal, zero_division=0)
+    thr_rule_note = f"long_thr={thr_long_cal:.2f} short_thr={thr_short_cal:.2f}"
     print(
         f"  Step1 cal: {thr_rule_note}  "
         f"F1={f1_cal_at_thr:.4f}  recall={rec_cal_thr:.3f}  precision={prec_cal_thr:.4f}  "
@@ -814,38 +854,32 @@ def train_trade_quality_classifier(
     # Evaluate cascade
     rp_test = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
     opp_te = _compute_opportunity_scores(X_test, rp_test, reg_models)
-    p_trade = step1_binary_model.predict(X_test)
+    p_long_te = 1.0 / (1.0 + np.exp(-step1_long_model.predict(X_test)))
+    p_short_te = 1.0 / (1.0 + np.exp(-step1_short_model.predict(X_test)))
     
     # Apply identical range penalty to test set
     p_range_mass_test = rp_test[:, RANGE_REGIME_INDICES].sum(axis=1)
-    p_trade = p_trade * (1.0 - 0.7 * p_range_mass_test)
+    p_long_te = p_long_te * (1.0 - 0.7 * p_range_mass_test)
+    p_short_te = p_short_te * (1.0 - 0.7 * p_range_mass_test)
     
     tcn_transition_prob_test = work["tcn_transition_prob"].values.astype(np.float32)[test_mask] if "tcn_transition_prob" in work.columns else None
-    p_trade, skip_cp_test = _apply_cp_skip(rp_test, p_trade, thr_cp, tcn_transition_prob_test)
+    p_long_te, skip_cp_test = _apply_cp_skip(rp_test, p_long_te, thr_cp, tcn_transition_prob_test)
+    p_short_te, _ = _apply_cp_skip(rp_test, p_short_te, thr_cp, tcn_transition_prob_test)
     print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
     
-    p_long = np.full(len(X_test), 0.5, dtype=float)
-    if len(X2_test) > 0:
-        p_long[tradable_test] = step2_model.predict(X2_test)
-        rp_rows = work.loc[test_mask, REGIME_NOW_PROB_COLS].to_numpy(dtype=np.float64, copy=False)
-    p_range_mass = rp_rows[:, RANGE_REGIME_INDICES].sum(axis=1)
     y_pred6 = _reconstruct_quality_classes(
-        p_trade, p_long, p_range_mass, thr_trade=thr_trade_cal
+        p_long_te, p_short_te, p_range_mass_test, thr_long=thr_long_cal, thr_short=thr_short_cal
     )
 
     print("\n  Step metrics (test):")
-    step1_pred = (p_trade >= thr_trade_cal).astype(int)
+    step1_pred = (p_long_te >= thr_long_cal) | (p_short_te >= thr_short_cal)
     s1_rec = recall_score(y_trade_test, step1_pred, zero_division=0)
     s1_prec = precision_score(y_trade_test, step1_pred, zero_division=0)
     print(
-        f"    Step1 TRADE/SKIP  acc={accuracy_score(y_trade_test, step1_pred):.4f} "
+        f"    Step1 LONG/SHORT gates  acc={accuracy_score(y_trade_test, step1_pred):.4f} "
         f"f1={f1_score(y_trade_test, step1_pred, zero_division=0):.4f}  "
-        f"recall={s1_rec:.3f}  precision={s1_prec:.4f}  (thr={thr_trade_cal:.3f})"
+        f"recall={s1_rec:.3f}  precision={s1_prec:.4f}"
     )
-    if len(y_dir_test) > 0:
-        step2_pred = (step2_model.predict(X2_test) >= 0.5).astype(int)
-        print(f"    Step2 LONG/SHORT acc={accuracy_score(y_dir_test, step2_pred):.4f} "
-              f"f1={f1_score(y_dir_test, step2_pred, zero_division=0):.4f}")
     
     acc = accuracy_score(y_test6, y_pred6)
     macro_f1 = f1_score(y_test6, y_pred6, average="macro")
@@ -866,12 +900,12 @@ def train_trade_quality_classifier(
     print(imp_df.head(25).to_string(index=False))
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    step1_binary_model.save_model(os.path.join(MODEL_DIR, "trade_gate_step1.txt"))
-    step2_model.save_model(os.path.join(MODEL_DIR, "trade_dir_step2.txt"))
+    step1_long_model.save_model(os.path.join(MODEL_DIR, "trade_gate_long.txt"))
+    step1_short_model.save_model(os.path.join(MODEL_DIR, "trade_gate_short.txt"))
     import pickle
 
     meta = {
-        "type": "trade_quality_hier_binary_gate",
+        "type": "trade_quality_split_long_short_gates",
         "class_names": QUALITY_CLASS_NAMES,
         "feature_cols": all_bo_feats,
         "pa_base_feat_cols": pa_base,
@@ -882,10 +916,9 @@ def train_trade_quality_classifier(
         "regime_prob_cols_layer3": REGIME_PROB_COLS,
         "garch_cols": garch_cols,
         "hierarchy_thresholds": {
-            "trade": float(thr_trade_cal), "long": 0.50, "cp_alpha": 0.05, "thr_cp": float(thr_cp)
+            "long": float(thr_long_cal), "short": float(thr_short_cal), "cp_alpha": 0.05, "thr_cp": float(thr_cp)
         },
         "step1_calibration": {
-            "best_trade_threshold": float(thr_trade_cal),
             "best_f1_cal": float(f1_cal_at_thr),
             "recall_cal": float(rec_cal_thr),
             "precision_cal": float(prec_cal_thr),
@@ -893,8 +926,8 @@ def train_trade_quality_classifier(
             "threshold_selection_rule": thr_rule_note,
         },
         "model_files": {
-            "step1_trade": "trade_gate_step1.txt",
-            "step2_direction": "trade_dir_step2.txt",
+            "step1_long": "trade_gate_long.txt",
+            "step1_short": "trade_gate_short.txt",
             },
         "position_scale_map": {
             "LONG": 1.00,
@@ -921,15 +954,15 @@ def train_trade_quality_classifier(
         pickle.dump(meta, f)
 
     print(
-        f"\n  Models saved → trade_gate_step1.txt, trade_dir_step2.txt\n"
+        f"\n  Models saved → trade_gate_long.txt, trade_gate_short.txt\n"
         f"  (L3 continuous features models saved to l2b_opp_mfe/mae_<regime>.txt)",
     )
     print(f"  Meta saved  → {MODEL_DIR}/trade_quality_meta.pkl")
 
     model_bundle = {
         "step1_regression": step1_regression_bundle,
-        "step1_binary": step1_binary_model,
-        "step2": step2_model,
+        "step1_long": step1_long_model,
+        "step1_short": step1_short_model,
         "thresholds": meta["hierarchy_thresholds"],
         "feature_cols": all_bo_feats,
     }

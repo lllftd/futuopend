@@ -135,8 +135,13 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     raw_regime = _chunked_booster_predict(
         p["l2a_model"], l2a_x, OOS_PRED_CHUNK, desc=f"L2a regime [{symbol}]",
     )
-    cal_regime = np.column_stack([p["l2a_cals"][c].predict(raw_regime[:, c]) for c in range(6)])
-    cal_regime /= np.maximum(cal_regime.sum(axis=1, keepdims=True), 1e-12)
+    if isinstance(p["l2a_cals"], list):
+        cal_regime = np.column_stack([p["l2a_cals"][c].predict(raw_regime[:, c]) for c in range(6)])
+        cal_regime /= np.maximum(cal_regime.sum(axis=1, keepdims=True), 1e-12)
+    else:
+        eps = 1e-7
+        l_p = np.log(np.clip(raw_regime, eps, 1 - eps))
+        cal_regime = p["l2a_cals"].predict_proba(l_p)
     for j, col in enumerate(REGIME_NOW_PROB_COLS):
         df[col] = cal_regime[:, j]
     df["regime_now_conf"] = cal_regime.max(axis=1)
@@ -146,15 +151,22 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     l2b_x = df[l2b_feats].fillna(0).values.astype(np.float32)
     rp = df[REGIME_NOW_PROB_COLS].values.astype(np.float32)
     
-    # Step 1: Binary Trade Gate
-    p_trade_raw = _chunked_booster_predict(p["l2b_s1"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step1 [{symbol}]")
+    # Step 1: Separate LONG and SHORT Gates
+    p_long_raw = 1.0 / (1.0 + np.exp(-_chunked_booster_predict(p["l2b_s1_long"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step1 LONG [{symbol}]")))
+    p_short_raw = 1.0 / (1.0 + np.exp(-_chunked_booster_predict(p["l2b_s1_short"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step1 SHORT [{symbol}]")))
+    
+    p_range_mass = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
+    p_long_raw = p_long_raw * (1.0 - 0.7 * p_range_mass)
+    p_short_raw = p_short_raw * (1.0 - 0.7 * p_range_mass)
     
     # Apply CP / TCN skip
     thr_cp = p["tq_meta"]["hierarchy_thresholds"].get("thr_cp", 0.0)
     tcn_prob = df["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in df.columns else None
-    p_trade, _ = _apply_cp_skip(rp, p_trade_raw, thr_cp, tcn_prob)
+    p_long_gate, _ = _apply_cp_skip(rp, p_long_raw, thr_cp, tcn_prob)
+    p_short_gate, _ = _apply_cp_skip(rp, p_short_raw, thr_cp, tcn_prob)
     
-    p_long = _chunked_booster_predict(p["l2b_s2"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step2 [{symbol}]")
+    p_trade = np.maximum(p_long_gate, p_short_gate)
+    p_long = (p_long_gate > p_short_gate).astype(np.float32)
 
     print(f"[{symbol}] Layer 3: Execution Sizer")
     df["tq_p_trade"] = p_trade
@@ -172,9 +184,10 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     l3_feats = p["l3_meta"]["feature_cols"]
     l3_x = df[l3_feats].fillna(0).values.astype(np.float32)
     if int(p["l3_meta"].get("l3_schema", 1)) >= 2:
-        pg = _chunked_booster_predict(
+        pg_raw = _chunked_booster_predict(
             p["l3_gate"], l3_x, OOS_PRED_CHUNK, desc=f"L3 gate [{symbol}]",
         )
+        pg = 1.0 / (1.0 + np.exp(-pg_raw))
         ps = _chunked_booster_predict(
             p["l3_size"], l3_x, OOS_PRED_CHUNK, desc=f"L3 size [{symbol}]",
         )
@@ -188,8 +201,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     # Layer 4 Execution (Ordinal EVT / Multi-class Binning & Survival)
     if p.get("l4_meta") and p["l4_meta"].get("l4_schema", 1) >= 3:
         # Ordinal approach
-        tp_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])
-        sl_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 SL>{k} [{symbol}]") for k, m in enumerate(p["l4_sl"])])
+        tp_probs = 1.0 / (1.0 + np.exp(-np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])))
+        sl_probs = 1.0 / (1.0 + np.exp(-np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 SL>{k} [{symbol}]") for k, m in enumerate(p["l4_sl"])])))
         
         # Enforce monotonicity: P(>0) >= P(>1) >= P(>2)
         tp_probs[:, 1] = np.minimum(tp_probs[:, 0], tp_probs[:, 1])

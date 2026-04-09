@@ -34,7 +34,7 @@ def train_exit_manager_layer4(
     df: pd.DataFrame,
     feat_cols: list[str],
     regime_model: lgb.Booster,
-    regime_calibrators: list,
+    regime_calibrators: Any,
     trade_quality_models: dict,
     thr_cp: float,
 ):
@@ -58,17 +58,20 @@ def train_exit_manager_layer4(
     garch_cols = sorted([c for c in work.columns if c.startswith("pa_garch_") and str(work[c].dtype) not in {"object", "category"}])
     layer2_feats = trade_quality_models["feature_cols"]
 
-    p_trade = np.empty(n, dtype=np.float32)
-    p_long = np.empty(n, dtype=np.float32)
-    _layer3_fill_trade_stack_probs(trade_quality_models, work, layer2_feats, p_trade, p_long, chunk)
+    p_long_gate = np.empty(n, dtype=np.float32)
+    p_short_gate = np.empty(n, dtype=np.float32)
+    _layer3_fill_trade_stack_probs(trade_quality_models, work, layer2_feats, p_long_gate, p_short_gate, chunk)
     
     tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
-    p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp, tcn_transition_prob_all)
+    p_long_gate, _ = _apply_cp_skip(cal_regime, p_long_gate, thr_cp, tcn_transition_prob_all)
+    p_short_gate, _ = _apply_cp_skip(cal_regime, p_short_gate, thr_cp, tcn_transition_prob_all)
+    
+    p_trade_max = np.maximum(p_long_gate, p_short_gate)
 
     l2b_opp = np.empty(n, dtype=np.float32)
     l2b_mfe = np.empty(n, dtype=np.float32)
     l2b_mae = np.empty(n, dtype=np.float32)
-    _layer3_fill_l2b_triplet_arrays(trade_quality_models, work, layer2_feats, p_trade, l2b_opp, l2b_mfe, l2b_mae, chunk)
+    _layer3_fill_l2b_triplet_arrays(trade_quality_models, work, layer2_feats, p_trade_max, l2b_opp, l2b_mfe, l2b_mae, chunk)
 
     safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values, 1e-3)
     
@@ -115,9 +118,10 @@ def train_exit_manager_layer4(
     y_time_train, y_time_test = y_time_target[cal_mask], y_time_target[test_mask]
     
     # We only care about training TP/SL on actual trades that passed the gate!
-    thr_trade = trade_quality_models["thresholds"]["trade"]
-    gate_mask_train = p_trade[cal_mask] >= thr_trade
-    gate_mask_test = p_trade[test_mask] >= thr_trade
+    thr_long = trade_quality_models["thresholds"]["long"]
+    thr_short = trade_quality_models["thresholds"]["short"]
+    gate_mask_train = (p_long_gate[cal_mask] >= thr_long) | (p_short_gate[cal_mask] >= thr_short)
+    gate_mask_test = (p_long_gate[test_mask] >= thr_long) | (p_short_gate[test_mask] >= thr_short)
     
     w_train = np.where(gate_mask_train, 1.0, 0.05) # Emphasize actual trades
     w_test = np.where(gate_mask_test, 1.0, 0.05)
@@ -151,9 +155,9 @@ def train_exit_manager_layer4(
         
         d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+        tp_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
         m = lgb.train(
             tp_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb,
-            fobj=lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0),
             feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
         tp_models.append(m)
@@ -172,9 +176,9 @@ def train_exit_manager_layer4(
         
         d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
+        sl_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
         m = lgb.train(
             sl_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb,
-            fobj=lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0),
             feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
         sl_models.append(m)
