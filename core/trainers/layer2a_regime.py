@@ -94,7 +94,12 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
     _require_lgb_matrix_matches_names(X_train, pa_only_feats, "Layer 2a final train")
     train_data = lgb.Dataset(X_train, label=y_train, weight=w_train,
                              feature_name=pa_only_feats, free_raw_data=False)
-    valid_data = lgb.Dataset(X_cal, label=y_cal,
+    # Split cal into early_stopping and calibration to prevent leaking labels to Layer 3
+    split_idx = int(len(X_cal) * 0.5)
+    X_cal_es, y_cal_es = X_cal[:split_idx], y_cal[:split_idx]
+    X_cal_iso, y_cal_iso = X_cal[split_idx:], y_cal[split_idx:]
+
+    valid_data = lgb.Dataset(X_cal_es, label=y_cal_es,
                              feature_name=pa_only_feats, free_raw_data=False)
 
     # Imbalanced 1-min labels: allow convergence (2000 rounds often still improving).
@@ -110,10 +115,11 @@ def train_regime_classifier(df: pd.DataFrame, feat_cols: list[str]):
 
     # ── Isotonic calibration per class on the calibration set ──
     # Index c == L2a class == STATE_NAMES[c] == REGIMES_6[c] (same axis as model.predict columns).
-    raw_cal_probs = model.predict(X_cal)   # (n_cal, NUM_REGIME_CLASSES)
+    # Use the second half of the calibration set (X_cal_iso) which wasn't used for early stopping
+    raw_cal_probs = model.predict(X_cal_iso)   # (n_cal_iso, NUM_REGIME_CLASSES)
     calibrators = []
     for c in range(NUM_REGIME_CLASSES):
-        y_binary = (y_cal == c).astype(int)
+        y_binary = (y_cal_iso == c).astype(int)
         iso = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
         iso.fit(raw_cal_probs[:, c], y_binary)
         calibrators.append(iso)

@@ -2609,19 +2609,30 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
         hmm_persist[i] = min(run, 40) / 40.0
         prev_state = cur_state
 
-    # GARCH(1,1)-style recursion (fixed robust coefficients).
-    alpha = 0.08
-    beta = 0.90
+    # GARCH(1,1)-style recursion (Pseudo-MSGARCH dynamics controlled by HMM state).
     var = np.zeros(n, dtype=float)
     # Calculate seed variance using strictly past/current data to prevent leakage from bar 60 to bar 0
     seed_var = float(log_ret[1] ** 2) if n > 1 else 1e-6
     seed_var = max(seed_var, 1e-6)
     var[0] = seed_var
-    omega = max(seed_var * (1.0 - alpha - beta), 1e-10)
 
     for i in range(1, n):
         prev_r2 = log_ret[i - 1] * log_ret[i - 1]
-        var[i] = omega + alpha * prev_r2 + beta * var[i - 1]
+        
+        # --- 动态切换参数 (Pseudo-MSGARCH) ---
+        # 1, 3, 5 对应 High Volatility (Bull, Bear, Range)
+        # 0, 2, 4 对应 Low Volatility  (Bull, Bear, Range)
+        if hmm_state[i - 1] in (1, 3, 5):  
+            # 高波动状态：市场情绪敏感，对最新冲击 (alpha) 赋予更高权重，历史记忆 (beta) 衰减更快
+            alpha_dyn = 0.15
+            beta_dyn = 0.80
+        else:                        
+            # 低波动状态：市场平稳，对最新冲击不敏感，依赖长记忆 (更平滑)
+            alpha_dyn = 0.05
+            beta_dyn = 0.94
+            
+        omega_dyn = max(seed_var * (1.0 - alpha_dyn - beta_dyn), 1e-10)
+        var[i] = omega_dyn + alpha_dyn * prev_r2 + beta_dyn * var[i - 1]
 
     garch_vol = np.sqrt(np.maximum(var, eps))
     # Replaced bfill() with fillna(current_garch_vol) to prevent leaking bar 20's moving average backwards

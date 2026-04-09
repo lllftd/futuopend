@@ -34,9 +34,9 @@ FAST_TRAIN_MODE = os.environ.get("FAST_TRAIN", "").strip().lower() in {"1", "tru
 
 RNG = np.random.default_accuracy if hasattr(np.random, "default_accuracy") else np.random.RandomState(42)
 
-QUALITY_CLASS_NAMES = ["A_LONG", "B_LONG", "NEUTRAL", "CHOP", "B_SHORT", "A_SHORT"]
+QUALITY_CLASS_NAMES = ["LONG", "NEUTRAL", "CHOP", "SHORT"]
 QUALITY_CLASS_ORDER = {name: i for i, name in enumerate(QUALITY_CLASS_NAMES)}
-TRADABLE_CLASS_IDS = [0, 1, 4, 5]
+TRADABLE_CLASS_IDS = [0, 3]
 
 EXECUTION_SIZER_GATE_FILE = "execution_sizer_gate.txt"
 EXECUTION_SIZER_SIZE_FILE = "execution_sizer_size.txt"

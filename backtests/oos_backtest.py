@@ -155,15 +155,12 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     p_trade, _ = _apply_cp_skip(rp, p_trade_raw, thr_cp, tcn_prob)
     
     p_long = _chunked_booster_predict(p["l2b_s2"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step2 [{symbol}]")
-    p_a = _chunked_booster_predict(p["l2b_s3"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step3 [{symbol}]")
 
     print(f"[{symbol}] Layer 3: Execution Sizer")
     df["tq_p_trade"] = p_trade
     df["tq_p_skip"] = 1.0 - p_trade
     df["tq_p_long"] = p_long
     df["tq_p_short"] = 1.0 - p_long
-    df["tq_p_a"] = p_a
-    df["tq_p_b"] = 1.0 - p_a
     materialize_layer3_features_v2(
         df,
         p,

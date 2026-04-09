@@ -30,6 +30,8 @@ from core.trainers.layer2b_quality import (
     _apply_cp_skip,
     _reconstruct_quality_classes,
     _build_trade_quality_targets,
+    focal_loss_lgb,
+    focal_loss_lgb_eval_error,
 )
 
 def _layer3_fill_regime_calibrated(
@@ -69,13 +71,12 @@ def _layer3_fill_trade_stack_probs(
     layer2_feats: list[str],
     p_trade: np.ndarray,
     p_long: np.ndarray,
-    p_a: np.ndarray,
     chunk: int,
 ) -> None:
     if not trade_quality_models.get("step1_regression"):
         raise RuntimeError("Layer 2b Step1 is regression-only; missing step1_regression in model bundle.")
     _layer3_fill_p_trade_from_regression(
-        trade_quality_models, work, layer2_feats, p_trade, p_long, p_a, chunk,
+        trade_quality_models, work, layer2_feats, p_trade, p_long, chunk,
     )
 
 
@@ -151,9 +152,8 @@ def train_execution_sizer(
 
     p_trade = np.empty(n, dtype=np.float32)
     p_long = np.empty(n, dtype=np.float32)
-    p_a = np.empty(n, dtype=np.float32)
     _layer3_fill_trade_stack_probs(
-        trade_quality_models, work, layer2_feats, p_trade, p_long, p_a, chunk,
+        trade_quality_models, work, layer2_feats, p_trade, p_long, chunk,
     )
     tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
     p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp, tcn_transition_prob_all)
@@ -169,15 +169,13 @@ def train_execution_sizer(
     y_cls_est = _reconstruct_quality_classes(
         p_trade=p_trade,
         p_long=p_long,
-        p_a=p_a,
         p_range_mass=p_range_mass,
         thr_trade=thr["trade"],
         thr_long=thr["long"],
-        thr_a=thr["grade_a"],
     )
 
     y_cls = _build_trade_quality_targets(work)
-    class_size = np.array([1.5, 1.0, 0.0, 0.0, -1.0, -1.5], dtype=float)
+    class_size = np.array([1.0, 0.0, 0.0, -1.0], dtype=float)
     base_size = 0.7 * class_size[y_cls] + 0.3 * class_size[y_cls_est]
 
     safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values, 1e-3)
@@ -228,7 +226,7 @@ def train_execution_sizer(
     _require_lgb_matrix_matches_names(X, exec_feat_cols, "Layer 3 (execution sizer v2)")
 
     del triplet_blk, regime_blk, tcn_mat, mamba_mat, pa_mat, g_mat, inter_blk, cal_regime
-    del p_trade, p_long, p_a, sc_conf, work
+    del p_trade, p_long, sc_conf, work
     del l2b_opp, l2b_mfe, l2b_mae
     gc.collect()
 
@@ -236,18 +234,30 @@ def train_execution_sizer(
     cal_mask = (t >= np.datetime64(TRAIN_END)) & (t < np.datetime64(CAL_END))
     test_mask = (t >= np.datetime64(CAL_END)) & (t < np.datetime64(TEST_END))
 
-    X_train, y_train = X[cal_mask], y_target[cal_mask]
+    # Split cal_mask temporally into training and validation sets for Layer 3
+    cal_indices = np.where(cal_mask)[0]
+    split_idx = int(len(cal_indices) * 0.8)
+    l3_train_mask = np.zeros_like(cal_mask, dtype=bool)
+    l3_train_mask[cal_indices[:split_idx]] = True
+    l3_val_mask = np.zeros_like(cal_mask, dtype=bool)
+    l3_val_mask[cal_indices[split_idx:]] = True
+
+    X_train, y_train = X[l3_train_mask], y_target[l3_train_mask]
+    X_val, y_val = X[l3_val_mask], y_target[l3_val_mask]
     X_test, y_test = X[test_mask], y_target[test_mask]
 
-    y_tp_train, y_sl_train = y_tp_target[cal_mask], y_sl_target[cal_mask]
+    y_tp_train, y_sl_train = y_tp_target[l3_train_mask], y_sl_target[l3_train_mask]
+    y_tp_val, y_sl_val = y_tp_target[l3_val_mask], y_sl_target[l3_val_mask]
     y_tp_test, y_sl_test = y_tp_target[test_mask], y_sl_target[test_mask]
 
     y_gate_train = (np.abs(y_train) >= l3_flat_tau).astype(np.int32)
+    y_gate_val = (np.abs(y_val) >= l3_flat_tau).astype(np.int32)
     pos_ct = int(y_gate_train.sum())
     neg_ct = int(len(y_gate_train) - pos_ct)
     spw = float(neg_ct / max(pos_ct, 1)) if pos_ct else 1.0
 
     w_size = np.where(np.abs(y_train) < l3_flat_tau, l3_flat_w, 1.0).astype(np.float64)
+    w_size_val = np.where(np.abs(y_val) < l3_flat_tau, l3_flat_w, 1.0).astype(np.float64)
     y_gate_test = (np.abs(y_test) >= l3_flat_tau).astype(np.int32)
 
     print(
@@ -269,8 +279,8 @@ def train_execution_sizer(
     es_cb = _lgb_train_callbacks(90 if FAST_TRAIN_MODE else 120)
 
     gate_params = {
-        "objective": "binary",
-        "metric": "auc",
+        # Custom objective used: focal_loss_lgb
+        "metric": "None",
         "boosting_type": "gbdt",
         "learning_rate": 0.02,
         "num_leaves": 48,
@@ -287,13 +297,15 @@ def train_execution_sizer(
         "scale_pos_weight": spw,
     }
     d_gate_tr = lgb.Dataset(X_train, label=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
-    d_gate_va = lgb.Dataset(X_test, label=y_gate_test, feature_name=exec_feat_cols, free_raw_data=True)
+    d_gate_va = lgb.Dataset(X_val, label=y_gate_val, feature_name=exec_feat_cols, free_raw_data=True)
     model_gate = lgb.train(
         gate_params,
         d_gate_tr,
         num_boost_round=rounds,
         valid_sets=[d_gate_va],
         callbacks=es_cb,
+        fobj=lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0),
+        feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
     )
 
     size_params = {
@@ -317,7 +329,7 @@ def train_execution_sizer(
     d_sz_tr = lgb.Dataset(
         X_train, label=y_train, weight=w_size, feature_name=exec_feat_cols, free_raw_data=True,
     )
-    d_sz_va = lgb.Dataset(X_test, label=y_test, feature_name=exec_feat_cols, free_raw_data=True)
+    d_sz_va = lgb.Dataset(X_val, label=y_val, weight=w_size_val, feature_name=exec_feat_cols, free_raw_data=True)
     model_size = lgb.train(
         size_params,
         d_sz_tr,

@@ -251,12 +251,10 @@ def _layer3_fill_p_trade_from_regression(
     layer2_feats: list[str],
     p_trade: np.ndarray,
     p_long: np.ndarray,
-    p_a: np.ndarray,
     chunk: int,
 ) -> None:
     s1 = trade_quality_models.get("step1_binary")
     s2 = trade_quality_models["step2"]
-    s3 = trade_quality_models["step3"]
     regb = trade_quality_models.get("step1_regression")
 
     regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
@@ -282,7 +280,6 @@ def _layer3_fill_p_trade_from_regression(
             p_trade[i:j] = _opp_to_synthetic_p_trade(opp, thr_row)
 
         p_long[i:j] = s2.predict(x_b)
-        p_a[i:j] = s3.predict(x_b)
 
 
 def _print_quality_label_outcome_stats(df: pd.DataFrame, y6: np.ndarray) -> None:
@@ -293,7 +290,7 @@ def _print_quality_label_outcome_stats(df: pd.DataFrame, y6: np.ndarray) -> None
     mae_arr = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
     rr = mfe / np.maximum(mae_arr, 0.1)
     print("  Outcome stats by quality label (MFE/ATR, MAE/ATR, RR):")
-    for c in range(6):
+    for c in range(4):
         sel = y6 == c
         if not sel.any():
             continue
@@ -301,7 +298,7 @@ def _print_quality_label_outcome_stats(df: pd.DataFrame, y6: np.ndarray) -> None
             f"    {QUALITY_CLASS_NAMES[c]:>8s}: n={int(sel.sum()):>9,}  "
             f"mfe={mfe[sel].mean():.3f}  mae={mae_arr[sel].mean():.3f}  rr={rr[sel].mean():.3f}"
         )
-    for a, b, name in [(0, 1, "A_LONG vs B_LONG"), (5, 4, "A_SHORT vs B_SHORT"), (2, 3, "NEUTRAL vs CHOP")]:
+    for a, b, name in [(0, 3, "LONG vs SHORT"), (1, 2, "NEUTRAL vs CHOP")]:
         ma, mb = y6 == a, y6 == b
         if ma.sum() and mb.sum():
             dmfe = mfe[ma].mean() - mfe[mb].mean()
@@ -328,10 +325,10 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     qbear = df["quality_bear_breakout"].fillna(0).values.astype(int)
     state = df["state_label"].fillna(2).values.astype(int)
 
-    y = np.full(len(df), 2, dtype=int)  # default NEUTRAL
+    y = np.full(len(df), 1, dtype=int)  # default NEUTRAL
 
     both_breakout = (qbull == 1) & (qbear == 1)
-    y[both_breakout] = 3  # CHOP
+    y[both_breakout] = 2  # CHOP
 
     long_mask = (qbull == 1) & (qbear == 0)
     short_mask = (qbear == 1) & (qbull == 0)
@@ -344,7 +341,7 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
         indices = np.where(mask)[0]
         if len(indices) < 3:
             # Fallback if too few samples
-            y[mask] = 1 if is_long else 4
+            y[mask] = 0 if is_long else 3
             return
 
         # Features: [MFE, MAE, RR, log1p(Hold_Time)] then Z-score below
@@ -355,45 +352,59 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
             log_hold_time[indices],
         ])
 
-        # Z-score normalization for clustering
-        X_mean = X_cluster.mean(axis=0)
-        X_std = X_cluster.std(axis=0) + 1e-6
+        # Find train indices within this mask to avoid data leakage
+        train_indices_mask = mask & (df["time_key"].values < np.datetime64(TRAIN_END))
+        
+        # If train set is too small, fallback to using all indices for stats
+        if train_indices_mask.sum() < 5:
+            train_indices = indices
+            X_train_cluster = X_cluster
+        else:
+            train_indices = np.where(train_indices_mask)[0]
+            X_train_cluster = np.column_stack([
+                mfe[train_indices],
+                mae[train_indices],
+                rr[train_indices],
+                log_hold_time[train_indices],
+            ])
+
+        # Z-score normalization using train statistics
+        X_mean = X_train_cluster.mean(axis=0)
+        X_std = X_train_cluster.std(axis=0) + 1e-6
         X_scaled = (X_cluster - X_mean) / X_std
+        X_train_scaled = (X_train_cluster - X_mean) / X_std
 
-        # GMM clustering into 3 classes (A, B, CHOP)
-        # GMM captures the covariance between MFE and MAE better than spherical KMeans
-        gmm = GaussianMixture(n_components=3, covariance_type='full', random_state=42, n_init=5)
-        clusters = gmm.fit_predict(X_scaled)
+        # GMM clustering into 2 classes (TRADE, CHOP)
+        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42, n_init=5)
+        gmm.fit(X_train_scaled)
+        clusters = gmm.predict(X_scaled)
+        train_clusters = clusters[np.isin(indices, train_indices)]
 
-        # Interpret clusters based on heuristic score: MFE + RR - MAE
+        # Interpret clusters based on heuristic score on train data
         cluster_scores = []
-        for c in range(3):
-            c_mask = (clusters == c)
+        for c in range(2):
+            c_mask = (train_clusters == c)
             if not c_mask.any():
                 cluster_scores.append(-1000)
                 continue
-            c_mfe = mfe[indices][c_mask].mean()
-            c_mae = mae[indices][c_mask].mean()
-            c_rr = rr[indices][c_mask].mean()
+            c_mfe = mfe[train_indices][c_mask].mean()
+            c_mae = mae[train_indices][c_mask].mean()
+            c_rr = rr[train_indices][c_mask].mean()
             score = c_mfe + c_rr - c_mae
             cluster_scores.append(score)
 
         # Sort clusters by score descending
         ranked_clusters = np.argsort(cluster_scores)[::-1]
         
-        # Best score -> A grade
-        # Middle score -> B grade
+        # Best score -> TRADE
         # Lowest score -> CHOP
-        grade_a_cluster = ranked_clusters[0]
-        grade_b_cluster = ranked_clusters[1]
-        chop_cluster = ranked_clusters[2]
+        trade_cluster = ranked_clusters[0]
+        chop_cluster = ranked_clusters[1]
 
-        label_a = 0 if is_long else 5
-        label_b = 1 if is_long else 4
-        label_chop = 3
+        label_trade = 0 if is_long else 3
+        label_chop = 2
 
-        for c, label in [(grade_a_cluster, label_a), 
-                         (grade_b_cluster, label_b), 
+        for c, label in [(trade_cluster, label_trade), 
                          (chop_cluster, label_chop)]:
             c_idx = indices[clusters == c]
             y[c_idx] = label
@@ -416,11 +427,11 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     no_breakout = (qbull == 0) & (qbear == 0)
     trend_long_weak = no_breakout & (state == 0) & (mfe >= 0.35) & (rr >= 0.40)
     trend_short_weak = no_breakout & (state == 1) & (mfe >= 0.35) & (rr >= 0.40)
-    y[trend_long_weak] = 1
-    y[trend_short_weak] = 4
+    y[trend_long_weak] = 0
+    y[trend_short_weak] = 3
     range_state = np.isin(state, (4, 5))
-    y[no_breakout & range_state] = 3
-    y[no_breakout & ~range_state & ~(trend_long_weak | trend_short_weak)] = 2
+    y[no_breakout & range_state] = 2
+    y[no_breakout & ~range_state & ~(trend_long_weak | trend_short_weak)] = 1
     return y
 
 
@@ -484,30 +495,20 @@ def _binary_weights(y: np.ndarray, timestamps: np.ndarray, pos_boost: float = 1.
 def _reconstruct_quality_classes(
     p_trade: np.ndarray,
     p_long: np.ndarray,
-    p_a: np.ndarray,
     p_range_mass: np.ndarray,
     thr_trade: float = 0.55,
     thr_long: float = 0.50,
-    thr_a: float = 0.50,
 ) -> np.ndarray:
-    """Map hierarchical binary outputs back into 6-class trade-quality space.
-
-    ``p_range_mass`` must be the summed L2a probability for range regimes only
-    (indices ``RANGE_REGIME_INDICES``, i.e. ``range_conv`` + ``range_div`` in ``REGIMES_6``),
-    not a 3-way bull/bear/range bucket and not the sum of all six probs.
-    """
-    pred = np.full(len(p_trade), 2, dtype=int)  # NEUTRAL default
+    """Map hierarchical binary outputs back into 4-class trade-quality space."""
+    pred = np.full(len(p_trade), 1, dtype=int)  # NEUTRAL default
     skip = p_trade < thr_trade
-    pred[skip & (p_range_mass >= 0.50)] = 3  # CHOP when range_* mass is high
-    pred[skip & (p_range_mass < 0.50)] = 2   # NEUTRAL when bull/bear mass dominates
+    pred[skip & (p_range_mass >= 0.50)] = 2  # CHOP when range_* mass is high
+    pred[skip & (p_range_mass < 0.50)] = 1   # NEUTRAL when bull/bear mass dominates
 
     trade = ~skip
     is_long = p_long >= thr_long
-    is_a = p_a >= thr_a
-    pred[trade & is_long & is_a] = 0
-    pred[trade & is_long & ~is_a] = 1
-    pred[trade & ~is_long & ~is_a] = 4
-    pred[trade & ~is_long & is_a] = 5
+    pred[trade & is_long] = 0
+    pred[trade & ~is_long] = 3
     return pred
 
 
@@ -540,7 +541,7 @@ def train_trade_quality_classifier(
     print("\n" + "=" * 70)
     print("  LAYER 2b: Hierarchical Trade-Quality Stack (regression Step1)")
     print("  y = trade_quality (KMeans outcomes); X excludes regime probabilities")
-    print("  Step1 6-regime opp gate  |  Step2 LONG/SHORT  |  Step3 A/B")
+    print("  Step1 6-regime opp gate  |  Step2 LONG/SHORT")
     print("=" * 70)
 
     print(
@@ -551,7 +552,7 @@ def train_trade_quality_classifier(
     work["trade_quality_label"] = _build_trade_quality_targets(work)
 
     print("  Label distribution (full):")
-    for c in range(6):
+    for c in range(4):
         cnt = (work["trade_quality_label"] == c).sum()
         pct = 100.0 * cnt / max(len(work), 1)
         print(f"    {QUALITY_CLASS_NAMES[c]:>8s}: {cnt:>9,}  ({pct:>5.2f}%)")
@@ -673,13 +674,9 @@ def train_trade_quality_classifier(
     tradable_cal = y_trade_cal == 1
     tradable_test = y_trade_test == 1
 
-    y_dir_train = np.isin(y_train6[tradable_train], [0, 1]).astype(int)   # 1=LONG, 0=SHORT
-    y_dir_cal = np.isin(y_cal6[tradable_cal], [0, 1]).astype(int)
-    y_dir_test = np.isin(y_test6[tradable_test], [0, 1]).astype(int)
-
-    y_ab_train = np.isin(y_train6[tradable_train], [0, 5]).astype(int)     # 1=A, 0=B
-    y_ab_cal = np.isin(y_cal6[tradable_cal], [0, 5]).astype(int)
-    y_ab_test = np.isin(y_test6[tradable_test], [0, 5]).astype(int)
+    y_dir_train = (y_train6[tradable_train] == 0).astype(int)   # 1=LONG, 0=SHORT
+    y_dir_cal = (y_cal6[tradable_cal] == 0).astype(int)
+    y_dir_test = (y_test6[tradable_test] == 0).astype(int)
 
     print(f"  Dates — Train: < {TRAIN_END} | Cal: → {CAL_END} | Test: → {TEST_END}")
     print(f"  Train: {len(y_train6):,}  |  Cal: {len(y_cal6):,}  |  Test: {len(y_test6):,}")
@@ -724,11 +721,7 @@ def train_trade_quality_classifier(
     w2_cal = _binary_weights(y_dir_cal, t2_cal, pos_boost=1.0)
     d2_train = lgb.Dataset(X2_train, label=y_dir_train, weight=w2_train, feature_name=all_bo_feats, free_raw_data=False)
     d2_cal = lgb.Dataset(X2_cal, label=y_dir_cal, weight=w2_cal, feature_name=all_bo_feats, free_raw_data=False)
-    w3_train = _binary_weights(y_ab_train, t2_train, pos_boost=1.3)
-    w3_cal = _binary_weights(y_ab_cal, t2_cal, pos_boost=1.1)
-    d3_train = lgb.Dataset(X2_train, label=y_ab_train, weight=w3_train, feature_name=all_bo_feats, free_raw_data=False)
-    d3_cal = lgb.Dataset(X2_cal, label=y_ab_cal, weight=w3_cal, feature_name=all_bo_feats, free_raw_data=False)
-
+    
     reg_models: dict[str, dict[str, lgb.Booster]] = {}
     thr_vec = np.ones(len(REGIMES_6), dtype=np.float64)
 
@@ -785,30 +778,7 @@ def train_trade_quality_classifier(
     finally:
         for fn in clean2:
             fn()
-    print("  [L2b train] Step3 A/B LightGBM (Custom Focal Loss) …", flush=True)
-    c3, clean3 = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step3 A/B")
     
-    # Use Focal Loss for Step 3 to drastically boost A-grade recall (dealing with extreme 0.06% class imbalance)
-    # 1=A, 0=B. A is extremely rare, so we need alpha > 0.5 to weight it higher, and gamma >= 2.0 to focus on hard examples.
-    def custom_focal_obj(preds, dtrain): return focal_loss_lgb(preds, dtrain, alpha=0.75, gamma=2.0)
-    def custom_focal_eval(preds, dtrain): return focal_loss_lgb_eval_error(preds, dtrain, alpha=0.75, gamma=2.0)
-    
-    focal_params = common_params.copy()
-    # LightGBM >= 4.0: custom objective goes in params (fobj kwarg removed from train()).
-    focal_params.pop("objective", None)
-    focal_params.pop("metric", None)
-    focal_params["objective"] = custom_focal_obj
-    focal_params["metric"] = "None"
-
-    try:
-        step3_model = lgb.train(
-            focal_params, d3_train, num_boost_round=rounds, valid_sets=[d3_cal],
-            callbacks=c3, feval=custom_focal_eval,
-        )
-    finally:
-        for fn in clean3:
-            fn()
-
     rp_cal = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
     p_trade_cal = step1_binary_model.predict(X_cal)
     
@@ -822,7 +792,7 @@ def train_trade_quality_classifier(
         pr = (p_trade_cal >= thr_c).astype(int)
         f05 = fbeta_score(y_trade_cal, pr, beta=0.5, zero_division=0)
         prec = precision_score(y_trade_cal, pr, zero_division=0)
-        # Relaxed precision floor from 15% to 10% to improve recall for rare A_LONG / A_SHORT opportunities
+        # Relaxed precision floor from 15% to 10% to improve recall for rare LONG / SHORT opportunities
         if f05 > best_f05 and prec >= 0.10:
             best_f05, best_thr = f05, thr_c
     thr_trade_cal = best_thr if best_f05 > 0 else 0.85
@@ -855,14 +825,12 @@ def train_trade_quality_classifier(
     print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
     
     p_long = np.full(len(X_test), 0.5, dtype=float)
-    p_a = np.full(len(X_test), 0.5, dtype=float)
     if len(X2_test) > 0:
         p_long[tradable_test] = step2_model.predict(X2_test)
-        p_a[tradable_test] = step3_model.predict(X2_test)
-    rp_rows = work.loc[test_mask, REGIME_NOW_PROB_COLS].to_numpy(dtype=np.float64, copy=False)
+        rp_rows = work.loc[test_mask, REGIME_NOW_PROB_COLS].to_numpy(dtype=np.float64, copy=False)
     p_range_mass = rp_rows[:, RANGE_REGIME_INDICES].sum(axis=1)
     y_pred6 = _reconstruct_quality_classes(
-        p_trade, p_long, p_a, p_range_mass, thr_trade=thr_trade_cal
+        p_trade, p_long, p_range_mass, thr_trade=thr_trade_cal
     )
 
     print("\n  Step metrics (test):")
@@ -878,18 +846,14 @@ def train_trade_quality_classifier(
         step2_pred = (step2_model.predict(X2_test) >= 0.5).astype(int)
         print(f"    Step2 LONG/SHORT acc={accuracy_score(y_dir_test, step2_pred):.4f} "
               f"f1={f1_score(y_dir_test, step2_pred, zero_division=0):.4f}")
-    if len(y_ab_test) > 0:
-        step3_pred = (step3_model.predict(X2_test) >= 0.5).astype(int)
-        print(f"    Step3 A/B        acc={accuracy_score(y_ab_test, step3_pred):.4f} "
-              f"f1={f1_score(y_ab_test, step3_pred, zero_division=0):.4f}")
-
+    
     acc = accuracy_score(y_test6, y_pred6)
     macro_f1 = f1_score(y_test6, y_pred6, average="macro")
-    print("\n  Reconstructed 6-class metrics:")
+    print("\n  Reconstructed 4-class metrics:")
     print(f"    Accuracy:  {acc:.4f}")
     print(f"    Macro-F1:  {macro_f1:.4f}")
     print(classification_report(y_test6, y_pred6, target_names=QUALITY_CLASS_ORDER, digits=4))
-    cm = confusion_matrix(y_test6, y_pred6, labels=list(range(6)))
+    cm = confusion_matrix(y_test6, y_pred6, labels=list(range(4)))
     print("  Confusion Matrix:")
     print(pd.DataFrame(cm, index=QUALITY_CLASS_ORDER, columns=QUALITY_CLASS_ORDER).to_string())
 
@@ -904,7 +868,6 @@ def train_trade_quality_classifier(
     os.makedirs(MODEL_DIR, exist_ok=True)
     step1_binary_model.save_model(os.path.join(MODEL_DIR, "trade_gate_step1.txt"))
     step2_model.save_model(os.path.join(MODEL_DIR, "trade_dir_step2.txt"))
-    step3_model.save_model(os.path.join(MODEL_DIR, "trade_grade_step3.txt"))
     import pickle
 
     meta = {
@@ -919,8 +882,7 @@ def train_trade_quality_classifier(
         "regime_prob_cols_layer3": REGIME_PROB_COLS,
         "garch_cols": garch_cols,
         "hierarchy_thresholds": {
-            "trade": float(thr_trade_cal), "long": 0.50, "grade_a": 0.50, 
-            "cp_alpha": 0.05, "thr_cp": float(thr_cp)
+            "trade": float(thr_trade_cal), "long": 0.50, "cp_alpha": 0.05, "thr_cp": float(thr_cp)
         },
         "step1_calibration": {
             "best_trade_threshold": float(thr_trade_cal),
@@ -933,15 +895,12 @@ def train_trade_quality_classifier(
         "model_files": {
             "step1_trade": "trade_gate_step1.txt",
             "step2_direction": "trade_dir_step2.txt",
-            "step3_grade": "trade_grade_step3.txt",
-        },
+            },
         "position_scale_map": {
-            "A_LONG": 1.50,
-            "B_LONG": 1.00,
+            "LONG": 1.00,
             "NEUTRAL": 0.00,
             "CHOP": 0.00,
-            "B_SHORT": -1.00,
-            "A_SHORT": -1.50,
+            "SHORT": -1.00,
         },
         "regression_gate": {
             "groups": list(REGIMES_6),
@@ -962,7 +921,7 @@ def train_trade_quality_classifier(
         pickle.dump(meta, f)
 
     print(
-        f"\n  Models saved → trade_gate_step1.txt, trade_dir_step2.txt, trade_grade_step3.txt\n"
+        f"\n  Models saved → trade_gate_step1.txt, trade_dir_step2.txt\n"
         f"  (L3 continuous features models saved to l2b_opp_mfe/mae_<regime>.txt)",
     )
     print(f"  Meta saved  → {MODEL_DIR}/trade_quality_meta.pkl")
@@ -971,7 +930,6 @@ def train_trade_quality_classifier(
         "step1_regression": step1_regression_bundle,
         "step1_binary": step1_binary_model,
         "step2": step2_model,
-        "step3": step3_model,
         "thresholds": meta["hierarchy_thresholds"],
         "feature_cols": all_bo_feats,
     }

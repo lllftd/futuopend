@@ -22,7 +22,7 @@ from core.tcn_pa_state import PAStateTCN, FocalLoss
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.data_prep import *
-from core.trainers.layer2b_quality import _apply_cp_skip
+from core.trainers.layer2b_quality import focal_loss_lgb, focal_loss_lgb_eval_error, _apply_cp_skip
 from core.trainers.layer3_sizer import (
     _layer3_fill_regime_calibrated,
     _layer3_attach_regime_probs_to_work,
@@ -60,8 +60,7 @@ def train_exit_manager_layer4(
 
     p_trade = np.empty(n, dtype=np.float32)
     p_long = np.empty(n, dtype=np.float32)
-    p_a = np.empty(n, dtype=np.float32)
-    _layer3_fill_trade_stack_probs(trade_quality_models, work, layer2_feats, p_trade, p_long, p_a, chunk)
+    _layer3_fill_trade_stack_probs(trade_quality_models, work, layer2_feats, p_trade, p_long, chunk)
     
     tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
     p_trade, _ = _apply_cp_skip(cal_regime, p_trade, thr_cp, tcn_transition_prob_all)
@@ -131,8 +130,8 @@ def train_exit_manager_layer4(
     for k in range(3):
         print(f"    -> TP > {k} ...")
         tp_params = {
-            "objective": "binary",
-            "metric": "auc",
+            # Custom objective used: focal_loss_lgb
+            "metric": "None",
             "boosting_type": "gbdt",
             "learning_rate": 0.02,
             "num_leaves": 31,
@@ -152,7 +151,11 @@ def train_exit_manager_layer4(
         
         d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
-        m = lgb.train(tp_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb)
+        m = lgb.train(
+            tp_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb,
+            fobj=lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0),
+            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
+        )
         tp_models.append(m)
 
     print("  Training SL Ordinal Regressor (3 Binary Classifiers)...")
@@ -169,13 +172,17 @@ def train_exit_manager_layer4(
         
         d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
-        m = lgb.train(sl_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb)
+        m = lgb.train(
+            sl_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb,
+            fobj=lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0),
+            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
+        )
         sl_models.append(m)
 
-    print("  Training Time Survival Proxy (Poisson Regression on Holding Bars)...")
+    print("  Training Time Survival Proxy (Survival Analysis on Holding Bars)...")
     time_params = {
-        "objective": "poisson",
-        "metric": "rmse",
+        "objective": "survival",
+        "metric": "None",
         "boosting_type": "gbdt",
         "learning_rate": 0.02,
         "num_leaves": 31,
