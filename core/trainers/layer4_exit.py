@@ -88,10 +88,15 @@ def train_exit_manager_layer4(
     mfe_atr = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
     mae_atr = np.clip(work["max_adverse"].values / safe_atr, 0.0, 4.0)
     
-    # Bins for Gamma Scalping: 0: <0.5, 1: 0.5-1.0, 2: 1.0-1.5, 3: >1.5
-    y_tp_target = np.digitize(mfe_atr, bins=[0.5, 1.0, 1.5]).astype(np.int32)
-    # Bins for Gamma Scalping SL: 0: <0.3, 1: 0.3-0.6, 2: 0.6-1.0, 3: >1.0
-    y_sl_target = np.digitize(mae_atr, bins=[0.3, 0.6, 1.0]).astype(np.int32)
+    # Calculate percentiles dynamically to handle bimodal distribution and empty bins
+    tp_boundaries = np.quantile(mfe_atr[cal_mask], [0.25, 0.50, 0.75])
+    sl_boundaries = np.quantile(mae_atr[cal_mask], [0.25, 0.50, 0.75])
+    
+    print(f"  Dynamic TP Bins (ATR): {tp_boundaries}")
+    print(f"  Dynamic SL Bins (ATR): {sl_boundaries}")
+
+    y_tp_target = np.digitize(mfe_atr, bins=tp_boundaries).astype(np.int32)
+    y_sl_target = np.digitize(mae_atr, bins=sl_boundaries).astype(np.int32)
     # Time target (Survival): predict expected duration of the trade. Max 6 bars (30 mins) for fast options scalping.
     y_time_target = np.clip(work.get("exit_bar", np.zeros(n)).fillna(0).values, 1, 6).astype(np.float32)
 
@@ -143,15 +148,18 @@ def train_exit_manager_layer4(
     for k in range(3):
         print(f"    -> TP > {k} ...")
         tp_params = {
-            # Custom objective used: focal_loss_lgb
-            "metric": "None",
+            "objective": "binary",
+            "metric": "binary_logloss",
             "boosting_type": "gbdt",
             "learning_rate": 0.02,
-            "num_leaves": 31,
-            "max_depth": 5,
+            "num_leaves": 48,
+            "max_depth": 6,
             "feature_fraction": 0.8,
             "bagging_fraction": 0.8,
             "bagging_freq": 5,
+            "min_child_samples": 50,
+            "lambda_l1": 0.1,
+            "lambda_l2": 1.0,
             "verbosity": -1,
             "seed": 54 + k,
             "n_jobs": _lgbm_n_jobs(),
@@ -159,15 +167,19 @@ def train_exit_manager_layer4(
         y_bin_tr = (y_tp_train > k).astype(np.int32)
         y_bin_te = (y_tp_test > k).astype(np.int32)
         
-        pos_w = len(y_bin_tr) / max(y_bin_tr.sum(), 1)
-        w_tr_adj = w_train * np.where(y_bin_tr == 1, pos_w, 1.0)
+        pos_rate = max(y_bin_tr.mean(), 1e-5)
+        neg_rate = 1.0 - pos_rate
+        if pos_rate < 0.3:
+            spw = float(neg_rate / pos_rate)
+        else:
+            spw = 1.0
         
-        d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
+        tp_params["scale_pos_weight"] = spw
+        
+        d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
-        tp_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
         m = lgb.train(
             tp_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb,
-            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
         tp_models.append(m)
 
@@ -182,15 +194,19 @@ def train_exit_manager_layer4(
         y_bin_tr = (y_sl_train > k).astype(np.int32)
         y_bin_te = (y_sl_test > k).astype(np.int32)
         
-        pos_w = len(y_bin_tr) / max(y_bin_tr.sum(), 1)
-        w_tr_adj = w_train * np.where(y_bin_tr == 1, pos_w, 1.0)
+        pos_rate = max(y_bin_tr.mean(), 1e-5)
+        neg_rate = 1.0 - pos_rate
+        if pos_rate < 0.3:
+            spw = float(neg_rate / pos_rate)
+        else:
+            spw = 1.0
+            
+        sl_params["scale_pos_weight"] = spw
         
-        d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_tr_adj, feature_name=exec_feat_cols, free_raw_data=True)
+        d_tr = lgb.Dataset(X_train, label=y_bin_tr, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
-        sl_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
         m = lgb.train(
             sl_params, d_tr, num_boost_round=sl_rounds, valid_sets=[d_va], callbacks=es_cb,
-            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
         sl_models.append(m)
 
@@ -251,10 +267,22 @@ def train_exit_manager_layer4(
         print(f"    LONG: {np.sum(is_long_test)}, SHORT: {np.sum(is_short_test)}")
 
         def predict_ordinal(models, X):
-            preds = np.zeros(len(X), dtype=np.int32)
-            for m in models:
-                preds += (m.predict(X) > 0.5).astype(np.int32)
-            return preds
+            n_bins = len(models) + 1
+            cumulative_probs = np.zeros((len(X), len(models)))
+            for k, m in enumerate(models):
+                cumulative_probs[:, k] = m.predict(X)
+                
+            # Enforce monotonicity P(Y>0) >= P(Y>1) >= P(Y>2)
+            for k in range(1, len(models)):
+                cumulative_probs[:, k] = np.minimum(cumulative_probs[:, k], cumulative_probs[:, k-1])
+                
+            bin_probs = np.zeros((len(X), n_bins))
+            bin_probs[:, 0] = 1.0 - cumulative_probs[:, 0]
+            for k in range(1, n_bins - 1):
+                bin_probs[:, k] = cumulative_probs[:, k-1] - cumulative_probs[:, k]
+            bin_probs[:, -1] = cumulative_probs[:, -1]
+            
+            return bin_probs.argmax(axis=1)
             
         pred_tp_class = predict_ordinal(tp_models, X_test_gated)
         pred_sl_class = predict_ordinal(sl_models, X_test_gated)
@@ -283,8 +311,8 @@ def train_exit_manager_layer4(
         l2b_mfe_test = l2b_mfe[test_mask][test_idx]
         l2b_mae_test = l2b_mae[test_mask][test_idx]
         
-        l2b_tp_class = np.digitize(l2b_mfe_test, bins=[0.5, 1.0, 1.5]).astype(np.int32)
-        l2b_sl_class = np.digitize(l2b_mae_test, bins=[0.3, 0.6, 1.0]).astype(np.int32)
+        l2b_tp_class = np.digitize(l2b_mfe_test, bins=tp_boundaries).astype(np.int32)
+        l2b_sl_class = np.digitize(l2b_mae_test, bins=sl_boundaries).astype(np.int32)
         
         print("\n  --- Comparison: L4 vs L2b (Accuracy on Bins) ---")
         print(f"    L4 TP Accuracy:  {np.mean(pred_tp_class == y_tp_test_gated):.4f}")
@@ -313,8 +341,8 @@ def train_exit_manager_layer4(
         "l4_schema": 3,
         "type": "exit_manager_ordinal_evt_bocpd_hawkes",
         "feature_cols": exec_feat_cols,
-        "tp_bins": [0.5, 1.0, 1.5],
-        "sl_bins": [0.3, 0.6, 1.0],
+        "tp_bins": tp_boundaries.tolist(),
+        "sl_bins": sl_boundaries.tolist(),
         "evt_tp_max": evt_tp_max,
         "evt_sl_max": evt_sl_max,
         "model_files": {

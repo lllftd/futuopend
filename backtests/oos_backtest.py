@@ -202,8 +202,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     # Layer 4 Execution (Ordinal EVT / Multi-class Binning & Survival)
     if p.get("l4_meta") and p["l4_meta"].get("l4_schema", 1) >= 3:
         # Ordinal approach
-        tp_probs = 1.0 / (1.0 + np.exp(-np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])))
-        sl_probs = 1.0 / (1.0 + np.exp(-np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 SL>{k} [{symbol}]") for k, m in enumerate(p["l4_sl"])])))
+        tp_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])
+        sl_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 SL>{k} [{symbol}]") for k, m in enumerate(p["l4_sl"])])
         
         # Enforce monotonicity: P(>0) >= P(>1) >= P(>2)
         tp_probs[:, 1] = np.minimum(tp_probs[:, 0], tp_probs[:, 1])
@@ -215,9 +215,19 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         tp_p_exact = np.column_stack([1.0 - tp_probs[:, 0], tp_probs[:, 0] - tp_probs[:, 1], tp_probs[:, 1] - tp_probs[:, 2], tp_probs[:, 2]])
         sl_p_exact = np.column_stack([1.0 - sl_probs[:, 0], sl_probs[:, 0] - sl_probs[:, 1], sl_probs[:, 1] - sl_probs[:, 2], sl_probs[:, 2]])
         
-        # Adjusted centers for Gamma Scalping Bins
-        tp_centers = np.array([0.25, 0.75, 1.25, 2.0])
-        sl_centers = np.array([0.15, 0.45, 0.8, 1.5])
+        # Adjusted centers for Gamma Scalping Bins using dynamic medians from meta
+        tp_centers = np.array([
+            p["l4_meta"]["tp_bins"][0] / 2,
+            (p["l4_meta"]["tp_bins"][0] + p["l4_meta"]["tp_bins"][1]) / 2,
+            (p["l4_meta"]["tp_bins"][1] + p["l4_meta"]["tp_bins"][2]) / 2,
+            p["l4_meta"]["tp_bins"][2] * 1.5
+        ])
+        sl_centers = np.array([
+            p["l4_meta"]["sl_bins"][0] / 2,
+            (p["l4_meta"]["sl_bins"][0] + p["l4_meta"]["sl_bins"][1]) / 2,
+            (p["l4_meta"]["sl_bins"][1] + p["l4_meta"]["sl_bins"][2]) / 2,
+            p["l4_meta"]["sl_bins"][2] * 1.5
+        ])
         
         pred_tp_atr = np.sum(tp_p_exact * tp_centers, axis=1)
         pred_sl_atr = np.sum(sl_p_exact * sl_centers, axis=1)
