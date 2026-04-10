@@ -237,7 +237,7 @@ def train_execution_sizer(
     _require_lgb_matrix_matches_names(X, exec_feat_cols, "Layer 3 (execution sizer v2)")
 
     del triplet_blk, regime_blk, tcn_mat, mamba_mat, pa_mat, g_mat, inter_blk, cal_regime
-    del p_trade, p_long, sc_conf, work
+    del p_trade_max, p_long_gate, p_short_gate, sc_conf, work
     del l2b_opp, l2b_mfe, l2b_mae
     gc.collect()
 
