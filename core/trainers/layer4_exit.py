@@ -176,6 +176,8 @@ def train_exit_manager_layer4(
     for k in range(3):
         print(f"    -> SL > {k} ...")
         sl_params = tp_params.copy()
+        sl_params["learning_rate"] = 0.01
+        sl_rounds = rounds * 2
         sl_params["seed"] = 64 + k
         y_bin_tr = (y_sl_train > k).astype(np.int32)
         y_bin_te = (y_sl_test > k).astype(np.int32)
@@ -187,7 +189,7 @@ def train_exit_manager_layer4(
         d_va = lgb.Dataset(X_test, label=y_bin_te, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
         sl_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
         m = lgb.train(
-            sl_params, d_tr, num_boost_round=rounds, valid_sets=[d_va], callbacks=es_cb,
+            sl_params, d_tr, num_boost_round=sl_rounds, valid_sets=[d_va], callbacks=es_cb,
             feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
         sl_models.append(m)
@@ -211,6 +213,86 @@ def train_exit_manager_layer4(
     d_time_tr = lgb.Dataset(X_train, label=y_time_train, weight=w_train, feature_name=exec_feat_cols, free_raw_data=True)
     d_time_va = lgb.Dataset(X_test, label=y_time_test, weight=w_test, feature_name=exec_feat_cols, free_raw_data=True)
     model_time = lgb.train(time_params, d_time_tr, num_boost_round=rounds, valid_sets=[d_time_va], callbacks=es_cb)
+
+    print("\n" + "=" * 50)
+    print("  Layer 4 Test Set Evaluation (on Gated Trades)")
+    print("=" * 50)
+    
+    evt_tp_max = float(np.percentile(mfe_atr[mfe_atr > 0], 99.5)) if (mfe_atr > 0).any() else 5.0
+    evt_sl_max = float(np.percentile(mae_atr[mae_atr > 0], 99.5)) if (mae_atr > 0).any() else 3.0
+
+    print(f"  TP Bins (ATR): <0.5, 0.5-1.0, 1.0-1.5, >1.5")
+    print(f"  SL Bins (ATR): <0.3, 0.3-0.6, 0.6-1.0, >1.0")
+    print(f"  EVT Bounds (99.5% Tail): TP_max={evt_tp_max:.2f} ATR, SL_max={evt_sl_max:.2f} ATR")
+    if evt_tp_max > 1.5:
+        print("  -> TP EVT bound is larger than max bin boundary (1.5), which is expected.")
+    if evt_sl_max > 1.0:
+        print("  -> SL EVT bound is larger than max bin boundary (1.0), which is expected.")
+
+    test_idx = np.where(gate_mask_test)[0]
+    if len(test_idx) > 0:
+        X_test_gated = X_test[test_idx]
+        y_tp_test_gated = y_tp_test[test_idx]
+        y_sl_test_gated = y_sl_test[test_idx]
+        y_time_test_gated = y_time_test[test_idx]
+        
+        train_idx_gated = np.where(gate_mask_train)[0]
+        n_long_train = np.sum(p_long_gate[cal_mask][train_idx_gated] >= thr_long)
+        n_short_train = np.sum(p_short_gate[cal_mask][train_idx_gated] >= thr_short)
+        print(f"\n  [Train Set] LONG vs SHORT gated trades:")
+        print(f"    LONG: {n_long_train}, SHORT: {n_short_train} (Ratio: {n_long_train/max(1, n_short_train):.2f})")
+
+        p_long_test_gated = p_long_gate[test_mask][test_idx]
+        p_short_test_gated = p_short_gate[test_mask][test_idx]
+        is_long_test = p_long_test_gated >= thr_long
+        is_short_test = p_short_test_gated >= thr_short
+        
+        print(f"\n  [Test Set] LONG vs SHORT gated trades:")
+        print(f"    LONG: {np.sum(is_long_test)}, SHORT: {np.sum(is_short_test)}")
+
+        def predict_ordinal(models, X):
+            preds = np.zeros(len(X), dtype=np.int32)
+            for m in models:
+                preds += (m.predict(X) > 0.5).astype(np.int32)
+            return preds
+            
+        pred_tp_class = predict_ordinal(tp_models, X_test_gated)
+        pred_sl_class = predict_ordinal(sl_models, X_test_gated)
+        
+        from sklearn.metrics import classification_report
+        print("\n  --- TP Classification Report (Test Set Gated) ---")
+        print(classification_report(y_tp_test_gated, pred_tp_class, zero_division=0))
+        
+        print("\n  --- SL Classification Report (Test Set Gated) ---")
+        print(classification_report(y_sl_test_gated, pred_sl_class, zero_division=0))
+
+        if np.sum(is_short_test) > 0:
+            print("\n  --- TP Classification Report (Test Set Gated - SHORT ONLY) ---")
+            print(classification_report(y_tp_test_gated[is_short_test], pred_tp_class[is_short_test], zero_division=0))
+            print("\n  --- SL Classification Report (Test Set Gated - SHORT ONLY) ---")
+            print(classification_report(y_sl_test_gated[is_short_test], pred_sl_class[is_short_test], zero_division=0))
+
+        pred_time = model_time.predict(X_test_gated)
+        time_err = pred_time - y_time_test_gated
+        print("\n  --- Time-to-Exit Error Distribution (Pred - True) ---")
+        print(f"    Mean Error: {np.mean(time_err):.2f} bars")
+        print(f"    MAE:        {np.mean(np.abs(time_err)):.2f} bars")
+        for pct in [5, 25, 50, 75, 95]:
+            print(f"    {pct}th pctl:  {np.percentile(time_err, pct):.2f} bars")
+
+        l2b_mfe_test = l2b_mfe[test_mask][test_idx]
+        l2b_mae_test = l2b_mae[test_mask][test_idx]
+        
+        l2b_tp_class = np.digitize(l2b_mfe_test, bins=[0.5, 1.0, 1.5]).astype(np.int32)
+        l2b_sl_class = np.digitize(l2b_mae_test, bins=[0.3, 0.6, 1.0]).astype(np.int32)
+        
+        print("\n  --- Comparison: L4 vs L2b (Accuracy on Bins) ---")
+        print(f"    L4 TP Accuracy:  {np.mean(pred_tp_class == y_tp_test_gated):.4f}")
+        print(f"    L2b TP Accuracy: {np.mean(l2b_tp_class == y_tp_test_gated):.4f}")
+        print(f"    L4 SL Accuracy:  {np.mean(pred_sl_class == y_sl_test_gated):.4f}")
+        print(f"    L2b SL Accuracy: {np.mean(l2b_sl_class == y_sl_test_gated):.4f}")
+    else:
+        print("\n  [Test Set] No gated trades found. Skipping evaluation.")
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     EXECUTION_SIZER_TIME_FILE = "execution_sizer_time.txt"
