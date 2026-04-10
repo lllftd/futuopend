@@ -191,7 +191,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         ps = _chunked_booster_predict(
             p["l3_size"], l3_x, OOS_PRED_CHUNK, desc=f"L3 size [{symbol}]",
         )
-        exec_size = np.clip(pg * ps, -1.0, 1.0)
+        l3_pos_mult = float(p["l3_meta"].get("pos_multiplier", 3.0))
+        exec_size = np.clip(pg * ps * l3_pos_mult, -1.0, 1.0)
     else:
         exec_size = _chunked_booster_predict(
             p["l3_model"], l3_x, OOS_PRED_CHUNK, desc=f"L3 sizer [{symbol}]",

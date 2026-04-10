@@ -141,6 +141,7 @@ def train_execution_sizer(
 
     l3_flat_tau = float(os.environ.get("L3_FLAT_TAU", "0.05"))
     l3_flat_w = float(os.environ.get("L3_FLAT_WEIGHT", "0.35"))
+    l3_pos_multiplier = float(os.environ.get("L3_POS_MULTIPLIER", "3.0"))  # Amplify L3 raw prediction
 
     chunk = _layer3_chunk_rows()
     print(f"  Memory: chunked predicts (LAYER3_CHUNK={chunk}); shallow df, no full feature matrices")
@@ -358,7 +359,7 @@ def train_execution_sizer(
 
     pred_g = 1.0 / (1.0 + np.exp(-model_gate.predict(X_test)))
     pred_s = model_size.predict(X_test)
-    pred = np.clip(pred_g * pred_s, -1.0, 1.0)
+    pred = np.clip(pred_g * pred_s * l3_pos_multiplier, -1.0, 1.0)
 
     mse = float(np.mean((pred - y_test) ** 2))
     nz = np.abs(y_test) >= l3_flat_tau
@@ -394,7 +395,8 @@ def train_execution_sizer(
         "type": "execution_sizer_two_stage",
         "feature_cols": exec_feat_cols,
         "position_clip": [-1.0, 1.0],
-        "combine_rule": "clip(p_gate * pred_size, -1, 1)",
+        "combine_rule": f"clip(p_gate * pred_size * {l3_pos_multiplier}, -1, 1)",
+        "pos_multiplier": l3_pos_multiplier,
         "target_definition": "clip(class_blend * edge_scale, -1, 1); same tier blend as v1",
         "flat_tau": l3_flat_tau,
         "flat_sample_weight": l3_flat_w,
