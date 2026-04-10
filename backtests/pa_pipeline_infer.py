@@ -22,6 +22,7 @@ from core.tcn_pa_state import PAStateTCN
 from core.mamba_pa_state import PAStateMamba
 from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
 from core.trainers.layer1b_mamba import MAMBA_STATE_CLASSIFIER_FILE
+from core.trainers.l4_sequence import L4ExitSequenceModel
 
 OOS_PRED_CHUNK = max(4096, int(os.environ.get("OOS_PRED_CHUNK", "65536")))
 
@@ -32,6 +33,10 @@ MODEL_DIR = os.path.join(_REPO_ROOT, "lgbm_models")
 DATA_DIR = os.path.join(_REPO_ROOT, "data")
 RESULTS_DIR = os.environ.get("OOS_RESULTS_DIR", os.path.join(_REPO_ROOT, "results"))
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+def _experimental_mamba_enabled() -> bool:
+    return os.environ.get("ENABLE_EXPERIMENTAL_MAMBA", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _tq(it, **kwargs):
@@ -57,25 +62,37 @@ def _compute_opportunity_triplet_infer(
     regime_probs: np.ndarray,
     models: dict[str, dict[str, lgb.Booster]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # st[i] = L2a argmax k → models[REGIMES_6[k]]["mfe"|"mae"]
-    st = np.argmax(regime_probs, axis=1).astype(np.int64, copy=False)
     n = len(X)
     opp = np.zeros(n, dtype=np.float64)
     mfe_p = np.zeros(n, dtype=np.float64)
     mae_p = np.zeros(n, dtype=np.float64)
-    for argmax_idx, predicted_regime in enumerate(REGIMES_6):
-        if predicted_regime not in models:
-            continue
-        m = st == argmax_idx
-        if not m.any():
-            continue
-        mf = models[predicted_regime]["mfe"].predict(X[m])
-        ma = models[predicted_regime]["mae"].predict(X[m])
-        mf = np.clip(mf, 0.0, None)
-        ma = np.clip(ma, 0.01, None)
-        opp[m] = np.log1p(mf) - np.log1p(ma)
-        mfe_p[m] = mf
-        mae_p[m] = ma
+    if n == 0 or not models:
+        return opp, mfe_p, mae_p
+
+    available = [idx for idx, regime in enumerate(REGIMES_6) if regime in models]
+    if not available:
+        return opp, mfe_p, mae_p
+
+    mfe_stack: list[np.ndarray] = []
+    mae_stack: list[np.ndarray] = []
+    for idx in available:
+        regime = REGIMES_6[idx]
+        mf = np.clip(models[regime]["mfe"].predict(X), 0.0, None)
+        ma = np.clip(models[regime]["mae"].predict(X), 0.01, None)
+        mfe_stack.append(mf)
+        mae_stack.append(ma)
+
+    weights = np.clip(regime_probs[:, available].astype(np.float64, copy=False), 0.0, None)
+    denom = weights.sum(axis=1, keepdims=True)
+    weights = np.divide(
+        weights,
+        denom,
+        out=np.full_like(weights, 1.0 / weights.shape[1]),
+        where=denom > 1e-12,
+    )
+    mfe_p = np.sum(weights * np.column_stack(mfe_stack), axis=1)
+    mae_p = np.sum(weights * np.column_stack(mae_stack), axis=1)
+    opp = np.log1p(mfe_p) - np.log1p(mae_p)
     return opp, mfe_p, mae_p
 
 
@@ -104,7 +121,7 @@ def materialize_layer3_features_v2(
     chunk: int,
     desc: str = "",
 ) -> None:
-    """Add ``l3_meta['feature_cols']`` prerequisites: L2b triplet + ``l2b_opp_x_<regime>`` (6 cols, opp×p_k)."""
+    """Add ``l3_meta['feature_cols']`` prerequisites: soft L2b triplet + ``l2b_opp_x_<regime>``."""
     meta = pipeline["l3_meta"]
     if int(meta.get("l3_schema", 1)) < 2:
         return
@@ -112,6 +129,12 @@ def materialize_layer3_features_v2(
     if n == 0:
         return
     rp = df[regime_prob_cols].values.astype(np.float32)
+    raw_route_cols = [f"{c}_raw" for c in regime_prob_cols]
+    route_probs = (
+        df[raw_route_cols].values.astype(np.float32)
+        if all(c in df.columns for c in raw_route_cols)
+        else rp
+    )
     models = pipeline.get("l2b_opp")
     if models:
         o = np.empty(n, dtype=np.float32)
@@ -120,7 +143,7 @@ def materialize_layer3_features_v2(
         n_chunk = (n + chunk - 1) // chunk
         for start in _tq(range(0, n, chunk), desc=desc or "L3 L2b triplet", unit="chunk", total=n_chunk):
             end = min(start + chunk, n)
-            oc, mfc, mac = _compute_opportunity_triplet_infer(l2b_x[start:end], rp[start:end], models)
+            oc, mfc, mac = _compute_opportunity_triplet_infer(l2b_x[start:end], route_probs[start:end], models)
             o[start:end] = oc.astype(np.float32)
             mf[start:end] = mfc.astype(np.float32)
             ma[start:end] = mac.astype(np.float32)
@@ -209,7 +232,7 @@ def load_layered_pa_pipeline():
     mamba_model = None
     mamba_meta = None
     mamba_meta_path = os.path.join(MODEL_DIR, "mamba_meta.pkl")
-    if os.path.exists(mamba_meta_path):
+    if _experimental_mamba_enabled() and os.path.exists(mamba_meta_path):
         with open(mamba_meta_path, "rb") as f:
             mamba_meta = pickle.load(f)
         n_cls_mamba = int(mamba_meta.get("num_regime_classes", mamba_meta.get("num_classes", 2)))
@@ -229,6 +252,8 @@ def load_layered_pa_pipeline():
             )
         )
         mamba_model.eval()
+    elif os.path.exists(mamba_meta_path):
+        print("  Mamba artifacts found but skipped (experimental module; set ENABLE_EXPERIMENTAL_MAMBA=1 to enable).")
 
     l2a_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, "state_classifier_6c.txt"))
     with open(os.path.join(MODEL_DIR, "state_calibrators.pkl"), "rb") as f:
@@ -253,6 +278,7 @@ def load_layered_pa_pipeline():
             f"regression_gate.thr_vec must have length {len(REGIMES_6)}, got {len(tv)}",
         )
     l2b_opp_thr_vec = np.asarray(tv, dtype=np.float64)
+    l2b_soft_opp_thr = float(rg.get("soft_opp_threshold", 0.0))
     l2b_opp: dict[str, dict[str, lgb.Booster]] = {}
     for regime in REGIMES_6:
         pm = mfiles.get(f"{regime}_mfe")
@@ -291,6 +317,7 @@ def load_layered_pa_pipeline():
     try:
         with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "rb") as f:
             l4_meta = pickle.load(f)
+        l4_seq = None
         
         if l4_meta.get("l4_schema", 1) >= 4:
             l4_tp = None
@@ -298,16 +325,31 @@ def load_layered_pa_pipeline():
             l4_time = None
             l4_exit = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["exit"]))
             l4_value = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["value"]))
+            seq_name = (l4_meta.get("model_files") or {}).get("seq")
+            if seq_name:
+                seq_path = os.path.join(MODEL_DIR, seq_name)
+                if os.path.exists(seq_path):
+                    l4_seq = L4ExitSequenceModel(
+                        input_size=len(l4_meta["feature_cols"]),
+                        hidden_size=int(l4_meta.get("seq_hidden_size", 48)),
+                        dropout=float(l4_meta.get("seq_dropout", 0.0)),
+                    ).to(device)
+                    l4_seq.load_state_dict(
+                        torch.load(seq_path, map_location=device, weights_only=True)
+                    )
+                    l4_seq.eval()
         elif l4_meta.get("l4_schema", 1) >= 3:
             l4_tp = [lgb.Booster(model_file=os.path.join(MODEL_DIR, fn)) for fn in l4_meta["model_files"]["tp_ordinal"]]
             l4_sl = [lgb.Booster(model_file=os.path.join(MODEL_DIR, fn)) for fn in l4_meta["model_files"]["sl_ordinal"]]
             l4_exit = None
             l4_value = None
+            l4_seq = None
         else:
             l4_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["tp"]))
             l4_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["sl"]))
             l4_exit = None
             l4_value = None
+            l4_seq = None
             
         if l4_meta.get("l4_schema", 1) < 4:
             l4_time = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["time"]))
@@ -318,6 +360,7 @@ def load_layered_pa_pipeline():
         l4_time = None
         l4_exit = None
         l4_value = None
+        l4_seq = None
 
     return {
         "tcn": tcn_model,
@@ -330,6 +373,7 @@ def load_layered_pa_pipeline():
         "tq_meta": tq_meta,
         "l2b_opp": l2b_opp,
         "l2b_opp_thr_vec": l2b_opp_thr_vec,
+        "l2b_soft_opp_thr": l2b_soft_opp_thr,
         "l2b_s1_long": l2b_step1_long,
         "l2b_s1_short": l2b_step1_short,
         "l2b_s3": l2b_step3,
@@ -342,5 +386,6 @@ def load_layered_pa_pipeline():
         "l4_time": l4_time,
         "l4_exit": l4_exit,
         "l4_value": l4_value,
+        "l4_seq": l4_seq,
         "l4_meta": l4_meta,
     }

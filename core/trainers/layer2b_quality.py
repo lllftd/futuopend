@@ -31,18 +31,21 @@ def _train_regime_opp_regression_models(
     train_mask: np.ndarray,
     cal_mask: np.ndarray,
     all_bo_feats: list[str],
-    regime_cal_probs_cal: np.ndarray,
+    regime_route_probs: np.ndarray,
     y_trade_cal: np.ndarray,
-) -> tuple[dict[str, dict[str, lgb.Booster]], dict[str, float], np.ndarray]:
+) -> tuple[dict[str, dict[str, lgb.Booster]], dict[str, float], np.ndarray, float]:
     """Train up to 6× (MFE + MAE) regressors (one pair per REGIMES_6 name); tune thresholds on cal.
 
-    **Training rows** for regime ``REGIMES_6[k]``: ground-truth ``state_label == k`` (supervision).
+    Train / cal routing uses the base regime model's raw probabilities so downstream regression
+    heads do not consume future information from the later calibration window. ``state_label`` is
+    retained only for mismatch diagnostics.
 
     **Cal / inference routing**: pick head with ``argmax(regime_now probabilities) == k``; then
     ``score = pred_mfe / (pred_mae + 0.1)`` on those rows only; F1 grid-search yields ``thr_vec[k]``.
 
     Six regimes ⇒ fewer routed cal rows per bucket than old 3-way groups — default min row
-    count is lower (``L2B_OPP_CAL_MIN_ROWS``).
+    count is lower (``L2B_OPP_CAL_MIN_ROWS``). A global soft-mixture threshold is also
+    calibrated on the full cal split for downstream mixture routing.
     """
     reg_rounds = 1500 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ROUNDS", "4000"))
     reg_es = 150 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ES", "300"))
@@ -71,16 +74,26 @@ def _train_regime_opp_regression_models(
     X_ca = X[cal_mask]
     st_tr = state_label[train_mask]
     st_ca = state_label[cal_mask]
+    rp_tr = regime_route_probs[train_mask]
+    rp_ca = regime_route_probs[cal_mask]
+    st_tr_pred = np.argmax(rp_tr, axis=1).astype(np.int64, copy=False)
+    st_ca_pred = np.argmax(rp_ca, axis=1).astype(np.int64, copy=False)
     mfe_tr = mfe[train_mask]
     mae_tr = mae[train_mask]
     mfe_ca = mfe[cal_mask]
     mae_ca = mae[cal_mask]
 
     for argmax_idx, predicted_regime in enumerate(REGIMES_6):
-        mtr = st_tr == argmax_idx
-        mca = st_ca == argmax_idx
+        mtr = st_tr_pred == argmax_idx
+        mca = st_ca_pred == argmax_idx
         ntr, nca = int(mtr.sum()), int(mca.sum())
-        print(f"  [L2b regression] {predicted_regime}: train_rows={ntr:,}  cal_rows(early_stop)={nca:,}")
+        train_match = float((st_tr[mtr] == argmax_idx).mean()) if ntr else float("nan")
+        cal_match = float((st_ca[mca] == argmax_idx).mean()) if nca else float("nan")
+        print(
+            f"  [L2b regression] {predicted_regime}: "
+            f"train_rows(routed)={ntr:,}  cal_rows(routed)={nca:,}  "
+            f"label_match(train/cal)={train_match:.1%}/{cal_match:.1%}"
+        )
         if ntr < 2000:
             print(f"    [warn] {predicted_regime}: too few train rows — skipping pair (needs ≥2000).")
             continue
@@ -120,9 +133,8 @@ def _train_regime_opp_regression_models(
     if not models:
         raise RuntimeError("Regime opportunity regression: no group had enough data.")
 
-    # L2a routing: argmax on cal probs → class index k == predicted_regime REGIMES_6[k]
-    st_cal_pred = np.argmax(regime_cal_probs_cal, axis=1)
-    gix_cal = st_cal_pred.astype(np.int64, copy=False)
+    # L2a routing: argmax on raw regime probs → class index k == predicted_regime REGIMES_6[k]
+    gix_cal = st_ca_pred
     n_cal = len(y_trade_cal)
     opp_cal = np.zeros(n_cal, dtype=np.float64)
     for argmax_idx, predicted_regime in enumerate(REGIMES_6):
@@ -179,8 +191,22 @@ def _train_regime_opp_regression_models(
             )
         opp_thr[predicted_regime] = best_thr
 
+    best_soft_f1 = 0.0
+    best_soft_thr = float(os.environ.get("L2B_OPP_SOFT_THR", "0.0"))
+    for thr in np.arange(-1.0, 3.0, 0.1):
+        pred = (opp_cal >= thr).astype(int)
+        prec = precision_score(y_trade_cal, pred, zero_division=0)
+        f1v = f1_score(y_trade_cal, pred, zero_division=0)
+        if prec >= min_prec and f1v > best_soft_f1:
+            best_soft_f1 = f1v
+            best_soft_thr = float(thr)
+    print(
+        f"  [L2b regression] soft_mix_thr={best_soft_thr:.2f}  "
+        f"F1={best_soft_f1:.4f}  (cal, full mixture)"
+    )
+
     thr_vec = np.array([opp_thr.get(g, 1.0) for g in REGIMES_6], dtype=np.float64)
-    return models, opp_thr, thr_vec
+    return models, opp_thr, thr_vec, best_soft_thr
 
 
 def _l2b_nested_opp_models(regb: dict) -> dict[str, dict[str, lgb.Booster]]:
@@ -193,31 +219,51 @@ def _l2b_nested_opp_models(regb: dict) -> dict[str, dict[str, lgb.Booster]]:
     return out
 
 
+def _available_l2b_regime_indices(models: dict[str, dict[str, lgb.Booster]]) -> list[int]:
+    return [idx for idx, regime in enumerate(REGIMES_6) if regime in models]
+
+
 def _compute_opportunity_triplet(
     X: np.ndarray,
     regime_probs: np.ndarray,
     models: dict[str, dict[str, lgb.Booster]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Routed dual-head: pred_mfe, pred_mae, opportunity = mfe/(mae+0.1)."""
-    # st[i] = L2a argmax index k → use models[REGIMES_6[k]] (same k as REGIME_NOW_PROB_COLS[k]).
-    st = np.argmax(regime_probs, axis=1).astype(np.int64, copy=False)
+    """Soft mixture over regime experts: expected MFE/MAE then log opportunity."""
     n = len(X)
     opp = np.zeros(n, dtype=np.float64)
     mfe_p = np.zeros(n, dtype=np.float64)
     mae_p = np.zeros(n, dtype=np.float64)
-    for argmax_idx, predicted_regime in enumerate(REGIMES_6):
-        if predicted_regime not in models:
-            continue
-        m = st == argmax_idx
-        if not m.any():
-            continue
-        mf = models[predicted_regime]["mfe"].predict(X[m])
-        ma = models[predicted_regime]["mae"].predict(X[m])
-        mf = np.clip(mf, 0.0, None)
-        ma = np.clip(ma, 0.01, None)
-        opp[m] = np.log1p(mf) - np.log1p(ma)
-        mfe_p[m] = mf
-        mae_p[m] = ma
+    if n == 0 or not models:
+        return opp, mfe_p, mae_p
+
+    available = _available_l2b_regime_indices(models)
+    if not available:
+        return opp, mfe_p, mae_p
+
+    mfe_stack: list[np.ndarray] = []
+    mae_stack: list[np.ndarray] = []
+    for idx in available:
+        regime = REGIMES_6[idx]
+        mf = np.clip(models[regime]["mfe"].predict(X), 0.0, None)
+        ma = np.clip(models[regime]["mae"].predict(X), 0.01, None)
+        mfe_stack.append(mf)
+        mae_stack.append(ma)
+
+    weights = np.clip(regime_probs[:, available].astype(np.float64, copy=False), 0.0, None)
+    if weights.shape[1] == 0:
+        return opp, mfe_p, mae_p
+    denom = weights.sum(axis=1, keepdims=True)
+    weights = np.divide(
+        weights,
+        denom,
+        out=np.full_like(weights, 1.0 / weights.shape[1]),
+        where=denom > 1e-12,
+    )
+    mfe_mat = np.column_stack(mfe_stack)
+    mae_mat = np.column_stack(mae_stack)
+    mfe_p = np.sum(weights * mfe_mat, axis=1)
+    mae_p = np.sum(weights * mae_mat, axis=1)
+    opp = np.log1p(mfe_p) - np.log1p(mae_p)
     return opp, mfe_p, mae_p
 
 
@@ -279,8 +325,12 @@ def _layer3_fill_trade_stack_probs_gates(
         else:
             rp = regime_mat[i:j]
             opp = _compute_opportunity_scores(x_b, rp, models)
-            gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)
-            thr_row = thr_vec[gix]
+            soft_thr = float(regb.get("soft_opp_threshold", np.nan)) if regb else float("nan")
+            if np.isfinite(soft_thr):
+                thr_row = np.full(len(rp), soft_thr, dtype=np.float64)
+            else:
+                gix = np.argmax(rp, axis=1).astype(np.int64, copy=False)
+                thr_row = thr_vec[gix]
             p_trade = _opp_to_synthetic_p_trade(opp, thr_row)
             p_long_gate[i:j] = p_trade
             p_short_gate[i:j] = p_trade
@@ -611,6 +661,7 @@ def train_trade_quality_classifier(
     for j, col in enumerate(REGIME_NOW_PROB_COLS):
         work[col] = cal_regime[:, j]
     work["regime_now_conf"] = cal_regime.max(axis=1)
+    raw_regime = raw_regime.astype(np.float32, copy=False)
 
     print("  [L2b prep] Resolving feature groups (PA / HMM / GARCH / TCN) …", flush=True)
     garch_cols = [
@@ -714,8 +765,8 @@ def train_trade_quality_classifier(
     )
     mfe_full, mae_full = _mfe_mae_atr_arrays(work)
     st_full = work["state_label"].values.astype(int)
-    rp_full = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)
-    reg_models, _, thr_vec = _train_regime_opp_regression_models(
+    rp_route_full = raw_regime
+    reg_models, _, thr_vec, soft_opp_thr = _train_regime_opp_regression_models(
         X,
         st_full,
         mfe_full,
@@ -723,7 +774,7 @@ def train_trade_quality_classifier(
         train_mask,
         cal_mask,
         all_bo_feats,
-        rp_full[cal_mask],
+        rp_route_full,
         y_trade_cal,
     )
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -732,7 +783,11 @@ def train_trade_quality_classifier(
             continue
         reg_models[regime]["mfe"].save_model(os.path.join(MODEL_DIR, f"l2b_opp_mfe_{regime}.txt"))
         reg_models[regime]["mae"].save_model(os.path.join(MODEL_DIR, f"l2b_opp_mae_{regime}.txt"))
-    step1_regression_bundle = {"thr_vec": thr_vec}
+    step1_regression_bundle = {
+        "thr_vec": thr_vec,
+        "soft_opp_threshold": float(soft_opp_thr),
+        "gating_mode": "soft_mixture",
+    }
     for regime, pair in reg_models.items():
         step1_regression_bundle[f"{regime}_mfe"] = pair["mfe"]
         step1_regression_bundle[f"{regime}_mae"] = pair["mae"]
@@ -835,7 +890,8 @@ def train_trade_quality_classifier(
 
     # Evaluate cascade
     rp_test = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
-    opp_te = _compute_opportunity_scores(X_test, rp_test, reg_models)
+    rp_route_test = raw_regime[test_mask]
+    opp_te = _compute_opportunity_scores(X_test, rp_route_test, reg_models)
     p_long_te = step1_long_model.predict(X_test)
     p_short_te = step1_short_model.predict(X_test)
     
@@ -847,7 +903,7 @@ def train_trade_quality_classifier(
     tcn_transition_prob_test = work["tcn_transition_prob"].values.astype(np.float32)[test_mask] if "tcn_transition_prob" in work.columns else None
     p_long_te, skip_cp_test = _apply_cp_skip(rp_test, p_long_te, thr_cp, tcn_transition_prob_test)
     p_short_te, _ = _apply_cp_skip(rp_test, p_short_te, thr_cp, tcn_transition_prob_test)
-    print(f"\n  CP Skip rate (Layer 2b routed test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
+    print(f"\n  CP Skip rate (Layer 2b soft-mixture test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
     
     y_pred6 = _reconstruct_quality_classes(
         p_long_te, p_short_te, p_range_mass_test, thr_long=thr_long_cal, thr_short=thr_short_cal
@@ -920,6 +976,8 @@ def train_trade_quality_classifier(
         "regression_gate": {
             "groups": list(REGIMES_6),
             "thr_vec": thr_vec.tolist(),
+            "soft_opp_threshold": float(soft_opp_thr),
+            "gating_mode": "soft_mixture",
             "model_files": {
                 fk: fn
                 for regime in REGIMES_6

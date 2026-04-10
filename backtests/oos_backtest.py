@@ -145,6 +145,7 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         cal_regime = p["l2a_cals"].predict_proba(l_p)
     for j, col in enumerate(REGIME_NOW_PROB_COLS):
         df[col] = cal_regime[:, j]
+        df[f"{col}_raw"] = raw_regime[:, j]
     df["regime_now_conf"] = cal_regime.max(axis=1)
 
     print(f"[{symbol}] Layer 2b: Trade Stack")
@@ -213,6 +214,13 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         pred_value_left = np.zeros(len(df), dtype=np.float32)
         l4_base_cols = p["l4_meta"]["base_feature_cols"]
         l4_base_x = df[l4_base_cols].fillna(0).values.astype(np.float32)
+        l4_backend = os.environ.get("L4_INFER_BACKEND", p["l4_meta"].get("exit_backend", "tree")).strip().lower()
+        use_seq_backend = l4_backend in {"gru", "seq", "sequence"} and p.get("l4_seq") is not None
+        seq_mean = np.asarray(p["l4_meta"].get("seq_norm_mean", []), dtype=np.float32) if use_seq_backend else np.empty(0, dtype=np.float32)
+        seq_std = np.asarray(p["l4_meta"].get("seq_norm_std", []), dtype=np.float32) if use_seq_backend else np.empty(0, dtype=np.float32)
+        if use_seq_backend and seq_mean.size:
+            seq_std = np.where(seq_std > 1e-5, seq_std, 1.0).astype(np.float32, copy=False)
+        l4_hidden = None
     elif p.get("l4_meta") and l4_schema >= 3:
         # Ordinal approach
         tp_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])
@@ -328,6 +336,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 tp_price = entry_price + tp_arr[i] * atr_arr[i]
                 max_hold = int(p["l4_meta"].get("max_hold_bars", 30)) if l4_schema >= 4 and p.get("l4_meta") else int(time_arr[i] * 1.2)
                 hold = 0
+                if l4_schema >= 4 and p.get("l4_meta"):
+                    l4_hidden = None
             elif sz < -0.6:
                 in_pos = -1
                 entry_price = float(nxt_open)
@@ -339,6 +349,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 tp_price = entry_price - tp_arr[i] * atr_arr[i]
                 max_hold = int(p["l4_meta"].get("max_hold_bars", 30)) if l4_schema >= 4 and p.get("l4_meta") else int(time_arr[i] * 1.2)
                 hold = 0
+                if l4_schema >= 4 and p.get("l4_meta"):
+                    l4_hidden = None
         else:
             hold += 1
             exit_signal = False
@@ -363,8 +375,16 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                     mfe_atr_live=float(live_mfe_atr),
                     mae_atr_live=float(live_mae_atr),
                 ).reshape(1, -1)
-                exit_prob = float(p["l4_exit"].predict(feat_vec)[0])
-                value_left = float(p["l4_value"].predict(feat_vec)[0])
+                if use_seq_backend and seq_mean.size:
+                    feat_norm = (feat_vec.astype(np.float32, copy=False) - seq_mean[None, :]) / seq_std[None, :]
+                    x_t = torch.from_numpy(feat_norm).to(p["device"])
+                    with torch.inference_mode():
+                        exit_logit_t, value_left_t, l4_hidden = p["l4_seq"].forward_step(x_t, l4_hidden)
+                    exit_prob = float(torch.sigmoid(exit_logit_t)[0].item())
+                    value_left = float(value_left_t[0].item())
+                else:
+                    exit_prob = float(p["l4_exit"].predict(feat_vec)[0])
+                    value_left = float(p["l4_value"].predict(feat_vec)[0])
                 pred_exit_prob[i] = exit_prob
                 pred_value_left[i] = value_left
                 if hawkes_lambda > hawkes_threshold:
@@ -455,6 +475,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                     }
                 )
                 in_pos = 0
+                if l4_schema >= 4 and p.get("l4_meta"):
+                    l4_hidden = None
 
     return pd.DataFrame(trades)
 

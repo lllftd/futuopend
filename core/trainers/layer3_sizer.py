@@ -31,6 +31,10 @@ from core.trainers.layer2b_quality import (
     _build_trade_quality_targets,
 )
 
+def _regime_raw_prob_cols() -> list[str]:
+    return [f"{c}_raw" for c in REGIME_NOW_PROB_COLS]
+
+
 def _layer3_fill_regime_calibrated(
     regime_model: lgb.Booster,
     regime_calibrators: Any,
@@ -38,6 +42,7 @@ def _layer3_fill_regime_calibrated(
     out: np.ndarray,
     chunk: int,
     *,
+    raw_out: np.ndarray | None = None,
     tqdm_desc: str = "Layer3 regime→cal",
 ) -> None:
     n = len(work)
@@ -48,6 +53,8 @@ def _layer3_fill_regime_calibrated(
         j = min(i + chunk, n)
         x_s = work[regime_cols].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
         raw = regime_model.predict(x_s)
+        if raw_out is not None:
+            raw_out[i:j] = raw.astype(np.float32, copy=False)
         
         if isinstance(regime_calibrators, list):
             row = np.empty((j - i, n_cls), dtype=np.float64)
@@ -70,6 +77,12 @@ def _layer3_attach_regime_probs_to_work(work: pd.DataFrame, cal_regime: np.ndarr
     for j, col in enumerate(REGIME_NOW_PROB_COLS):
         work[col] = cal_regime[:, j]
     work["regime_now_conf"] = cal_regime.max(axis=1)
+
+
+def _layer3_attach_regime_raw_probs_to_work(work: pd.DataFrame, raw_regime: np.ndarray) -> None:
+    """Persist uncalibrated Layer-2a probs for leakage-safe routing in downstream regression heads."""
+    for j, col in enumerate(_regime_raw_prob_cols()):
+        work[col] = raw_regime[:, j]
 
 
 def _layer3_fill_trade_stack_probs(
@@ -105,7 +118,9 @@ def _layer3_fill_l2b_triplet_arrays(
     """Fill L2b regression outputs for Layer 3 (chunked). Uses Step1 regression if available."""
     regb = trade_quality_models.get("step1_regression")
     n = len(work)
-    regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
+    raw_cols = _regime_raw_prob_cols()
+    route_cols = raw_cols if all(c in work.columns for c in raw_cols) else list(REGIME_NOW_PROB_COLS)
+    regime_mat = work[route_cols].to_numpy(dtype=np.float32, copy=False)
     if regb:
         models = _l2b_nested_opp_models(regb)
         n_chunk = (n + chunk - 1) // chunk

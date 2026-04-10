@@ -39,6 +39,10 @@ from core.trainers.layer2b_quality import train_trade_quality_classifier
 from core.trainers.layer3_sizer import train_execution_sizer
 from core.trainers.layer4_exit import train_exit_manager_layer4
 
+def _experimental_mamba_enabled() -> bool:
+    return os.environ.get("ENABLE_EXPERIMENTAL_MAMBA", "").strip().lower() in {"1", "true", "yes"}
+
+
 class Logger:
     """Redirects stdout and stderr to both the terminal and a specified log file."""
     def __init__(self, filename):
@@ -135,10 +139,15 @@ def run_layer1a_tcn():
         logger.close()
 
 def run_layer1b_mamba():
+    if not _experimental_mamba_enabled():
+        raise RuntimeError(
+            "Layer 1b Mamba is experimental and disabled by default. "
+            "Set ENABLE_EXPERIMENTAL_MAMBA=1 to run it explicitly."
+        )
     logger = setup_logger("layer1b_mamba")
     try:
         print("\n" + "=" * 70)
-        print("  [1b] Mamba — Future Transition Signal (binary, +15 bars)")
+        print("  [1b] Experimental Mamba — Future Transition Signal")
         print("=" * 70)
         print(f"  Device: {DEVICE}  (override: TORCH_DEVICE=cuda:0 | mps | cpu)")
 
@@ -176,7 +185,7 @@ def run_layer1b_mamba():
             with open(os.path.join(TCN_MODEL_DIR, "mamba_meta.pkl"), "wb") as f:
                 pickle.dump(meta, f)
 
-            print(f"\n  Mamba binary future-transition model saved → {TCN_MODEL_DIR}/{MAMBA_STATE_CLASSIFIER_FILE}")
+            print(f"\n  Experimental Mamba model saved → {TCN_MODEL_DIR}/{MAMBA_STATE_CLASSIFIER_FILE}")
             print(f"  Meta saved → {TCN_MODEL_DIR}/mamba_meta.pkl")
         finally:
             if mm is not None:
@@ -233,7 +242,11 @@ def load_layer2b_artifacts():
         meta = pickle.load(f)
     
     regb = meta.get("regression_gate", {})
-    step1_regression_bundle = {"thr_vec": np.array(regb.get("thr_vec", []))}
+    step1_regression_bundle = {
+        "thr_vec": np.array(regb.get("thr_vec", [])),
+        "soft_opp_threshold": float(regb.get("soft_opp_threshold", 0.0)),
+        "gating_mode": regb.get("gating_mode", "hard_route"),
+    }
     for regime in regb.get("groups", []):
         mfe_file = regb["model_files"].get(f"{regime}_mfe", "")
         mae_file = regb["model_files"].get(f"{regime}_mae", "")
@@ -314,22 +327,23 @@ def run_lgbm_layers(start_from="layer2a"):
     print("=" * 70)
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified Training Pipeline (TCN + LGBM)")
+    parser = argparse.ArgumentParser(description="Unified Training Pipeline (TCN + LGBM; Mamba is experimental)")
     parser.add_argument(
         "--start-from", 
         type=str, 
         choices=["layer1", "layer1a", "layer1b", "layer2", "layer2a", "layer2b", "layer3", "layer4"],
         default="layer1",
-        help="Skip earlier layers. layer2 is an alias for layer2a (LGBM from regime head).",
+        help="Skip earlier layers. layer2 is an alias for layer2a. layer1b is experimental and requires ENABLE_EXPERIMENTAL_MAMBA=1.",
     )
     args = parser.parse_args()
     start = "layer2a" if args.start_from == "layer2" else args.start_from
 
     if start == "layer1" or start == "layer1a":
         run_layer1a_tcn()
-    if start == "layer1" or start == "layer1b":
-        print("\n  [1b] --- Skipping Layer 1b Mamba (Disabled) ---")
-        # run_layer1b_mamba()
+    if start == "layer1":
+        print("\n  [1b] --- Skipping Layer 1b Mamba (experimental module; disabled by default) ---")
+    elif start == "layer1b":
+        run_layer1b_mamba()
 
     if start in ["layer1", "layer1a", "layer1b"]:
         run_lgbm_layers("layer2a")

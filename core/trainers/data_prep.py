@@ -669,16 +669,19 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     df = _compute_tcn_derived_features(df, feat_cols)
     feat_cols = _unique_cols(feat_cols + _tcn_derived_feature_names())
 
-    # Mamba columns (optional): requires weights unless explicitly disabled
+    # Mamba is kept behind an explicit opt-in because it is experimental and not part of the default stack.
+    enable_experimental_mamba = os.environ.get("ENABLE_EXPERIMENTAL_MAMBA", "").strip().lower() in ("1", "true", "yes")
     disable_mamba = os.environ.get("DISABLE_MAMBA_FEATURES", "").strip().lower() in ("1", "true", "yes")
     mamba_ckpt = os.path.join(MODEL_DIR, "mamba_state_classifier_6c.pt")
-    if disable_mamba:
+    if not enable_experimental_mamba:
+        print("  Mamba-derived features skipped (experimental module; set ENABLE_EXPERIMENTAL_MAMBA=1 to enable).", flush=True)
+    elif disable_mamba:
         print("  Mamba-derived features skipped (DISABLE_MAMBA_FEATURES=1).", flush=True)
     elif os.path.exists(mamba_ckpt):
         df = _compute_mamba_derived_features(df, feat_cols)
         feat_cols = _unique_cols(feat_cols + _mamba_derived_feature_names())
     else:
-        print("  No Mamba checkpoint; continuing with TCN (+PA) features only.", flush=True)
+        print("  Experimental Mamba requested but no checkpoint found; continuing with TCN (+PA) features only.", flush=True)
 
     base_feats, hmm_feats, garch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")
@@ -686,7 +689,7 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     print(f"    HMM-style:   {len(hmm_feats)}")
     print(f"    GARCH-style: {len(garch_feats)}")
     print(f"    TCN-derived: {len(tcn_feats)}")
-    print(f"    Mamba-derived: {len(mamba_feats)}")
+    print(f"    Mamba-derived (experimental): {len(mamba_feats)}")
     _log_tcn_feature_health(df, tcn_feats)
     print(f"  Total rows: {len(df):,}")
     print(f"  Date range: {df['time_key'].min()} → {df['time_key'].max()}")
