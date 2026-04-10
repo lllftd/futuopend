@@ -40,12 +40,14 @@ def _layer3_fill_regime_calibrated(
     work: pd.DataFrame,
     out: np.ndarray,
     chunk: int,
+    *,
+    tqdm_desc: str = "Layer3 regime→cal",
 ) -> None:
     n = len(work)
     n_cls = NUM_REGIME_CLASSES
     n_chunk = (n + chunk - 1) // chunk
     regime_cols = _lgbm_booster_feature_names(regime_model)
-    for i in _tq(range(0, n, chunk), desc="Layer3 regime→cal", total=n_chunk, unit="chunk"):
+    for i in _tq(range(0, n, chunk), desc=tqdm_desc, total=n_chunk, unit="chunk"):
         j = min(i + chunk, n)
         x_s = work[regime_cols].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
         raw = regime_model.predict(x_s)
@@ -80,11 +82,14 @@ def _layer3_fill_trade_stack_probs(
     p_long_gate: np.ndarray,
     p_short_gate: np.ndarray,
     chunk: int,
+    *,
+    tqdm_desc: str = "Layer3 trade stack",
 ) -> None:
     if not trade_quality_models.get("step1_regression"):
         raise RuntimeError("Layer 2b Step1 is regression-only; missing step1_regression in model bundle.")
     _layer3_fill_trade_stack_probs_gates(
         trade_quality_models, work, layer2_feats, p_long_gate, p_short_gate, chunk,
+        tqdm_desc=tqdm_desc,
     )
 
 
@@ -97,6 +102,8 @@ def _layer3_fill_l2b_triplet_arrays(
     mfe_out: np.ndarray,
     mae_out: np.ndarray,
     chunk: int,
+    *,
+    tqdm_desc: str = "Layer3 L2b triplet (reg)",
 ) -> None:
     """Fill L2b regression outputs for Layer 3 (chunked). Uses Step1 regression if available."""
     regb = trade_quality_models.get("step1_regression")
@@ -105,7 +112,7 @@ def _layer3_fill_l2b_triplet_arrays(
     if regb:
         models = _l2b_nested_opp_models(regb)
         n_chunk = (n + chunk - 1) // chunk
-        for i in _tq(range(0, n, chunk), desc="Layer3 L2b triplet (reg)", total=n_chunk, unit="chunk"):
+        for i in _tq(range(0, n, chunk), desc=tqdm_desc, total=n_chunk, unit="chunk"):
             j = min(i + chunk, n)
             x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
             rp = regime_mat[i:j]

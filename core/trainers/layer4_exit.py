@@ -52,7 +52,10 @@ def train_exit_manager_layer4(
 
     n = len(work)
     cal_regime = np.empty((n, NUM_REGIME_CLASSES), dtype=np.float32)
-    _layer3_fill_regime_calibrated(regime_model, regime_calibrators, work, cal_regime, chunk)
+    _layer3_fill_regime_calibrated(
+        regime_model, regime_calibrators, work, cal_regime, chunk,
+        tqdm_desc="Layer4 regime→cal",
+    )
     _layer3_attach_regime_probs_to_work(work, cal_regime)
 
     garch_cols = sorted([c for c in work.columns if c.startswith("pa_garch_") and str(work[c].dtype) not in {"object", "category"}])
@@ -60,7 +63,10 @@ def train_exit_manager_layer4(
 
     p_long_gate = np.empty(n, dtype=np.float32)
     p_short_gate = np.empty(n, dtype=np.float32)
-    _layer3_fill_trade_stack_probs(trade_quality_models, work, layer2_feats, p_long_gate, p_short_gate, chunk)
+    _layer3_fill_trade_stack_probs(
+        trade_quality_models, work, layer2_feats, p_long_gate, p_short_gate, chunk,
+        tqdm_desc="Layer4 trade stack",
+    )
     
     tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
     p_long_gate, _ = _apply_cp_skip(cal_regime, p_long_gate, thr_cp, tcn_transition_prob_all)
@@ -71,7 +77,10 @@ def train_exit_manager_layer4(
     l2b_opp = np.empty(n, dtype=np.float32)
     l2b_mfe = np.empty(n, dtype=np.float32)
     l2b_mae = np.empty(n, dtype=np.float32)
-    _layer3_fill_l2b_triplet_arrays(trade_quality_models, work, layer2_feats, p_trade_max, l2b_opp, l2b_mfe, l2b_mae, chunk)
+    _layer3_fill_l2b_triplet_arrays(
+        trade_quality_models, work, layer2_feats, p_trade_max, l2b_opp, l2b_mfe, l2b_mae, chunk,
+        tqdm_desc="Layer4 L2b triplet (reg)",
+    )
 
     safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values, 1e-3)
     

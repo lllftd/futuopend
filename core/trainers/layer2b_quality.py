@@ -252,6 +252,8 @@ def _layer3_fill_trade_stack_probs_gates(
     p_long_gate: np.ndarray,
     p_short_gate: np.ndarray,
     chunk: int,
+    *,
+    tqdm_desc: str = "Layer3 trade stack",
 ) -> None:
     s1_long = trade_quality_models.get("step1_long")
     s1_short = trade_quality_models.get("step1_short")
@@ -263,7 +265,7 @@ def _layer3_fill_trade_stack_probs_gates(
 
     n = len(work)
     n_chunk = (n + chunk - 1) // chunk
-    for i in _tq(range(0, n, chunk), desc="Layer3 trade stack", total=n_chunk, unit="chunk"):
+    for i in _tq(range(0, n, chunk), desc=tqdm_desc, total=n_chunk, unit="chunk"):
         j = min(i + chunk, n)
         x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
 
