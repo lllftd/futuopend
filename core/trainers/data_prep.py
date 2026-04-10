@@ -149,6 +149,234 @@ def ensure_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _ctx_first_numeric(df: pd.DataFrame, names: list[str], default: float = 0.0) -> np.ndarray:
+    for name in names:
+        if name in df.columns:
+            series = pd.to_numeric(df[name], errors="coerce").fillna(default)
+            return series.to_numpy(dtype=np.float32, copy=False)
+    return np.full(len(df), default, dtype=np.float32)
+
+
+def _clip01(x: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
+
+
+def ensure_structure_context_features(df: pd.DataFrame) -> pd.DataFrame:
+    missing_cols = [c for c in PA_CTX_FEATURES if c not in df.columns]
+    if not missing_cols:
+        return df
+
+    ensure_breakout_features(df)
+
+    pressure_diff = _ctx_first_numeric(df, ["bo_pressure_diff"])
+    consec_dir = _ctx_first_numeric(df, ["bo_consec_dir"])
+    gap_signal = _ctx_first_numeric(df, ["bo_gap_signal"])
+    or_dist = _ctx_first_numeric(df, ["bo_or_dist"])
+    close_ext = _ctx_first_numeric(df, ["bo_close_extremity"], default=0.5)
+    body_growth = _ctx_first_numeric(df, ["bo_body_growth"])
+    range_atr = _ctx_first_numeric(df, ["bo_range_atr"])
+    inside_prior = _ctx_first_numeric(df, ["bo_inside_prior", "pa_is_inside_bar"])
+    range_compress = _ctx_first_numeric(df, ["bo_range_compress"], default=1.0)
+    bb_width = _ctx_first_numeric(df, ["bo_bb_width"])
+
+    trend_dir = _ctx_first_numeric(df, ["pa_env_trend_dir"])
+    trend_score = _ctx_first_numeric(df, ["pa_env_trend_score_ratio", "pa_trend_ratio"])
+    range_score = _ctx_first_numeric(df, ["pa_env_range_score_ratio", "pa_regime_range"])
+    breakout_fail = _ctx_first_numeric(df, ["pa_breakout_likely_fail"])
+    trend_weakened = _ctx_first_numeric(df, ["pa_trend_weakened"])
+    resume_prob = _ctx_first_numeric(df, ["pa_trend_resume_prob"], default=0.75)
+    opening_reversal = _ctx_first_numeric(df, ["pa_opening_reversal"])
+    gap_open = _ctx_first_numeric(df, ["pa_gap_open_flag"])
+    h2 = _ctx_first_numeric(df, ["pa_is_h2_setup"])
+    l2 = _ctx_first_numeric(df, ["pa_is_l2_setup"])
+    pullback_stage = _ctx_first_numeric(df, ["pa_pullback_stage"])
+
+    bull_pressure = _clip01(0.5 + 0.5 * np.tanh(pressure_diff / 2.0))
+    bear_pressure = _clip01(0.5 - 0.5 * np.tanh(pressure_diff / 2.0))
+    consec_long = _clip01(0.5 + 0.5 * np.tanh(consec_dir / 3.0))
+    consec_short = _clip01(0.5 - 0.5 * np.tanh(consec_dir / 3.0))
+    gap_long = _clip01(0.5 + 0.5 * np.tanh(gap_signal))
+    gap_short = _clip01(0.5 - 0.5 * np.tanh(gap_signal))
+    or_above = _clip01(0.5 + 0.5 * np.tanh(or_dist))
+    or_below = _clip01(0.5 - 0.5 * np.tanh(or_dist))
+    bull_close = _clip01(close_ext)
+    bear_close = _clip01(1.0 - close_ext)
+    body_push = _clip01(body_growth / 2.5)
+    range_push = _clip01(range_atr / 3.0)
+    tight_range = _clip01(1.0 - np.clip(range_compress / 1.5, 0.0, 1.0))
+    bb_tight = _clip01(1.0 - np.tanh(np.maximum(bb_width, 0.0) * 2.0))
+    trend_long_dir = _clip01(trend_dir)
+    trend_short_dir = _clip01(-trend_dir)
+    trend_score = _clip01(trend_score)
+    range_score = _clip01(range_score)
+    breakout_fail = _clip01(np.maximum(breakout_fail, range_score * 0.75))
+    trend_weakened = _clip01(trend_weakened)
+    resume_score = _clip01((resume_prob - 0.5) / 0.45)
+    h2 = _clip01(h2)
+    l2 = _clip01(l2)
+    pullback_long = _clip01(np.clip(pullback_stage, 0.0, 4.0) / 4.0)
+    pullback_short = _clip01(np.clip(-pullback_stage, 0.0, 4.0) / 4.0)
+    open_ctx = _clip01(0.6 * opening_reversal + 0.4 * gap_open)
+
+    trend_setup_long = _clip01(
+        0.26 * trend_long_dir
+        + 0.20 * trend_score
+        + 0.18 * bull_pressure
+        + 0.12 * consec_long
+        + 0.10 * body_push
+        + 0.08 * range_push
+        + 0.08 * bull_close
+        + 0.06 * gap_long
+        - 0.24 * range_score
+        - 0.20 * breakout_fail
+    )
+    trend_setup_short = _clip01(
+        0.26 * trend_short_dir
+        + 0.20 * trend_score
+        + 0.18 * bear_pressure
+        + 0.12 * consec_short
+        + 0.10 * body_push
+        + 0.08 * range_push
+        + 0.08 * bear_close
+        + 0.06 * gap_short
+        - 0.24 * range_score
+        - 0.20 * breakout_fail
+    )
+    pullback_setup_long = _clip01(
+        0.30 * trend_long_dir
+        + 0.24 * h2
+        + 0.18 * pullback_long
+        + 0.16 * resume_score
+        + 0.08 * or_below
+        + 0.08 * bull_pressure
+        - 0.20 * range_score
+        - 0.12 * trend_weakened
+    )
+    pullback_setup_short = _clip01(
+        0.30 * trend_short_dir
+        + 0.24 * l2
+        + 0.18 * pullback_short
+        + 0.16 * resume_score
+        + 0.08 * or_above
+        + 0.08 * bear_pressure
+        - 0.20 * range_score
+        - 0.12 * trend_weakened
+    )
+    range_setup_long = _clip01(
+        0.38 * range_score
+        + 0.18 * tight_range
+        + 0.14 * bb_tight
+        + 0.12 * inside_prior
+        + 0.10 * or_below
+        + 0.08 * bear_close
+        + 0.06 * open_ctx
+        - 0.12 * trend_score
+    )
+    range_setup_short = _clip01(
+        0.38 * range_score
+        + 0.18 * tight_range
+        + 0.14 * bb_tight
+        + 0.12 * inside_prior
+        + 0.10 * or_above
+        + 0.08 * bull_close
+        + 0.06 * open_ctx
+        - 0.12 * trend_score
+    )
+    failed_breakout_long = _clip01(
+        0.34 * breakout_fail
+        + 0.18 * range_score
+        + 0.16 * bull_pressure
+        + 0.12 * bull_close
+        + 0.10 * inside_prior
+        + 0.10 * open_ctx
+        - 0.12 * trend_short_dir
+    )
+    failed_breakout_short = _clip01(
+        0.34 * breakout_fail
+        + 0.18 * range_score
+        + 0.16 * bear_pressure
+        + 0.12 * bear_close
+        + 0.10 * inside_prior
+        + 0.10 * open_ctx
+        - 0.12 * trend_long_dir
+    )
+    follow_long = _clip01(
+        0.28 * bull_pressure
+        + 0.18 * consec_long
+        + 0.16 * bull_close
+        + 0.14 * body_push
+        + 0.10 * range_push
+        + 0.10 * gap_long
+        - 0.20 * inside_prior
+        - 0.20 * breakout_fail
+    )
+    follow_short = _clip01(
+        0.28 * bear_pressure
+        + 0.18 * consec_short
+        + 0.16 * bear_close
+        + 0.14 * body_push
+        + 0.10 * range_push
+        + 0.10 * gap_short
+        - 0.20 * inside_prior
+        - 0.20 * breakout_fail
+    )
+
+    setup_long = np.maximum.reduce(
+        [trend_setup_long, pullback_setup_long, range_setup_long, failed_breakout_long]
+    ).astype(np.float32, copy=False)
+    setup_short = np.maximum.reduce(
+        [trend_setup_short, pullback_setup_short, range_setup_short, failed_breakout_short]
+    ).astype(np.float32, copy=False)
+
+    range_pressure = _clip01(
+        0.50 * range_score
+        + 0.18 * tight_range
+        + 0.12 * bb_tight
+        + 0.10 * inside_prior
+        + 0.10 * (1.0 - np.abs(pressure_diff) / (np.abs(pressure_diff) + 1.0))
+    )
+    structure_veto = _clip01(
+        0.42 * range_pressure
+        + 0.28 * breakout_fail
+        + 0.18 * trend_weakened
+        + 0.12 * (1.0 - np.maximum(follow_long, follow_short))
+    )
+    premise_break_long = _clip01(
+        0.42 * structure_veto
+        + 0.22 * setup_short
+        + 0.20 * np.maximum(follow_short - follow_long, 0.0)
+        + 0.16 * range_pressure
+    )
+    premise_break_short = _clip01(
+        0.42 * structure_veto
+        + 0.22 * setup_long
+        + 0.20 * np.maximum(follow_long - follow_short, 0.0)
+        + 0.16 * range_pressure
+    )
+
+    ctx_values = {
+        "pa_ctx_setup_trend_long": trend_setup_long,
+        "pa_ctx_setup_trend_short": trend_setup_short,
+        "pa_ctx_setup_pullback_long": pullback_setup_long,
+        "pa_ctx_setup_pullback_short": pullback_setup_short,
+        "pa_ctx_setup_range_long": range_setup_long,
+        "pa_ctx_setup_range_short": range_setup_short,
+        "pa_ctx_setup_failed_breakout_long": failed_breakout_long,
+        "pa_ctx_setup_failed_breakout_short": failed_breakout_short,
+        "pa_ctx_setup_long": setup_long,
+        "pa_ctx_setup_short": setup_short,
+        "pa_ctx_follow_through_long": follow_long,
+        "pa_ctx_follow_through_short": follow_short,
+        "pa_ctx_range_pressure": range_pressure,
+        "pa_ctx_structure_veto": structure_veto,
+        "pa_ctx_premise_break_long": premise_break_long,
+        "pa_ctx_premise_break_short": premise_break_short,
+    }
+    for col in missing_cols:
+        df[col] = ctx_values[col]
+    return df
+
+
 def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -> pd.DataFrame:
     """
     Real TCN forward only — no uniform-prior placeholders.
@@ -716,6 +944,8 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
         print("  Experimental Mamba requested but no checkpoint found; continuing with TCN (+PA) features only.", flush=True)
 
     df = ensure_breakout_features(df)
+    df = ensure_structure_context_features(df)
+    feat_cols = _unique_cols(feat_cols + list(PA_CTX_FEATURES))
 
     base_feats, hmm_feats, garch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")

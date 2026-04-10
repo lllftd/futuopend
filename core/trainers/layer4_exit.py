@@ -75,6 +75,13 @@ def _build_exit_policy_dataset(
     else:
         tp, sl, ex = _optimal_exit_target_arrays(work)
         opt_net = _net_edge_atr_from_state(tp, sl, ex).astype(np.float64)
+    setup_long = work["pa_ctx_setup_long"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_setup_long" in work.columns else np.zeros(n, dtype=np.float32)
+    setup_short = work["pa_ctx_setup_short"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_setup_short" in work.columns else np.zeros(n, dtype=np.float32)
+    follow_long = work["pa_ctx_follow_through_long"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_follow_through_long" in work.columns else np.zeros(n, dtype=np.float32)
+    follow_short = work["pa_ctx_follow_through_short"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_follow_through_short" in work.columns else np.zeros(n, dtype=np.float32)
+    structure_veto = work["pa_ctx_structure_veto"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_structure_veto" in work.columns else np.zeros(n, dtype=np.float32)
+    premise_break_long = work["pa_ctx_premise_break_long"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_premise_break_long" in work.columns else np.zeros(n, dtype=np.float32)
+    premise_break_short = work["pa_ctx_premise_break_short"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_premise_break_short" in work.columns else np.zeros(n, dtype=np.float32)
 
     times = work["time_key"].values
     split_code = np.full(n, -1, dtype=np.int8)
@@ -100,6 +107,8 @@ def _build_exit_policy_dataset(
         entry_price = float(open_px[i + 1])
         entry_atr = float(safe_atr[i])
         side = float(side_arr[i])
+        entry_setup = float(setup_long[i] if side > 0 else setup_short[i])
+        entry_follow = float(follow_long[i] if side > 0 else follow_short[i])
         live_mfe = 0.0
         live_mae = 0.0
         max_j = min(int(sym_end[i]), i + max_hold)
@@ -126,6 +135,12 @@ def _build_exit_policy_dataset(
             live_edge = float(_net_edge_atr_from_state(live_mfe, live_mae, hold))
             future_gain_left = float(opt_edge - live_edge)
             y_exit = 1 if (hold >= opt_bar or future_gain_left <= exit_epsilon_atr) else 0
+            aligned_setup_now = float(setup_long[j] if side > 0 else setup_short[j])
+            opposing_setup_now = float(setup_short[j] if side > 0 else setup_long[j])
+            follow_now = float(follow_long[j] if side > 0 else follow_short[j])
+            premise_break_now = float(premise_break_long[j] if side > 0 else premise_break_short[j])
+            setup_retention = float(np.clip(aligned_setup_now / max(entry_setup, 1e-3), 0.0, 2.0))
+            follow_gap = float(np.clip(follow_now - entry_follow, -1.0, 1.0))
             rows_x.append(
                 _layer4_policy_state_vector(
                     base_X[j],
@@ -135,6 +150,12 @@ def _build_exit_policy_dataset(
                     unreal_pnl_atr=float(unreal),
                     mfe_atr_live=float(live_mfe),
                     mae_atr_live=float(live_mae),
+                    setup_aligned_now=aligned_setup_now,
+                    setup_retention=setup_retention,
+                    structure_veto_now=float(structure_veto[j]),
+                    premise_break_now=float(np.clip(max(premise_break_now, 0.5 * structure_veto[j] + 0.5 * opposing_setup_now), 0.0, 1.0)),
+                    opposing_setup_now=opposing_setup_now,
+                    follow_through_gap=follow_gap,
                 )
             )
             rows_exit.append(y_exit)
@@ -385,7 +406,7 @@ def train_exit_manager_layer4(
     exit_eps = float(os.environ.get("L4_EXIT_EPS_ATR", "0.03"))
     exit_prob_thr = float(os.environ.get("L4_EXIT_PROB_THRESHOLD", "0.55"))
     value_thr = float(os.environ.get("L4_VALUE_LEFT_THRESHOLD", "0.02"))
-    work = ensure_breakout_features(df.copy(deep=False))
+    work = ensure_structure_context_features(df.copy(deep=False))
 
     n = len(work)
     time_arr = work["time_key"].values
@@ -418,6 +439,7 @@ def train_exit_manager_layer4(
         p_short_adj, _ = _apply_cp_skip(cal_regime[non_train_rows], p_short_gate[non_train_rows], thr_cp, tcn_transition_prob_eval)
         p_long_gate[non_train_rows] = p_long_adj
         p_short_gate[non_train_rows] = p_short_adj
+    p_long_gate, p_short_gate = _apply_structure_veto_to_gates(work, p_long_gate, p_short_gate)
 
     p_trade_max = np.maximum(p_long_gate, p_short_gate)
     l2b_opp = np.empty(n, dtype=np.float32)
@@ -430,7 +452,7 @@ def train_exit_manager_layer4(
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
-    pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
+    pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:24]
     regime_feat = cal_regime.copy()
     regime_feat[train_rows] = raw_regime[train_rows]
     inter_blk = (l2b_opp.astype(np.float64)[:, None] * regime_feat.astype(np.float64)).astype(np.float32, copy=False)

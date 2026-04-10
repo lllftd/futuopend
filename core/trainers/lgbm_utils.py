@@ -276,6 +276,12 @@ L4_POLICY_DYNAMIC_FEATURES = [
     "l4_mae_atr_live",
     "l4_net_edge_atr_live",
     "l4_theta_decay_live",
+    "l4_setup_aligned_now",
+    "l4_setup_retention",
+    "l4_structure_veto_now",
+    "l4_premise_break_now",
+    "l4_opposing_setup_now",
+    "l4_follow_through_gap",
 ]
 
 
@@ -304,6 +310,12 @@ def _layer4_policy_state_vector(
     unreal_pnl_atr: float,
     mfe_atr_live: float,
     mae_atr_live: float,
+    setup_aligned_now: float = 0.0,
+    setup_retention: float = 0.0,
+    structure_veto_now: float = 0.0,
+    premise_break_now: float = 0.0,
+    opposing_setup_now: float = 0.0,
+    follow_through_gap: float = 0.0,
 ) -> np.ndarray:
     hold_arr = np.asarray([hold_bars], dtype=np.float32)
     dyn = np.array(
@@ -316,10 +328,36 @@ def _layer4_policy_state_vector(
             float(mae_atr_live),
             float(_net_edge_atr_from_state(mfe_atr_live, mae_atr_live, hold_bars)),
             float(_theta_decay_from_bars(hold_arr)[0]),
+            float(setup_aligned_now),
+            float(setup_retention),
+            float(structure_veto_now),
+            float(premise_break_now),
+            float(opposing_setup_now),
+            float(follow_through_gap),
         ],
         dtype=np.float32,
     )
     return np.concatenate([np.asarray(base_row, dtype=np.float32), dyn], axis=0)
+
+
+def _apply_structure_veto_to_gates(
+    work: pd.DataFrame,
+    p_long_gate: np.ndarray,
+    p_short_gate: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    long_setup = work["pa_ctx_setup_long"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_setup_long" in work.columns else np.zeros(len(work), dtype=np.float32)
+    short_setup = work["pa_ctx_setup_short"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_setup_short" in work.columns else np.zeros(len(work), dtype=np.float32)
+    range_pressure = work["pa_ctx_range_pressure"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_range_pressure" in work.columns else np.zeros(len(work), dtype=np.float32)
+    premise_break_long = work["pa_ctx_premise_break_long"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_premise_break_long" in work.columns else np.zeros(len(work), dtype=np.float32)
+    premise_break_short = work["pa_ctx_premise_break_short"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_premise_break_short" in work.columns else np.zeros(len(work), dtype=np.float32)
+    structure_veto = work["pa_ctx_structure_veto"].to_numpy(dtype=np.float32, copy=False) if "pa_ctx_structure_veto" in work.columns else np.zeros(len(work), dtype=np.float32)
+
+    long_allow = np.clip(0.20 + 0.95 * long_setup - 0.40 * range_pressure - 0.35 * premise_break_long - 0.20 * structure_veto, 0.0, 1.0)
+    short_allow = np.clip(0.20 + 0.95 * short_setup - 0.40 * range_pressure - 0.35 * premise_break_short - 0.20 * structure_veto, 0.0, 1.0)
+    return (
+        p_long_gate.astype(np.float32, copy=False) * long_allow.astype(np.float32, copy=False),
+        p_short_gate.astype(np.float32, copy=False) * short_allow.astype(np.float32, copy=False),
+    )
 
 
 def _lgb_round_tqdm_enabled() -> bool:
@@ -525,6 +563,7 @@ __all__ = [
     "_is_lgbm_string_tag_col",
     "_l2b_reg_objective_params",
     "_layer3_chunk_rows",
+    "_apply_structure_veto_to_gates",
     "_lgb_log_eval_period",
     "_lgb_round_tqdm_enabled",
     "_lgb_train_callbacks",

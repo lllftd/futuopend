@@ -39,7 +39,7 @@ from core.trainers.constants import (
 )
 from core.trainers.data_prep import (
     _create_tcn_windows,
-    compute_breakout_features,
+    ensure_structure_context_features,
 )
 from core.trainers.lgbm_utils import _layer4_policy_state_vector
 
@@ -54,10 +54,7 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
 
     atr_1m = compute_atr(raw, length=14)
     df = add_pa_features(raw, atr_1m, timeframe="5min")
-
-    bo_df = compute_breakout_features(df)
-    for c in BO_FEAT_COLS:
-        df[c] = bo_df[c].values
+    df = ensure_structure_context_features(df)
 
     tcn_feats = p["tcn_meta"]["feat_cols"]
     x_raw = df[tcn_feats].values.astype(np.float32)
@@ -166,6 +163,18 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     tcn_prob = df["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in df.columns else None
     p_long_gate, _ = _apply_cp_skip(rp, p_long_raw, thr_cp, tcn_prob)
     p_short_gate, _ = _apply_cp_skip(rp, p_short_raw, thr_cp, tcn_prob)
+    long_setup = df["pa_ctx_setup_long"].values.astype(np.float32) if "pa_ctx_setup_long" in df.columns else np.zeros(len(df), dtype=np.float32)
+    short_setup = df["pa_ctx_setup_short"].values.astype(np.float32) if "pa_ctx_setup_short" in df.columns else np.zeros(len(df), dtype=np.float32)
+    follow_long = df["pa_ctx_follow_through_long"].values.astype(np.float32) if "pa_ctx_follow_through_long" in df.columns else np.zeros(len(df), dtype=np.float32)
+    follow_short = df["pa_ctx_follow_through_short"].values.astype(np.float32) if "pa_ctx_follow_through_short" in df.columns else np.zeros(len(df), dtype=np.float32)
+    range_pressure = df["pa_ctx_range_pressure"].values.astype(np.float32) if "pa_ctx_range_pressure" in df.columns else np.zeros(len(df), dtype=np.float32)
+    premise_break_long = df["pa_ctx_premise_break_long"].values.astype(np.float32) if "pa_ctx_premise_break_long" in df.columns else np.zeros(len(df), dtype=np.float32)
+    premise_break_short = df["pa_ctx_premise_break_short"].values.astype(np.float32) if "pa_ctx_premise_break_short" in df.columns else np.zeros(len(df), dtype=np.float32)
+    structure_veto = df["pa_ctx_structure_veto"].values.astype(np.float32) if "pa_ctx_structure_veto" in df.columns else np.zeros(len(df), dtype=np.float32)
+    long_allow = np.clip(0.20 + 0.95 * long_setup - 0.40 * range_pressure - 0.35 * premise_break_long - 0.20 * structure_veto, 0.0, 1.0)
+    short_allow = np.clip(0.20 + 0.95 * short_setup - 0.40 * range_pressure - 0.35 * premise_break_short - 0.20 * structure_veto, 0.0, 1.0)
+    p_long_gate = p_long_gate * long_allow
+    p_short_gate = p_short_gate * short_allow
     
     p_trade = np.maximum(p_long_gate, p_short_gate)
     p_long = (p_long_gate > p_short_gate).astype(np.float32)
@@ -302,6 +311,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     entry_atr = 1e-3
     live_mfe_atr = 0.0
     live_mae_atr = 0.0
+    entry_setup_score = 0.0
+    entry_follow_score = 0.0
     
     # Hawkes parameters
     hawkes_decay = np.exp(-1.0 / 6.0) # ~6 bars decay (30 mins)
@@ -336,6 +347,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 tp_price = entry_price + tp_arr[i] * atr_arr[i]
                 max_hold = int(p["l4_meta"].get("max_hold_bars", 30)) if l4_schema >= 4 and p.get("l4_meta") else int(time_arr[i] * 1.2)
                 hold = 0
+                entry_setup_score = float(long_setup[i])
+                entry_follow_score = float(follow_long[i])
                 if l4_schema >= 4 and p.get("l4_meta"):
                     l4_hidden = None
             elif sz < -0.6:
@@ -349,6 +362,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 tp_price = entry_price - tp_arr[i] * atr_arr[i]
                 max_hold = int(p["l4_meta"].get("max_hold_bars", 30)) if l4_schema >= 4 and p.get("l4_meta") else int(time_arr[i] * 1.2)
                 hold = 0
+                entry_setup_score = float(short_setup[i])
+                entry_follow_score = float(follow_short[i])
                 if l4_schema >= 4 and p.get("l4_meta"):
                     l4_hidden = None
         else:
@@ -366,6 +381,12 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                     live_mfe_atr = max(live_mfe_atr, max(0.0, (entry_price - df["low"].iloc[i]) / entry_atr))
                     live_mae_atr = max(live_mae_atr, max(0.0, (df["high"].iloc[i] - entry_price) / entry_atr))
                     unreal = (entry_price - df["close"].iloc[i]) / entry_atr
+                aligned_setup_now = float(long_setup[i] if in_pos == 1 else short_setup[i])
+                opposing_setup_now = float(short_setup[i] if in_pos == 1 else long_setup[i])
+                follow_now = float(follow_long[i] if in_pos == 1 else follow_short[i])
+                premise_break_now = float(premise_break_long[i] if in_pos == 1 else premise_break_short[i])
+                setup_retention = float(np.clip(aligned_setup_now / max(entry_setup_score, 1e-3), 0.0, 2.0))
+                follow_gap = float(np.clip(follow_now - entry_follow_score, -1.0, 1.0))
                 feat_vec = _layer4_policy_state_vector(
                     l4_base_x[i],
                     hold_bars=float(hold),
@@ -374,6 +395,12 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                     unreal_pnl_atr=float(unreal),
                     mfe_atr_live=float(live_mfe_atr),
                     mae_atr_live=float(live_mae_atr),
+                    setup_aligned_now=aligned_setup_now,
+                    setup_retention=setup_retention,
+                    structure_veto_now=float(structure_veto[i]),
+                    premise_break_now=float(np.clip(max(premise_break_now, 0.5 * structure_veto[i] + 0.5 * opposing_setup_now), 0.0, 1.0)),
+                    opposing_setup_now=opposing_setup_now,
+                    follow_through_gap=follow_gap,
                 ).reshape(1, -1)
                 if use_seq_backend and seq_mean.size:
                     feat_norm = (feat_vec.astype(np.float32, copy=False) - seq_mean[None, :]) / seq_std[None, :]

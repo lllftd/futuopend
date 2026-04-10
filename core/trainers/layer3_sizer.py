@@ -151,7 +151,7 @@ def train_execution_sizer(
     chunk = _layer3_chunk_rows()
     print(f"  Memory: chunked predicts (LAYER3_CHUNK={chunk}); shallow df, no full feature matrices")
 
-    work = ensure_breakout_features(df.copy(deep=False))
+    work = ensure_structure_context_features(df.copy(deep=False))
 
     n = len(work)
     cal_regime = np.empty((n, NUM_REGIME_CLASSES), dtype=np.float32)
@@ -175,6 +175,7 @@ def train_execution_sizer(
     tcn_transition_prob_all = work["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in work.columns else None
     p_long_gate, _ = _apply_cp_skip(cal_regime, p_long_gate, thr_cp, tcn_transition_prob_all)
     p_short_gate, _ = _apply_cp_skip(cal_regime, p_short_gate, thr_cp, tcn_transition_prob_all)
+    p_long_gate, p_short_gate = _apply_structure_veto_to_gates(work, p_long_gate, p_short_gate)
 
     p_trade_max = np.maximum(p_long_gate, p_short_gate)
 
@@ -208,7 +209,7 @@ def train_execution_sizer(
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
-    pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:15]
+    pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:24]
 
     # Routed scalar opp (this bar's argmax regime head) × each regime's probability — 6 L3 interaction cols.
     inter_blk = (

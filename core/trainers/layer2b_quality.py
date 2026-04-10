@@ -595,7 +595,7 @@ def train_trade_quality_classifier(
 
     # Breakout-context features are computed for all bars, so NEUTRAL/CHOP are covered too.
     print("  [L2b prep] Breakout / bar-context features …", flush=True)
-    work = ensure_breakout_features(work)
+    work = ensure_structure_context_features(work)
 
     print(
         "  [L2b prep] Regime head predict + per-class calibration (all bars) …",

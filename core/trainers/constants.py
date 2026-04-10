@@ -51,9 +51,32 @@ BO_FEAT_COLS = [
     "bo_bb_width", "bo_atr_zscore",
 ]
 
+PA_CTX_FEATURES = [
+    "pa_ctx_setup_trend_long",
+    "pa_ctx_setup_trend_short",
+    "pa_ctx_setup_pullback_long",
+    "pa_ctx_setup_pullback_short",
+    "pa_ctx_setup_range_long",
+    "pa_ctx_setup_range_short",
+    "pa_ctx_setup_failed_breakout_long",
+    "pa_ctx_setup_failed_breakout_short",
+    "pa_ctx_setup_long",
+    "pa_ctx_setup_short",
+    "pa_ctx_follow_through_long",
+    "pa_ctx_follow_through_short",
+    "pa_ctx_range_pressure",
+    "pa_ctx_structure_veto",
+    "pa_ctx_premise_break_long",
+    "pa_ctx_premise_break_short",
+]
+
 L2B_OPP_X_REGIME_COLS = [f"l2b_opp_x_{r}" for r in REGIME_NOW_PROB_COLS]
 
 LAYER3_PA_KEY_FEATURES = (
+    "pa_ctx_setup_long", "pa_ctx_setup_short",
+    "pa_ctx_follow_through_long", "pa_ctx_follow_through_short",
+    "pa_ctx_structure_veto", "pa_ctx_range_pressure",
+    "pa_ctx_premise_break_long", "pa_ctx_premise_break_short",
     "pa_vol_rvol", "pa_vol_momentum", "pa_bo_wick_imbalance", "pa_bo_close_extremity",
     "pa_lead_macd_hist_slope", "pa_lead_rsi_slope", "pa_bo_dist_vwap",
     "pa_struct_swing_range_atr", "pa_tr_mm_target_up", "pa_tr_mm_target_down",
