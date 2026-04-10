@@ -364,12 +364,28 @@ def _mfe_mae_atr_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _opp_regression_sample_weights(mfe_tgt: np.ndarray, regime_name: str) -> np.ndarray:
-    w = np.ones(len(mfe_tgt), dtype=np.float64)
-    w[mfe_tgt > 1.0] = 5.0
-    w[mfe_tgt > 2.0] = 15.0
+    """
+    Differentiated percentile weighting to force the model to focus on high-MFE (breakout) samples.
+    """
+    mfe_series = pd.Series(mfe_tgt)
+    # Ensure rank calculation handles empty or very small arrays gracefully
+    if len(mfe_series) == 0:
+        return np.ones(0, dtype=np.float64)
+        
+    mfe_percentile = mfe_series.rank(pct=True).values
+    
+    weight = np.where(
+        mfe_percentile > 0.9, 5.0,          # top 10% breakout
+        np.where(mfe_percentile > 0.7, 2.5,  # 70~90%
+                 np.where(mfe_percentile > 0.5, 1.5,  # 50~70%
+                          1.0))               # bottom 50%
+    )
+    
+    # Keep the existing domain-specific logic as a multiplier
     if regime_name.startswith("range"):
-        w[mfe_tgt < 0.2] = 0.3
-    return w
+        weight = np.where(mfe_tgt < 0.2, weight * 0.3, weight)
+        
+    return weight
 
 
 def _l2b_reg_objective_params() -> dict:
