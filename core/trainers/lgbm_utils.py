@@ -219,6 +219,109 @@ def _lgb_train_callbacks(early_stopping_rounds: int) -> list:
     return out
 
 
+def _options_target_config() -> dict[str, float]:
+    decision_horizon = max(1, int(os.environ.get("OPTION_DECISION_HORIZON_BARS", "20")))
+    theta_start = max(0, int(os.environ.get("OPTION_THETA_START_BARS", "15")))
+    theta_decay = max(float(os.environ.get("OPTION_THETA_DECAY_BARS", "5.0")), 1e-6)
+    adverse_penalty = max(float(os.environ.get("OPTION_ADVERSE_PENALTY", "1.0")), 0.0)
+    max_hold = max(decision_horizon, int(os.environ.get("OPTION_MAX_HOLD_BARS", "30")))
+    return {
+        "decision_horizon_bars": decision_horizon,
+        "theta_start_bars": theta_start,
+        "theta_decay_bars": theta_decay,
+        "adverse_penalty": adverse_penalty,
+        "max_hold_bars": max_hold,
+    }
+
+
+def _theta_decay_from_bars(bars: np.ndarray | pd.Series | list[float]) -> np.ndarray:
+    cfg = _options_target_config()
+    hold_time = np.maximum(np.asarray(bars, dtype=float), 0.0)
+    return np.exp(-np.maximum(hold_time - cfg["theta_start_bars"], 0.0) / cfg["theta_decay_bars"])
+
+
+def _decision_edge_atr_array(df: pd.DataFrame) -> np.ndarray:
+    if "decision_net_edge_atr" in df.columns:
+        return df["decision_net_edge_atr"].fillna(0.0).values.astype(np.float64)
+    lbl_atr = df["lbl_atr"].values
+    safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
+    mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
+    mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
+    peak_bar = df["exit_bar"].fillna(0).values.astype(float) if "exit_bar" in df.columns else np.zeros(len(df), dtype=float)
+    cfg = _options_target_config()
+    return mfe * _theta_decay_from_bars(peak_bar) - cfg["adverse_penalty"] * mae
+
+
+def _optimal_exit_target_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    cfg = _options_target_config()
+    if {"optimal_tp_atr", "optimal_sl_atr", "optimal_exit_bar"}.issubset(df.columns):
+        tp = df["optimal_tp_atr"].fillna(0.0).values.astype(np.float64)
+        sl = df["optimal_sl_atr"].fillna(0.0).values.astype(np.float64)
+        tm = df["optimal_exit_bar"].fillna(0.0).values.astype(np.float64)
+        return tp, sl, np.clip(tm, 1.0, float(cfg["max_hold_bars"]))
+    lbl_atr = df["lbl_atr"].values
+    safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
+    mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 6.0)
+    mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
+    exit_bar = df["exit_bar"].fillna(0).values.astype(float) if "exit_bar" in df.columns else np.zeros(len(df), dtype=float)
+    return mfe * _theta_decay_from_bars(exit_bar), mae, np.clip(exit_bar, 1.0, float(cfg["max_hold_bars"]))
+
+
+L4_POLICY_DYNAMIC_FEATURES = [
+    "l4_hold_bars",
+    "l4_hold_frac",
+    "l4_side",
+    "l4_unreal_pnl_atr",
+    "l4_mfe_atr_live",
+    "l4_mae_atr_live",
+    "l4_net_edge_atr_live",
+    "l4_theta_decay_live",
+]
+
+
+def _net_edge_atr_from_state(
+    mfe_atr: np.ndarray | float,
+    mae_atr: np.ndarray | float,
+    hold_bars: np.ndarray | float,
+) -> np.ndarray:
+    cfg = _options_target_config()
+    mfe = np.asarray(mfe_atr, dtype=float)
+    mae = np.asarray(mae_atr, dtype=float)
+    hold = np.asarray(hold_bars, dtype=float)
+    return mfe * _theta_decay_from_bars(hold) - cfg["adverse_penalty"] * mae
+
+
+def _layer4_policy_feature_names(base_feature_cols: list[str]) -> list[str]:
+    return list(base_feature_cols) + list(L4_POLICY_DYNAMIC_FEATURES)
+
+
+def _layer4_policy_state_vector(
+    base_row: np.ndarray,
+    *,
+    hold_bars: float,
+    max_hold_bars: float,
+    side: float,
+    unreal_pnl_atr: float,
+    mfe_atr_live: float,
+    mae_atr_live: float,
+) -> np.ndarray:
+    hold_arr = np.asarray([hold_bars], dtype=np.float32)
+    dyn = np.array(
+        [
+            float(hold_bars),
+            float(hold_bars / max(max_hold_bars, 1.0)),
+            float(side),
+            float(unreal_pnl_atr),
+            float(mfe_atr_live),
+            float(mae_atr_live),
+            float(_net_edge_atr_from_state(mfe_atr_live, mae_atr_live, hold_bars)),
+            float(_theta_decay_from_bars(hold_arr)[0]),
+        ],
+        dtype=np.float32,
+    )
+    return np.concatenate([np.asarray(base_row, dtype=np.float32), dyn], axis=0)
+
+
 def _lgb_round_tqdm_enabled() -> bool:
     if os.environ.get("DISABLE_TQDM", "").strip().lower() in {"1", "true", "yes"}:
         return False
@@ -364,8 +467,7 @@ def _mfe_mae_atr_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     # Options Gamma Scalping: Apply time-decay penalty to regression targets
     if "exit_bar" in df.columns:
         hold_time = np.maximum(df["exit_bar"].fillna(0).values.astype(float), 0.0)
-        # For 1-min K-lines: penalize trades taking > 15 minutes to reach MFE
-        gamma_decay = np.exp(-np.maximum(hold_time - 15.0, 0.0) / 5.0)
+        gamma_decay = _theta_decay_from_bars(hold_time)
         mfe = mfe * gamma_decay
         
     return mfe.astype(np.float64), mae.astype(np.float64)
@@ -398,10 +500,17 @@ def _opp_regression_sample_weights(mfe_tgt: np.ndarray, regime_name: str) -> np.
 
 
 def _l2b_reg_objective_params() -> dict:
-    obj = os.environ.get("L2B_REG_OBJECTIVE", "regression").strip().lower()
+    obj = os.environ.get("L2B_REG_OBJECTIVE", "tweedie").strip().lower()
     if obj == "huber":
         return {"objective": "huber", "alpha": 0.9}
-    return {"objective": "regression", "metric": "mae"}
+    if obj == "regression":
+        return {"objective": "regression", "metric": "mae"}
+    tweedie_power = float(os.environ.get("L2B_TWEEDIE_POWER", "1.5"))
+    return {
+        "objective": "tweedie",
+        "tweedie_variance_power": tweedie_power,
+        "metric": "tweedie"
+    }
 
 
 def _layer3_chunk_rows() -> int:

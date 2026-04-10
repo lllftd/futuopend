@@ -40,14 +40,22 @@ def _load_and_compute_pa(symbol: str) -> pd.DataFrame:
 
 
 def _load_labels(symbol: str) -> pd.DataFrame:
-    cols = [
+    required_cols = [
         "time_key", "market_state",
         "signal", "outcome",
         "quality_bull_breakout", "quality_bear_breakout",
         "max_favorable", "max_adverse", "exit_bar",
         "atr",
     ]
-    lbl = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}{LABELED_SUFFIX}.csv"), usecols=cols)
+    optional_cols = [
+        "decision_mfe_atr", "decision_mae_atr", "decision_peak_bar",
+        "decision_theta_decay", "decision_net_edge_atr",
+        "optimal_tp_atr", "optimal_sl_atr", "optimal_exit_bar", "optimal_net_edge_atr",
+    ]
+    path = os.path.join(DATA_DIR, f"{symbol}{LABELED_SUFFIX}.csv")
+    available_cols = pd.read_csv(path, nrows=0).columns.tolist()
+    cols = [c for c in required_cols + optional_cols if c in available_cols]
+    lbl = pd.read_csv(path, usecols=cols)
     lbl["time_key"] = pd.to_datetime(lbl["time_key"])
     lbl.rename(columns={"atr": "lbl_atr"}, inplace=True)
     return lbl

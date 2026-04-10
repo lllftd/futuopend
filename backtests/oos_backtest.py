@@ -41,6 +41,7 @@ from core.trainers.data_prep import (
     _create_tcn_windows,
     compute_breakout_features,
 )
+from core.trainers.lgbm_utils import _layer4_policy_state_vector
 
 
 def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
@@ -199,8 +200,20 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         )
         exec_size = np.clip(exec_size, -1.5, 1.5)
 
-    # Layer 4 Execution (Ordinal EVT / Multi-class Binning & Survival)
-    if p.get("l4_meta") and p["l4_meta"].get("l4_schema", 1) >= 3:
+    df["atr_5m"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean()
+    atr_arr = df["atr_5m"].values
+    l4_schema = int(p["l4_meta"].get("l4_schema", 1)) if p.get("l4_meta") else 0
+
+    # Layer 4 Execution
+    if p.get("l4_meta") and l4_schema >= 4:
+        pred_tp_atr = np.full(len(df), np.nan, dtype=np.float32)
+        pred_sl_atr = np.full(len(df), np.nan, dtype=np.float32)
+        pred_time = np.full(len(df), p["l4_meta"].get("max_hold_bars", 30), dtype=np.float32)
+        pred_exit_prob = np.zeros(len(df), dtype=np.float32)
+        pred_value_left = np.zeros(len(df), dtype=np.float32)
+        l4_base_cols = p["l4_meta"]["base_feature_cols"]
+        l4_base_x = df[l4_base_cols].fillna(0).values.astype(np.float32)
+    elif p.get("l4_meta") and l4_schema >= 3:
         # Ordinal approach
         tp_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 TP>{k} [{symbol}]") for k, m in enumerate(p["l4_tp"])])
         sl_probs = np.column_stack([_chunked_booster_predict(m, l3_x, OOS_PRED_CHUNK, desc=f"L4 SL>{k} [{symbol}]") for k, m in enumerate(p["l4_sl"])])
@@ -237,6 +250,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         evt_sl_max = p["l4_meta"].get("evt_sl_max", 3.0)
         pred_tp_atr = np.clip(pred_tp_atr, 0.1, evt_tp_max)
         pred_sl_atr = np.clip(pred_sl_atr, 0.1, evt_sl_max)
+        pred_exit_prob = np.zeros(len(df), dtype=np.float32)
+        pred_value_left = np.zeros(len(df), dtype=np.float32)
         
     elif p.get("l4_tp") and p.get("l4_sl") and p.get("l4_time"):
         # Old multiclass approach
@@ -250,20 +265,24 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         
         pred_tp_atr = np.sum(pred_tp_prob * tp_centers, axis=1)
         pred_sl_atr = np.sum(pred_sl_prob * sl_centers, axis=1)
+        pred_exit_prob = np.zeros(len(df), dtype=np.float32)
+        pred_value_left = np.zeros(len(df), dtype=np.float32)
     else:
         pred_tp_atr = df["l2b_pred_mfe"].values * 0.85
         pred_sl_atr = df["l2b_pred_mae"].values * 1.5
         pred_time = np.full(len(df), 30.0)
+        pred_exit_prob = np.zeros(len(df), dtype=np.float32)
+        pred_value_left = np.zeros(len(df), dtype=np.float32)
 
     df["exec_size"] = exec_size
     df["pred_tp_atr"] = np.clip(pred_tp_atr, 0.1, 3.0) # Scalping max TP 3 ATR
     df["pred_sl_atr"] = np.clip(pred_sl_atr, 0.1, 2.0) # Scalping max SL 2 ATR
     df["pred_time"] = np.clip(pred_time, 1.0, 6.0) # Gamma scalping max hold 6 bars (30 mins)
-    df["atr_5m"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean()
+    df["pred_exit_prob"] = pred_exit_prob
+    df["pred_value_left"] = pred_value_left
     tp_arr = df["pred_tp_atr"].values
     sl_arr = df["pred_sl_atr"].values
     time_arr = df["pred_time"].values
-    atr_arr = df["atr_5m"].values
 
     trades = []
     in_pos = 0
@@ -272,6 +291,9 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     tp_price = 0.0
     entry_time = None
     max_hold = 30
+    entry_atr = 1e-3
+    live_mfe_atr = 0.0
+    live_mae_atr = 0.0
     
     # Hawkes parameters
     hawkes_decay = np.exp(-1.0 / 6.0) # ~6 bars decay (30 mins)
@@ -298,18 +320,24 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
                 in_pos = 1
                 entry_price = float(nxt_open)
                 entry_time = nxt_time
+                entry_atr = max(float(atr_arr[i]), 1e-3)
+                live_mfe_atr = 0.0
+                live_mae_atr = 0.0
                 # Dynamic SL/TP and Time Stop based on Layer 4 models
                 sl_price = entry_price - sl_arr[i] * atr_arr[i]
                 tp_price = entry_price + tp_arr[i] * atr_arr[i]
-                max_hold = int(time_arr[i] * 1.2)
+                max_hold = int(p["l4_meta"].get("max_hold_bars", 30)) if l4_schema >= 4 and p.get("l4_meta") else int(time_arr[i] * 1.2)
                 hold = 0
             elif sz < -0.6:
                 in_pos = -1
                 entry_price = float(nxt_open)
                 entry_time = nxt_time
+                entry_atr = max(float(atr_arr[i]), 1e-3)
+                live_mfe_atr = 0.0
+                live_mae_atr = 0.0
                 sl_price = entry_price + sl_arr[i] * atr_arr[i]
                 tp_price = entry_price - tp_arr[i] * atr_arr[i]
-                max_hold = int(time_arr[i] * 1.2)
+                max_hold = int(p["l4_meta"].get("max_hold_bars", 30)) if l4_schema >= 4 and p.get("l4_meta") else int(time_arr[i] * 1.2)
                 hold = 0
         else:
             hold += 1
@@ -317,7 +345,45 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
             exit_price = 0.0
             exit_reason = ""
 
-            if in_pos == 1:
+            if l4_schema >= 4 and p.get("l4_meta"):
+                if in_pos == 1:
+                    live_mfe_atr = max(live_mfe_atr, max(0.0, (df["high"].iloc[i] - entry_price) / entry_atr))
+                    live_mae_atr = max(live_mae_atr, max(0.0, (entry_price - df["low"].iloc[i]) / entry_atr))
+                    unreal = (df["close"].iloc[i] - entry_price) / entry_atr
+                else:
+                    live_mfe_atr = max(live_mfe_atr, max(0.0, (entry_price - df["low"].iloc[i]) / entry_atr))
+                    live_mae_atr = max(live_mae_atr, max(0.0, (df["high"].iloc[i] - entry_price) / entry_atr))
+                    unreal = (entry_price - df["close"].iloc[i]) / entry_atr
+                feat_vec = _layer4_policy_state_vector(
+                    l4_base_x[i],
+                    hold_bars=float(hold),
+                    max_hold_bars=float(max_hold),
+                    side=float(in_pos),
+                    unreal_pnl_atr=float(unreal),
+                    mfe_atr_live=float(live_mfe_atr),
+                    mae_atr_live=float(live_mae_atr),
+                ).reshape(1, -1)
+                exit_prob = float(p["l4_exit"].predict(feat_vec)[0])
+                value_left = float(p["l4_value"].predict(feat_vec)[0])
+                pred_exit_prob[i] = exit_prob
+                pred_value_left[i] = value_left
+                if hawkes_lambda > hawkes_threshold:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Hawkes_BOCPD_Panic"
+                elif (in_pos == 1 and sz < -0.2) or (in_pos == -1 and sz > 0.2):
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Signal_Flip"
+                elif exit_prob >= float(p["l4_meta"].get("exit_prob_threshold", 0.55)) and value_left <= float(p["l4_meta"].get("value_left_threshold", 0.02)):
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Policy_Exit"
+                elif hold >= max_hold:
+                    exit_signal = True
+                    exit_price = float(nxt_open)
+                    exit_reason = "Policy_MaxHold"
+            elif in_pos == 1:
                 # Emergency Exit (BOCPD Proxy / Hawkes Volatility Spike)
                 if hawkes_lambda > hawkes_threshold:
                     exit_signal = True

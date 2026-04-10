@@ -69,10 +69,10 @@ def _compute_opportunity_triplet_infer(
         m = st == argmax_idx
         if not m.any():
             continue
-        mfe_p_log = models[predicted_regime]["mfe"].predict(X[m])
-        mae_p_log = models[predicted_regime]["mae"].predict(X[m])
-        mf = np.clip(np.expm1(mfe_p_log), 0.0, None)
-        ma = np.clip(np.expm1(mae_p_log), 0.01, None)
+        mf = models[predicted_regime]["mfe"].predict(X[m])
+        ma = models[predicted_regime]["mae"].predict(X[m])
+        mf = np.clip(mf, 0.0, None)
+        ma = np.clip(ma, 0.01, None)
         opp[m] = np.log1p(mf) - np.log1p(ma)
         mfe_p[m] = mf
         mae_p[m] = ma
@@ -292,19 +292,32 @@ def load_layered_pa_pipeline():
         with open(os.path.join(MODEL_DIR, "exit_manager_meta.pkl"), "rb") as f:
             l4_meta = pickle.load(f)
         
-        if l4_meta.get("l4_schema", 1) >= 3:
+        if l4_meta.get("l4_schema", 1) >= 4:
+            l4_tp = None
+            l4_sl = None
+            l4_time = None
+            l4_exit = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["exit"]))
+            l4_value = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["value"]))
+        elif l4_meta.get("l4_schema", 1) >= 3:
             l4_tp = [lgb.Booster(model_file=os.path.join(MODEL_DIR, fn)) for fn in l4_meta["model_files"]["tp_ordinal"]]
             l4_sl = [lgb.Booster(model_file=os.path.join(MODEL_DIR, fn)) for fn in l4_meta["model_files"]["sl_ordinal"]]
+            l4_exit = None
+            l4_value = None
         else:
             l4_tp = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["tp"]))
             l4_sl = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["sl"]))
+            l4_exit = None
+            l4_value = None
             
-        l4_time = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["time"]))
+        if l4_meta.get("l4_schema", 1) < 4:
+            l4_time = lgb.Booster(model_file=os.path.join(MODEL_DIR, l4_meta["model_files"]["time"]))
     except Exception:
         l4_meta = None
         l4_tp = None
         l4_sl = None
         l4_time = None
+        l4_exit = None
+        l4_value = None
 
     return {
         "tcn": tcn_model,
@@ -327,5 +340,7 @@ def load_layered_pa_pipeline():
         "l4_tp": l4_tp,
         "l4_sl": l4_sl,
         "l4_time": l4_time,
+        "l4_exit": l4_exit,
+        "l4_value": l4_value,
         "l4_meta": l4_meta,
     }

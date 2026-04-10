@@ -43,6 +43,10 @@ class LabelConfig:
     ma_period: int
     tr_lookback: int
     hold_bars: int
+    decision_horizon_bars: int
+    theta_start_bars: int
+    theta_decay_bars: float
+    adverse_penalty: float
     atr_multiplier_tp: float
     atr_multiplier_sl: float
     warmup_bars: int
@@ -59,6 +63,10 @@ def parse_args() -> LabelConfig:
     parser.add_argument("--ma-period", type=int, default=20)
     parser.add_argument("--tr-lookback", type=int, default=40)
     parser.add_argument("--hold-bars", type=int, default=30)
+    parser.add_argument("--decision-horizon-bars", type=int, default=20)
+    parser.add_argument("--theta-start-bars", type=int, default=15)
+    parser.add_argument("--theta-decay-bars", type=float, default=5.0)
+    parser.add_argument("--adverse-penalty", type=float, default=1.0)
     parser.add_argument("--atr-multiplier-tp", type=float, default=2.0)
     parser.add_argument("--atr-multiplier-sl", type=float, default=1.0)
     parser.add_argument("--warmup-bars", type=int, default=50)
@@ -75,6 +83,10 @@ def parse_args() -> LabelConfig:
         ma_period=args.ma_period,
         tr_lookback=args.tr_lookback,
         hold_bars=args.hold_bars,
+        decision_horizon_bars=args.decision_horizon_bars,
+        theta_start_bars=args.theta_start_bars,
+        theta_decay_bars=args.theta_decay_bars,
+        adverse_penalty=args.adverse_penalty,
         atr_multiplier_tp=args.atr_multiplier_tp,
         atr_multiplier_sl=args.atr_multiplier_sl,
         warmup_bars=args.warmup_bars,
@@ -309,7 +321,16 @@ def label_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["signal_reason"] = signal_reason
     return df
 
-def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: float = 2.0, atr_multiplier_sl: float = 1.0) -> pd.DataFrame:
+def label_outcomes(
+    df: pd.DataFrame,
+    hold_bars: int = 30,
+    decision_horizon_bars: int = 20,
+    theta_start_bars: int = 15,
+    theta_decay_bars: float = 5.0,
+    adverse_penalty: float = 1.0,
+    atr_multiplier_tp: float = 2.0,
+    atr_multiplier_sl: float = 1.0,
+) -> pd.DataFrame:
     """③ 前瞻审计 + 因果隔离: Only labels look into the future for outcome mapping."""
     df = df.copy()
     n = len(df)
@@ -318,6 +339,15 @@ def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: flo
     max_adverse = np.zeros(n, dtype=float)
     exit_bar = np.zeros(n, dtype=int)
     reward_risk = np.zeros(n, dtype=float)
+    decision_mfe_atr = np.zeros(n, dtype=float)
+    decision_mae_atr = np.zeros(n, dtype=float)
+    decision_peak_bar = np.zeros(n, dtype=int)
+    decision_theta_decay = np.ones(n, dtype=float)
+    decision_net_edge_atr = np.zeros(n, dtype=float)
+    optimal_tp_atr = np.zeros(n, dtype=float)
+    optimal_sl_atr = np.zeros(n, dtype=float)
+    optimal_exit_bar = np.zeros(n, dtype=int)
+    optimal_net_edge_atr = np.zeros(n, dtype=float)
 
     signal = df["signal"].to_numpy(dtype=int)
     close = df["close"].to_numpy(dtype=float)
@@ -325,6 +355,10 @@ def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: flo
     high = df["high"].to_numpy(dtype=float)
     low = df["low"].to_numpy(dtype=float)
     atr_arr = df["atr"].to_numpy(dtype=float)
+    decision_horizon_bars = max(1, int(decision_horizon_bars))
+    theta_start_bars = max(0, int(theta_start_bars))
+    theta_decay_bars = max(float(theta_decay_bars), 1e-6)
+    adverse_penalty = max(float(adverse_penalty), 0.0)
 
     bar_iter = _tq(range(n), desc="label_outcomes", unit="bar", leave=False, mininterval=0.5)
     for i in bar_iter:
@@ -346,6 +380,13 @@ def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: flo
 
         max_fav = max_adv = 0.0
         last_exit_bar = 0
+        best_decision_fav = 0.0
+        best_decision_adv = 0.0
+        best_peak_bar = 0
+        best_net_edge = float("-inf")
+        best_tp = 0.0
+        best_sl = 0.0
+        best_bar = 0
 
         for j in range(i + 1, min(i + 1 + hold_bars, n)):
             last_exit_bar = j - i
@@ -354,6 +395,20 @@ def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: flo
                 adverse = entry_price - low[j]
                 max_fav = max(max_fav, favorable)
                 max_adv = max(max_adv, adverse)
+                favorable_atr = favorable / atr
+                adverse_atr = adverse / atr
+                if last_exit_bar <= decision_horizon_bars:
+                    if favorable_atr > best_decision_fav + 1e-12:
+                        best_decision_fav = favorable_atr
+                        best_peak_bar = last_exit_bar
+                    best_decision_adv = max(best_decision_adv, adverse_atr)
+                bar_decay = np.exp(-max(last_exit_bar - theta_start_bars, 0) / theta_decay_bars)
+                net_edge = favorable_atr * bar_decay - adverse_penalty * adverse_atr
+                if net_edge > best_net_edge + 1e-12:
+                    best_net_edge = net_edge
+                    best_tp = favorable_atr
+                    best_sl = adverse_atr
+                    best_bar = last_exit_bar
                 if low[j] <= sl:
                     outcome[i] = -1
                     exit_bar[i] = last_exit_bar
@@ -367,6 +422,20 @@ def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: flo
                 adverse = high[j] - entry_price
                 max_fav = max(max_fav, favorable)
                 max_adv = max(max_adv, adverse)
+                favorable_atr = favorable / atr
+                adverse_atr = adverse / atr
+                if last_exit_bar <= decision_horizon_bars:
+                    if favorable_atr > best_decision_fav + 1e-12:
+                        best_decision_fav = favorable_atr
+                        best_peak_bar = last_exit_bar
+                    best_decision_adv = max(best_decision_adv, adverse_atr)
+                bar_decay = np.exp(-max(last_exit_bar - theta_start_bars, 0) / theta_decay_bars)
+                net_edge = favorable_atr * bar_decay - adverse_penalty * adverse_atr
+                if net_edge > best_net_edge + 1e-12:
+                    best_net_edge = net_edge
+                    best_tp = favorable_atr
+                    best_sl = adverse_atr
+                    best_bar = last_exit_bar
                 if high[j] >= sl:
                     outcome[i] = -1
                     exit_bar[i] = last_exit_bar
@@ -382,12 +451,31 @@ def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: flo
         max_adverse[i] = max_adv
         if sl_distance > 0:
             reward_risk[i] = max_fav / sl_distance
+        decision_mfe_atr[i] = best_decision_fav
+        decision_mae_atr[i] = best_decision_adv
+        decision_peak_bar[i] = best_peak_bar
+        theta_decay = np.exp(-max(best_peak_bar - theta_start_bars, 0) / theta_decay_bars) if best_peak_bar > 0 else 1.0
+        decision_theta_decay[i] = theta_decay
+        decision_net_edge_atr[i] = best_decision_fav * theta_decay - adverse_penalty * best_decision_adv
+        optimal_tp_atr[i] = best_tp
+        optimal_sl_atr[i] = best_sl
+        optimal_exit_bar[i] = best_bar
+        optimal_net_edge_atr[i] = 0.0 if best_net_edge == float("-inf") else best_net_edge
 
     df["outcome"] = outcome
     df["max_favorable"] = max_favorable
     df["max_adverse"] = max_adverse
     df["exit_bar"] = exit_bar
     df["reward_risk"] = reward_risk
+    df["decision_mfe_atr"] = decision_mfe_atr
+    df["decision_mae_atr"] = decision_mae_atr
+    df["decision_peak_bar"] = decision_peak_bar
+    df["decision_theta_decay"] = decision_theta_decay
+    df["decision_net_edge_atr"] = decision_net_edge_atr
+    df["optimal_tp_atr"] = optimal_tp_atr
+    df["optimal_sl_atr"] = optimal_sl_atr
+    df["optimal_exit_bar"] = optimal_exit_bar
+    df["optimal_net_edge_atr"] = optimal_net_edge_atr
     return df
 
 def auto_label_pipeline(df: pd.DataFrame, config: LabelConfig) -> pd.DataFrame:
@@ -406,6 +494,10 @@ def auto_label_pipeline(df: pd.DataFrame, config: LabelConfig) -> pd.DataFrame:
             lambda d: label_outcomes(
                 d,
                 hold_bars=config.hold_bars,
+                decision_horizon_bars=config.decision_horizon_bars,
+                theta_start_bars=config.theta_start_bars,
+                theta_decay_bars=config.theta_decay_bars,
+                adverse_penalty=config.adverse_penalty,
                 atr_multiplier_tp=config.atr_multiplier_tp,
                 atr_multiplier_sl=config.atr_multiplier_sl,
             ),

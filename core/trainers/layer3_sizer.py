@@ -17,7 +17,6 @@ from tqdm.auto import tqdm
 
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
-from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
@@ -30,8 +29,6 @@ from core.trainers.layer2b_quality import (
     _apply_cp_skip,
     _reconstruct_quality_classes,
     _build_trade_quality_targets,
-    focal_loss_lgb,
-    focal_loss_lgb_eval_error,
 )
 
 def _layer3_fill_regime_calibrated(
@@ -142,6 +139,7 @@ def train_execution_sizer(
     l3_flat_tau = float(os.environ.get("L3_FLAT_TAU", "0.05"))
     l3_flat_w = float(os.environ.get("L3_FLAT_WEIGHT", "0.35"))
     l3_pos_multiplier = float(os.environ.get("L3_POS_MULTIPLIER", "3.0"))  # Amplify L3 raw prediction
+    opt_cfg = _options_target_config()
 
     chunk = _layer3_chunk_rows()
     print(f"  Memory: chunked predicts (LAYER3_CHUNK={chunk}); shallow df, no full feature matrices")
@@ -197,14 +195,13 @@ def train_execution_sizer(
     class_size = np.array([1.0, 0.0, 0.0, -1.0], dtype=float)
     base_size = 0.7 * class_size[y_cls] + 0.3 * class_size[y_cls_est]
 
-    safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values, 1e-3)
-    edge = (work["max_favorable"].values - work["max_adverse"].values) / safe_atr
-    edge = np.clip(edge, -3.0, 3.0)
-    edge_scale = np.clip(0.90 + 0.30 * edge, 0.0, 1.60)
+    edge = np.clip(_decision_edge_atr_array(work), -3.0, 3.0)
+    edge_scale = np.clip(0.75 + 0.35 * edge, 0.0, 1.75)
     y_target = np.clip(base_size * edge_scale, -1.0, 1.0)
-    
-    y_tp_target = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
-    y_sl_target = np.clip(work["max_adverse"].values / safe_atr, 0.0, 3.0)
+
+    opt_tp_atr, opt_sl_atr, _ = _optimal_exit_target_arrays(work)
+    y_tp_target = np.clip(opt_tp_atr, 0.0, 6.0)
+    y_sl_target = np.clip(opt_sl_atr, 0.0, 3.0)
 
     tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
@@ -290,6 +287,11 @@ def train_execution_sizer(
         f"| flat weight={l3_flat_w}  τ={l3_flat_tau}",
     )
     print(
+        f"  Target config — decision_h={opt_cfg['decision_horizon_bars']}  "
+        f"theta_start={opt_cfg['theta_start_bars']}  theta_decay={opt_cfg['theta_decay_bars']:.1f}  "
+        f"adv_penalty={opt_cfg['adverse_penalty']:.2f}"
+    )
+    print(
         f"  Active (|y|≥τ) — train: {(np.abs(y_train) >= l3_flat_tau).mean():.1%} | "
         f"test: {(np.abs(y_test) >= l3_flat_tau).mean():.1%}",
     )
@@ -298,8 +300,8 @@ def train_execution_sizer(
     es_cb = _lgb_train_callbacks(90 if FAST_TRAIN_MODE else 120)
 
     gate_params = {
-        # Custom objective used: focal_loss_lgb
-        "metric": "None",
+        "objective": "binary",
+        "metric": "binary_logloss",
         "boosting_type": "gbdt",
         "learning_rate": 0.02,
         "num_leaves": 48,
@@ -317,14 +319,12 @@ def train_execution_sizer(
     }
     d_gate_tr = lgb.Dataset(X_train, label=y_gate_train, feature_name=exec_feat_cols, free_raw_data=True)
     d_gate_va = lgb.Dataset(X_val, label=y_gate_val, feature_name=exec_feat_cols, free_raw_data=True)
-    gate_params["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
     model_gate = lgb.train(
         gate_params,
         d_gate_tr,
         num_boost_round=rounds,
         valid_sets=[d_gate_va],
         callbacks=es_cb,
-        feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
     )
 
     size_params = {
@@ -357,7 +357,7 @@ def train_execution_sizer(
         callbacks=es_cb,
     )
 
-    pred_g = 1.0 / (1.0 + np.exp(-model_gate.predict(X_test)))
+    pred_g = model_gate.predict(X_test)
     pred_s = model_size.predict(X_test)
     pred = np.clip(pred_g * pred_s * l3_pos_multiplier, -1.0, 1.0)
 
@@ -397,11 +397,15 @@ def train_execution_sizer(
         "position_clip": [-1.0, 1.0],
         "combine_rule": f"clip(p_gate * pred_size * {l3_pos_multiplier}, -1, 1)",
         "pos_multiplier": l3_pos_multiplier,
-        "target_definition": "clip(class_blend * edge_scale, -1, 1); same tier blend as v1",
+        "target_definition": "clip(class_blend * decision_edge_scale, -1, 1); decision_edge uses horizon-limited, theta-decayed net edge",
         "flat_tau": l3_flat_tau,
         "flat_sample_weight": l3_flat_w,
         "gate_metric": "auc",
         "size_objective": "huber",
+        "decision_horizon_bars": opt_cfg["decision_horizon_bars"],
+        "theta_start_bars": opt_cfg["theta_start_bars"],
+        "theta_decay_bars": opt_cfg["theta_decay_bars"],
+        "adverse_penalty": opt_cfg["adverse_penalty"],
         "uses_garch": bool(garch_cols),
         "garch_cols": garch_cols,
         "pa_key_cols": pa_key_cols,

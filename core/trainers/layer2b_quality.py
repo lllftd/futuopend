@@ -18,7 +18,6 @@ from tqdm.auto import tqdm
 
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
-from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
@@ -87,19 +86,16 @@ def _train_regime_opp_regression_models(
             continue
         idx_sub = np.where(mtr)[0]
         X_g = X_tr[idx_sub]
-        y_mfe_g_raw = mfe_tr[idx_sub]
-        y_mae_g_raw = mae_tr[idx_sub]
+        y_mfe_g = mfe_tr[idx_sub]
+        y_mae_g = mae_tr[idx_sub]
         
-        w_base = _opp_regression_sample_weights(y_mfe_g_raw, predicted_regime)
-
-        y_mfe_g = np.log1p(y_mfe_g_raw)
-        y_mae_g = np.log1p(y_mae_g_raw)
+        w_base = _opp_regression_sample_weights(y_mfe_g, predicted_regime)
 
         if nca >= 200:
             idx_va = np.where(mca)[0]
             X_va = X_ca[idx_va]
-            y_mfe_va = np.log1p(mfe_ca[idx_va])
-            y_mae_va = np.log1p(mae_ca[idx_va])
+            y_mfe_va = mfe_ca[idx_va]
+            y_mae_va = mae_ca[idx_va]
         else:
             tail = min(5000, ntr)
             X_va = X_g[-tail:]
@@ -112,7 +108,7 @@ def _train_regime_opp_regression_models(
         m_mfe = lgb.train(
             base_reg, d_mfe_tr, num_boost_round=reg_rounds, valid_sets=[d_mfe_va], callbacks=cb,
         )
-        w_mae = _opp_regression_sample_weights(y_mae_g_raw, predicted_regime)
+        w_mae = _opp_regression_sample_weights(y_mae_g, predicted_regime)
         d_mae_tr = lgb.Dataset(X_g, label=y_mae_g, weight=w_mae, feature_name=all_bo_feats, free_raw_data=False)
         d_mae_va = lgb.Dataset(X_va, label=y_mae_va, feature_name=all_bo_feats, free_raw_data=False)
         print(f"    [L2b regression] {predicted_regime}: train MAE head …", flush=True)
@@ -135,11 +131,11 @@ def _train_regime_opp_regression_models(
         m = gix_cal == argmax_idx
         if not m.any():
             continue
-        mfe_p_log = models[predicted_regime]["mfe"].predict(X_ca[m])
-        mae_p_log = models[predicted_regime]["mae"].predict(X_ca[m])
-        mfe_p = np.clip(np.expm1(mfe_p_log), 0.0, None)
-        mae_p = np.clip(np.expm1(mae_p_log), 0.01, None)
-        opp_cal[m] = np.log1p(mfe_p) - np.log1p(mae_p)
+        mf = models[predicted_regime]["mfe"].predict(X_ca[m])
+        ma = models[predicted_regime]["mae"].predict(X_ca[m])
+        mf = np.clip(mf, 0.0, None)
+        ma = np.clip(ma, 0.01, None)
+        opp_cal[m] = np.log1p(mf) - np.log1p(ma)
 
     opp_nonzero = opp_cal[opp_cal != 0]
     if len(opp_nonzero) > 0:
@@ -215,10 +211,10 @@ def _compute_opportunity_triplet(
         m = st == argmax_idx
         if not m.any():
             continue
-        mfe_p_log = models[predicted_regime]["mfe"].predict(X[m])
-        mae_p_log = models[predicted_regime]["mae"].predict(X[m])
-        mf = np.clip(np.expm1(mfe_p_log), 0.0, None)
-        ma = np.clip(np.expm1(mae_p_log), 0.01, None)
+        mf = models[predicted_regime]["mfe"].predict(X[m])
+        ma = models[predicted_regime]["mae"].predict(X[m])
+        mf = np.clip(mf, 0.0, None)
+        ma = np.clip(ma, 0.01, None)
         opp[m] = np.log1p(mf) - np.log1p(ma)
         mfe_p[m] = mf
         mae_p[m] = ma
@@ -329,9 +325,8 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     # ---------------------------------------------------------
     # OPTIONS GAMMA SCALPING: Time-decay on MFE
     # ---------------------------------------------------------
-    # If a trade takes longer than 15 bars (15 mins) to reach its MFE, the option theta/IV crush
-    # destroys the premium. We artificially decay the MFE so KMeans correctly labels slow trades as CHOP.
-    gamma_decay = np.exp(-np.maximum(hold_time - 15, 0) / 5.0)
+    # Penalize slow favorable moves so trade-quality labels reflect theta-sensitive intraday options.
+    gamma_decay = _theta_decay_from_bars(hold_time)
     mfe = mfe * gamma_decay
     
     rr = mfe / np.maximum(mae, 0.1)
@@ -452,61 +447,24 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     return y
 
 
-def focal_loss_lgb_eval_error(y_pred, dtrain, alpha=0.25, gamma=2.0):
-    """
-    Custom eval metric for Focal Loss to be used with LightGBM.
-    Returns (eval_name, eval_result, is_higher_better).
-    """
-    label = dtrain.get_label()
-    # Apply sigmoid to raw predictions
-    p = 1.0 / (1.0 + np.exp(-y_pred))
-    
-    # Calculate the loss
-    loss = - alpha * (1 - p)**gamma * label * np.log(np.maximum(p, 1e-7)) \
-           - (1 - alpha) * p**gamma * (1 - label) * np.log(np.maximum(1 - p, 1e-7))
-    
-    return 'focal_loss', np.mean(loss), False
-
-
-def focal_loss_lgb(y_pred, dtrain, alpha=0.25, gamma=2.0):
-    """
-    Custom Focal Loss objective function for LightGBM.
-    y_pred is the raw margin (before sigmoid).
-    """
-    label = dtrain.get_label()
-    # Apply sigmoid to get probabilities
-    p = 1.0 / (1.0 + np.exp(-y_pred))
-    
-    # Gradient (first derivative)
-    # df/dx = (p - y) * alpha_t * [ gamma * (1-p_t)^(gamma-1) * p_t * log(p_t) + (1-p_t)^gamma ]
-    # A simplified but effective gradient approximation for focal loss:
-    pt = np.where(label == 1, p, 1.0 - p)
-    alpha_t = np.where(label == 1, alpha, 1.0 - alpha)
-    
-    grad = (p - label) * alpha_t * ((1.0 - pt)**gamma)
-    
-    # Hessian (second derivative) approximation
-    # For stability in GBDT, using the standard binary cross-entropy hessian multiplied by the focal weight
-    hess = alpha_t * ((1.0 - pt)**gamma) * p * (1.0 - p)
-    
-    return grad, hess
-
-
-def _binary_weights(y: np.ndarray, timestamps: np.ndarray, pos_boost: float = 1.0) -> np.ndarray:
-    """Balanced weights for binary tasks with recency adjustment."""
+def _binary_recency_weights(timestamps: np.ndarray) -> np.ndarray:
+    """Recency-only weights for native BCE training with scale_pos_weight."""
     ts = pd.to_datetime(timestamps)
-    n = len(y)
-    pos = max(int((y == 1).sum()), 1)
-    neg = max(n - pos, 1)
-    w_pos = n / (2.0 * pos)
-    w_neg = n / (2.0 * neg)
-    w = np.where(y == 1, w_pos * pos_boost, w_neg).astype(float)
-
     days_from_end = (ts.max() - ts).total_seconds() / 86400
     max_days = max(days_from_end.max(), 1.0)
     recency = 0.85 + 0.15 * (1.0 - days_from_end / max_days)
-    w *= recency.values
-    return w
+    return recency.values.astype(float)
+
+
+def _binary_scale_pos_weight(y: np.ndarray, *, max_spw: float = 50.0) -> float:
+    """Native LightGBM class prior correction for rare positive gates."""
+    pos = int((y == 1).sum())
+    neg = int((y == 0).sum())
+    if pos <= 0:
+        return max_spw
+    if neg <= 0:
+        return 1.0
+    return float(np.clip(neg / max(pos, 1), 1.0, max_spw))
 
 
 def _reconstruct_quality_classes(
@@ -781,19 +739,23 @@ def train_trade_quality_classifier(
 
     print("  [L2b train] Dedicated Step1 LONG gate binary classifier …", flush=True)
     c_long, clean_long = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 LONG")
-    # Massive pos_boost to force model to learn the rare signals instead of predicting CHOP for everything
-    w_long_train = _binary_weights(y_long_train, t[train_mask], pos_boost=12.0)
-    w_long_cal = _binary_weights(y_long_cal, t[cal_mask], pos_boost=6.0)
+    w_long_train = _binary_recency_weights(t[train_mask])
+    w_long_cal = _binary_recency_weights(t[cal_mask])
     d_long_train = lgb.Dataset(X_train, label=y_long_train, weight=w_long_train, feature_name=all_bo_feats, free_raw_data=False)
     d_long_cal = lgb.Dataset(X_cal, label=y_long_cal, weight=w_long_cal, feature_name=all_bo_feats, free_raw_data=False)
-    
+    long_spw = _binary_scale_pos_weight(y_long_train)
+    print(f"    [L2b gate] LONG pos_rate={y_long_train.mean():.3%} scale_pos_weight={long_spw:.2f}")
+
     common_params_long = common_params.copy()
-    common_params_long["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
-    
+    common_params_long.update({
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "scale_pos_weight": long_spw,
+    })
+
     try:
         step1_long_model = lgb.train(
             common_params_long, d_long_train, num_boost_round=rounds, valid_sets=[d_long_cal], callbacks=c_long,
-            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
     finally:
         for fn in clean_long:
@@ -801,26 +763,31 @@ def train_trade_quality_classifier(
 
     print("  [L2b train] Dedicated Step1 SHORT gate binary classifier …", flush=True)
     c_short, clean_short = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 SHORT")
-    w_short_train = _binary_weights(y_short_train, t[train_mask], pos_boost=18.0)
-    w_short_cal = _binary_weights(y_short_cal, t[cal_mask], pos_boost=8.0)
+    w_short_train = _binary_recency_weights(t[train_mask])
+    w_short_cal = _binary_recency_weights(t[cal_mask])
     d_short_train = lgb.Dataset(X_train, label=y_short_train, weight=w_short_train, feature_name=all_bo_feats, free_raw_data=False)
     d_short_cal = lgb.Dataset(X_cal, label=y_short_cal, weight=w_short_cal, feature_name=all_bo_feats, free_raw_data=False)
-    
+    short_spw = _binary_scale_pos_weight(y_short_train)
+    print(f"    [L2b gate] SHORT pos_rate={y_short_train.mean():.3%} scale_pos_weight={short_spw:.2f}")
+
     common_params_short = common_params.copy()
-    common_params_short["objective"] = lambda preds, train_data: focal_loss_lgb(preds, train_data, alpha=0.25, gamma=2.0)
-    
+    common_params_short.update({
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "scale_pos_weight": short_spw,
+    })
+
     try:
         step1_short_model = lgb.train(
             common_params_short, d_short_train, num_boost_round=rounds, valid_sets=[d_short_cal], callbacks=c_short,
-            feval=lambda preds, train_data: focal_loss_lgb_eval_error(preds, train_data, alpha=0.25, gamma=2.0),
         )
     finally:
         for fn in clean_short:
             fn()
     
     rp_cal = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
-    p_long_cal = 1.0 / (1.0 + np.exp(-step1_long_model.predict(X_cal)))
-    p_short_cal = 1.0 / (1.0 + np.exp(-step1_short_model.predict(X_cal)))
+    p_long_cal = step1_long_model.predict(X_cal)
+    p_short_cal = step1_short_model.predict(X_cal)
     
     # 1. Range Regime Penalty: heavily slash probabilities in range regimes
     p_range_mass_cal = rp_cal[:, RANGE_REGIME_INDICES].sum(axis=1)
@@ -869,8 +836,8 @@ def train_trade_quality_classifier(
     # Evaluate cascade
     rp_test = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
     opp_te = _compute_opportunity_scores(X_test, rp_test, reg_models)
-    p_long_te = 1.0 / (1.0 + np.exp(-step1_long_model.predict(X_test)))
-    p_short_te = 1.0 / (1.0 + np.exp(-step1_short_model.predict(X_test)))
+    p_long_te = step1_long_model.predict(X_test)
+    p_short_te = step1_short_model.predict(X_test)
     
     # Apply identical range penalty to test set
     p_range_mass_test = rp_test[:, RANGE_REGIME_INDICES].sum(axis=1)
