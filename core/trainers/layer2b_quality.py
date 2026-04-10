@@ -45,9 +45,9 @@ def _train_regime_opp_regression_models(
     Six regimes ⇒ fewer routed cal rows per bucket than old 3-way groups — default min row
     count is lower (``L2B_OPP_CAL_MIN_ROWS``).
     """
-    reg_rounds = 800 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ROUNDS", "2000"))
-    reg_es = 80 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ES", "150"))
-    min_prec = float(os.environ.get("L2B_OPP_MIN_PRECISION", "0.30"))
+    reg_rounds = 1500 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ROUNDS", "4000"))
+    reg_es = 150 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ES", "300"))
+    min_prec = float(os.environ.get("L2B_OPP_MIN_PRECISION", "0.20"))  # Relaxed precision floor to allow more opportunities
     min_cal_for_opp_thr = int(os.environ.get("L2B_OPP_CAL_MIN_ROWS", "150"))
     base_reg = {
         "boosting_type": "gbdt",
@@ -90,6 +90,7 @@ def _train_regime_opp_regression_models(
         y_mfe_g = mfe_tr[idx_sub]
         y_mae_g = mae_tr[idx_sub]
         w_base = _opp_regression_sample_weights(y_mfe_g, predicted_regime)
+        w_base *= 1.5  # Boost regression weight globally to handle outlier penalty of L1 loss
 
         if nca >= 200:
             idx_va = np.where(mca)[0]
@@ -109,6 +110,7 @@ def _train_regime_opp_regression_models(
             base_reg, d_mfe_tr, num_boost_round=reg_rounds, valid_sets=[d_mfe_va], callbacks=cb,
         )
         w_mae = _opp_regression_sample_weights(y_mae_g, predicted_regime)
+        w_mae *= 1.5
         d_mae_tr = lgb.Dataset(X_g, label=y_mae_g, weight=w_mae, feature_name=all_bo_feats, free_raw_data=False)
         d_mae_va = lgb.Dataset(X_va, label=y_mae_va, feature_name=all_bo_feats, free_raw_data=False)
         print(f"    [L2b regression] {predicted_regime}: train MAE head …", flush=True)
@@ -778,8 +780,8 @@ def train_trade_quality_classifier(
     print("  [L2b train] Dedicated Step1 LONG gate binary classifier …", flush=True)
     c_long, clean_long = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 LONG")
     # Massive pos_boost to force model to learn the rare signals instead of predicting CHOP for everything
-    w_long_train = _binary_weights(y_long_train, t[train_mask], pos_boost=8.0)
-    w_long_cal = _binary_weights(y_long_cal, t[cal_mask], pos_boost=4.0)
+    w_long_train = _binary_weights(y_long_train, t[train_mask], pos_boost=12.0)
+    w_long_cal = _binary_weights(y_long_cal, t[cal_mask], pos_boost=6.0)
     d_long_train = lgb.Dataset(X_train, label=y_long_train, weight=w_long_train, feature_name=all_bo_feats, free_raw_data=False)
     d_long_cal = lgb.Dataset(X_cal, label=y_long_cal, weight=w_long_cal, feature_name=all_bo_feats, free_raw_data=False)
     
@@ -797,8 +799,8 @@ def train_trade_quality_classifier(
 
     print("  [L2b train] Dedicated Step1 SHORT gate binary classifier …", flush=True)
     c_short, clean_short = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 SHORT")
-    w_short_train = _binary_weights(y_short_train, t[train_mask], pos_boost=8.0)
-    w_short_cal = _binary_weights(y_short_cal, t[cal_mask], pos_boost=4.0)
+    w_short_train = _binary_weights(y_short_train, t[train_mask], pos_boost=18.0)
+    w_short_cal = _binary_weights(y_short_cal, t[cal_mask], pos_boost=8.0)
     d_short_train = lgb.Dataset(X_train, label=y_short_train, weight=w_short_train, feature_name=all_bo_feats, free_raw_data=False)
     d_short_cal = lgb.Dataset(X_cal, label=y_short_cal, weight=w_short_cal, feature_name=all_bo_feats, free_raw_data=False)
     
@@ -825,21 +827,21 @@ def train_trade_quality_classifier(
     
     # 2. Threshold Search: Prioritize Precision via F0.5 score + strict Precision floor >= 10%
     best_f05_l, best_thr_l = 0.0, 0.7
-    for thr_c in np.arange(0.15, 0.95, 0.02):
+    for thr_c in np.arange(0.08, 0.95, 0.02):
         pr = (p_long_cal >= thr_c).astype(int)
         f05 = fbeta_score(y_long_cal, pr, beta=0.5, zero_division=0)
         prec = precision_score(y_long_cal, pr, zero_division=0)
-        # Relaxed precision floor from 15% to 10% to improve recall for rare LONG / SHORT opportunities
-        if f05 > best_f05_l and prec >= 0.10:
+        # Relaxed precision floor from 10% to 5% to force SHORT/LONG discovery at the cost of lower hit rate
+        if f05 > best_f05_l and prec >= 0.05:
             best_f05_l, best_thr_l = f05, thr_c
     thr_long_cal = best_thr_l if best_f05_l > 0 else 0.85
 
     best_f05_s, best_thr_s = 0.0, 0.7
-    for thr_c in np.arange(0.15, 0.95, 0.02):
+    for thr_c in np.arange(0.08, 0.95, 0.02):
         pr = (p_short_cal >= thr_c).astype(int)
         f05 = fbeta_score(y_short_cal, pr, beta=0.5, zero_division=0)
         prec = precision_score(y_short_cal, pr, zero_division=0)
-        if f05 > best_f05_s and prec >= 0.10:
+        if f05 > best_f05_s and prec >= 0.05:
             best_f05_s, best_thr_s = f05, thr_c
     thr_short_cal = best_thr_s if best_f05_s > 0 else 0.85
     
