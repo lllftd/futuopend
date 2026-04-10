@@ -360,6 +360,14 @@ def _mfe_mae_atr_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
     mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
     mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
+    
+    # Options Gamma Scalping: Apply time-decay penalty to regression targets
+    if "exit_bar" in df.columns:
+        hold_time = np.maximum(df["exit_bar"].fillna(0).values.astype(float), 0.0)
+        # For 1-min K-lines: penalize trades taking > 15 minutes to reach MFE
+        gamma_decay = np.exp(-np.maximum(hold_time - 15.0, 0.0) / 5.0)
+        mfe = mfe * gamma_decay
+        
     return mfe.astype(np.float64), mae.astype(np.float64)
 
 

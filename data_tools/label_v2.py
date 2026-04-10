@@ -58,7 +58,7 @@ def parse_args() -> LabelConfig:
     parser.add_argument("--atr-period", type=int, default=20)
     parser.add_argument("--ma-period", type=int, default=20)
     parser.add_argument("--tr-lookback", type=int, default=40)
-    parser.add_argument("--hold-bars", type=int, default=20)
+    parser.add_argument("--hold-bars", type=int, default=30)
     parser.add_argument("--atr-multiplier-tp", type=float, default=2.0)
     parser.add_argument("--atr-multiplier-sl", type=float, default=1.0)
     parser.add_argument("--warmup-bars", type=int, default=50)
@@ -309,7 +309,7 @@ def label_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["signal_reason"] = signal_reason
     return df
 
-def label_outcomes(df: pd.DataFrame, hold_bars: int = 20, atr_multiplier_tp: float = 2.0, atr_multiplier_sl: float = 1.0) -> pd.DataFrame:
+def label_outcomes(df: pd.DataFrame, hold_bars: int = 30, atr_multiplier_tp: float = 2.0, atr_multiplier_sl: float = 1.0) -> pd.DataFrame:
     """③ 前瞻审计 + 因果隔离: Only labels look into the future for outcome mapping."""
     df = df.copy()
     n = len(df)

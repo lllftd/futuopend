@@ -88,6 +88,11 @@ def train_exit_manager_layer4(
     mfe_atr = np.clip(work["max_favorable"].values / safe_atr, 0.0, 6.0)
     mae_atr = np.clip(work["max_adverse"].values / safe_atr, 0.0, 4.0)
     
+    if "exit_bar" in work.columns:
+        hold_time = np.maximum(work["exit_bar"].fillna(0).values.astype(float), 0.0)
+        gamma_decay = np.exp(-np.maximum(hold_time - 15.0, 0.0) / 5.0)
+        mfe_atr = mfe_atr * gamma_decay
+    
     # Calculate percentiles dynamically to handle bimodal distribution and empty bins
     tp_boundaries = np.quantile(mfe_atr[cal_mask], [0.25, 0.50, 0.75])
     sl_boundaries = np.quantile(mae_atr[cal_mask], [0.25, 0.50, 0.75])

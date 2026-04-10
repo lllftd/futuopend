@@ -329,9 +329,9 @@ def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
     # ---------------------------------------------------------
     # OPTIONS GAMMA SCALPING: Time-decay on MFE
     # ---------------------------------------------------------
-    # If a trade takes longer than 3 bars (15 mins) to reach its MFE, the option theta/IV crush
+    # If a trade takes longer than 15 bars (15 mins) to reach its MFE, the option theta/IV crush
     # destroys the premium. We artificially decay the MFE so KMeans correctly labels slow trades as CHOP.
-    gamma_decay = np.exp(-np.maximum(hold_time - 3, 0) / 3.0)
+    gamma_decay = np.exp(-np.maximum(hold_time - 15, 0) / 5.0)
     mfe = mfe * gamma_decay
     
     rr = mfe / np.maximum(mae, 0.1)
