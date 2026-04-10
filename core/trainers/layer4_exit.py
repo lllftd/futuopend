@@ -192,10 +192,11 @@ def train_exit_manager_layer4(
         )
         sl_models.append(m)
 
-    print("  Training Time Survival Proxy (Survival Analysis on Holding Bars)...")
+    # LightGBM has no built-in "survival" objective; y_time is bounded continuous bars → regression.
+    print("  Training time-to-exit regressor (exit_bar in bars, MAE)...")
     time_params = {
-        "objective": "survival",
-        "metric": "None",
+        "objective": "regression",
+        "metric": "mae",
         "boosting_type": "gbdt",
         "learning_rate": 0.02,
         "num_leaves": 31,
