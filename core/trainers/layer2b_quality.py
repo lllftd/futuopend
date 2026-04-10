@@ -594,23 +594,7 @@ def train_trade_quality_classifier(
 
     # Breakout-context features are computed for all bars, so NEUTRAL/CHOP are covered too.
     print("  [L2b prep] Breakout / bar-context features …", flush=True)
-    if "symbol" in work.columns:
-        bo_parts: list[pd.DataFrame] = []
-        grps = list(work.groupby("symbol", sort=False))
-        for _, g in _tq(
-            grps,
-            desc="  L2b BO feats",
-            total=len(grps),
-            unit="sym",
-            leave=False,
-        ):
-            bo_parts.append(compute_breakout_features(g))
-        bo_feats = pd.concat(bo_parts)
-        bo_feats = bo_feats.loc[work.index]
-    else:
-        bo_feats = compute_breakout_features(work)
-    for c in _tq(BO_FEAT_COLS, desc="  L2b BO → cols", leave=False, unit="col"):
-        work[c] = bo_feats[c].values
+    work = ensure_breakout_features(work)
 
     print(
         "  [L2b prep] Regime head predict + per-class calibration (all bars) …",

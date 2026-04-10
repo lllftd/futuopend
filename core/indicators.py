@@ -248,18 +248,6 @@ def cvd_divergence_features(
     )
 
 
-def ema(
-    df: pd.DataFrame,
-    length: int = 20,
-    source: PriceSource = "close",
-) -> pd.Series:
-    """Exponential Moving Average."""
-    if length <= 0:
-        raise ValueError("length must be greater than 0")
-    src = get_price_source(df, source=source)
-    return src.ewm(span=length, min_periods=length, adjust=False).mean()
-
-
 def atr(
     df: pd.DataFrame,
     length: int = 14,

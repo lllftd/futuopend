@@ -2,7 +2,7 @@
 Price Action (PA) — unified causal rules (single module).
 
 Public API: :func:`add_pa_features`
-(aliases: ``add_all_pa_features``, ``add_causal_pa_features``).
+(alias: ``add_all_pa_features``).
 All features are computed with the causal / no–look-ahead pipeline.
 """
 
@@ -3232,6 +3232,3 @@ def add_all_pa_features(
 ) -> pd.DataFrame:
     """Backward-compatible alias — use :func:`add_pa_features`."""
     return add_pa_features(df, atr_series, timeframe=timeframe)
-
-
-add_causal_pa_features = add_pa_features

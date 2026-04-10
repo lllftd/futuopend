@@ -17,6 +17,14 @@ def _default_bottleneck_dim() -> int:
     return max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
 
 
+def _default_tcn_readout_type() -> str:
+    return os.environ.get("TCN_READOUT_TYPE", "last_timestep").strip().lower() or "last_timestep"
+
+
+def _default_min_attention_seq_len() -> int:
+    return max(1, int(os.environ.get("TCN_MIN_ATTENTION_SEQ_LEN", "4")))
+
+
 class FocalLoss(nn.Module):
     """
     Focal Loss for multi-class classification.
@@ -109,6 +117,73 @@ class TemporalBlock(nn.Module):
         return (out + res) * 0.70710678
 
 
+class TemporalAttentionReadout(nn.Module):
+    """Lightweight attention pooling over causal TCN states."""
+
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _last_valid_indices(valid_mask: torch.Tensor) -> torch.Tensor:
+        time_idx = torch.arange(valid_mask.size(1), device=valid_mask.device, dtype=torch.long)
+        return (valid_mask.long() * time_idx.unsqueeze(0)).max(dim=1).values
+
+    def forward(
+        self,
+        seq: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        min_seq_len: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # seq: (B, T, H)
+        batch_size, seq_len, hidden_dim = seq.shape
+        if attention_mask is None:
+            valid_mask = torch.ones((batch_size, seq_len), device=seq.device, dtype=torch.bool)
+        else:
+            valid_mask = attention_mask.to(device=seq.device, dtype=torch.bool)
+            if valid_mask.shape != (batch_size, seq_len):
+                raise ValueError(
+                    f"attention_mask shape {tuple(valid_mask.shape)} does not match sequence "
+                    f"shape {(batch_size, seq_len)}"
+                )
+
+        valid_counts = valid_mask.sum(dim=1)
+        empty_rows = valid_counts == 0
+        if empty_rows.any():
+            valid_mask = valid_mask.clone()
+            valid_mask[empty_rows, -1] = True
+            valid_counts = valid_mask.sum(dim=1)
+
+        fallback_rows = valid_counts < max(1, int(min_seq_len))
+        last_valid_idx = self._last_valid_indices(valid_mask)
+
+        pooled = seq.new_zeros((batch_size, hidden_dim))
+        weights = seq.new_zeros((batch_size, seq_len))
+
+        if fallback_rows.any():
+            pooled[fallback_rows] = seq[fallback_rows, last_valid_idx[fallback_rows]]
+            weights[fallback_rows, last_valid_idx[fallback_rows]] = 1.0
+
+        attn_rows = ~fallback_rows
+        if attn_rows.any():
+            seq_sub = seq[attn_rows]
+            mask_sub = valid_mask[attn_rows]
+            logits = self.score(seq_sub).squeeze(-1).float()
+            logits = logits.masked_fill(~mask_sub, float("-inf"))
+            logits = logits - logits.amax(dim=1, keepdim=True)
+            attn_weights = torch.softmax(logits, dim=1).to(dtype=seq.dtype)
+            pooled[attn_rows] = torch.sum(seq_sub * attn_weights.unsqueeze(-1), dim=1)
+            weights[attn_rows] = attn_weights
+
+        return pooled, weights
+
+
 class PAStateTCN(nn.Module):
     """Causal TCN backbone + learned bottleneck z (for LGBM) + K-class regime head."""
 
@@ -121,17 +196,31 @@ class PAStateTCN(nn.Module):
         bottleneck_dim: int | None = None,
         num_classes: int = 6,
         noise_std: float = 0.02,
+        readout_type: str | None = None,
+        min_attention_seq_len: int | None = None,
     ):
         super().__init__()
         self.noise_std = noise_std
         bd = int(bottleneck_dim) if bottleneck_dim is not None else _default_bottleneck_dim()
         self.bottleneck_dim = bd
+        self.readout_type = (readout_type or _default_tcn_readout_type()).strip().lower()
+        self.min_attention_seq_len = (
+            int(min_attention_seq_len)
+            if min_attention_seq_len is not None
+            else _default_min_attention_seq_len()
+        )
         layers = []
         for i, out_ch in enumerate(num_channels):
             in_ch = input_size if i == 0 else num_channels[i - 1]
             layers.append(TemporalBlock(in_ch, out_ch, kernel_size, dilation=2**i, dropout=dropout))
         self.tcn = nn.Sequential(*layers)
         hidden_dim = num_channels[-1]
+        if self.readout_type == "attention":
+            self.readout = TemporalAttentionReadout(hidden_dim, dropout=dropout)
+        elif self.readout_type == "last_timestep":
+            self.readout = None
+        else:
+            raise ValueError(f"Unsupported TCN readout_type: {self.readout_type}")
         self.bottleneck = nn.Sequential(
             nn.Linear(hidden_dim, bd),
             nn.BatchNorm1d(bd),
@@ -139,11 +228,17 @@ class PAStateTCN(nn.Module):
         )
         self.classifier = nn.Linear(bd, num_classes)
 
-    def forward(self, x):
-        logits, _z = self.forward_with_embedding(x)
+    def forward(self, x, *, attention_mask: torch.Tensor | None = None):
+        logits, _z = self.forward_with_embedding(x, attention_mask=attention_mask)
         return logits
 
-    def forward_with_embedding(self, x):
+    def forward_with_embedding(
+        self,
+        x,
+        *,
+        return_attention: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ):
         # Apply Gaussian noise injection for robust sequence learning
         if self.training and self.noise_std > 0:
             noise = torch.randn_like(x) * self.noise_std
@@ -151,7 +246,48 @@ class PAStateTCN(nn.Module):
             
         x = x.transpose(1, 2)
         out = self.tcn(x)
-        h = out[:, :, -1]
+        attn_weights = None
+        if self.readout_type == "attention":
+            h, attn_weights = self.readout(
+                out.transpose(1, 2),
+                attention_mask=attention_mask,
+                min_seq_len=self.min_attention_seq_len,
+            )
+        else:
+            seq_mask = (
+                attention_mask.to(device=out.device, dtype=torch.bool)
+                if attention_mask is not None
+                else None
+            )
+            last_valid_idx = None
+            if seq_mask is None:
+                h = out[:, :, -1]
+            else:
+                if seq_mask.shape != (out.size(0), out.size(2)):
+                    raise ValueError(
+                        f"attention_mask shape {tuple(seq_mask.shape)} does not match sequence "
+                        f"shape {(out.size(0), out.size(2))}"
+                    )
+                valid_counts = seq_mask.sum(dim=1)
+                empty_rows = valid_counts == 0
+                if empty_rows.any():
+                    seq_mask = seq_mask.clone()
+                    seq_mask[empty_rows, -1] = True
+                last_valid_idx = TemporalAttentionReadout._last_valid_indices(seq_mask)
+                h = out.transpose(1, 2)[torch.arange(out.size(0), device=out.device), last_valid_idx]
+            if return_attention:
+                attn_weights = torch.zeros(
+                    out.size(0),
+                    out.size(2),
+                    device=out.device,
+                    dtype=out.dtype,
+                )
+                if last_valid_idx is None:
+                    attn_weights[:, -1] = 1.0
+                else:
+                    attn_weights[torch.arange(out.size(0), device=out.device), last_valid_idx] = 1.0
         z = self.bottleneck(h)
         regime_logits = self.classifier(z)
+        if return_attention:
+            return regime_logits, z, attn_weights
         return regime_logits, z

@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import os
 import pickle
-import warnings
 from typing import Any
 
 import lightgbm as lgb
@@ -12,13 +11,7 @@ import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
-from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
-from sklearn.model_selection import train_test_split
-from tqdm.auto import tqdm
-
-from core.indicators import atr as compute_atr
-from core.pa_rules import add_pa_features
+from sklearn.metrics import roc_auc_score
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
@@ -392,11 +385,7 @@ def train_exit_manager_layer4(
     exit_eps = float(os.environ.get("L4_EXIT_EPS_ATR", "0.03"))
     exit_prob_thr = float(os.environ.get("L4_EXIT_PROB_THRESHOLD", "0.55"))
     value_thr = float(os.environ.get("L4_VALUE_LEFT_THRESHOLD", "0.02"))
-    work = df.copy(deep=False)
-    bo_frame = compute_breakout_features(work)
-    for c in BO_FEAT_COLS:
-        work[c] = bo_frame[c].values
-    del bo_frame
+    work = ensure_breakout_features(df.copy(deep=False))
 
     n = len(work)
     time_arr = work["time_key"].values

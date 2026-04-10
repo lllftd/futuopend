@@ -96,15 +96,6 @@ def _compute_opportunity_triplet_infer(
     return opp, mfe_p, mae_p
 
 
-def _compute_opportunity_scores_infer(
-    X: np.ndarray,
-    regime_probs: np.ndarray,
-    models: dict[str, dict[str, lgb.Booster]],
-) -> np.ndarray:
-    o, _, _ = _compute_opportunity_triplet_infer(X, regime_probs, models)
-    return o
-
-
 def _l2b_triplet_from_trade_prob(p_trade: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     pt = np.clip(p_trade.astype(np.float64), 0.0, 1.0)
     mf = np.clip(2.0 * pt, 0.0, 5.0)
@@ -161,13 +152,6 @@ def materialize_layer3_features_v2(
     for c in meta.get("garch_cols", []) + meta.get("pa_key_cols", []) + meta.get("tcn_prob_cols", []):
         if c not in df.columns:
             df[c] = 0.0
-
-
-def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float = 4.0) -> np.ndarray:
-    z = np.clip(kappa * (opp - thr_row), -20.0, 20.0)
-    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
-
-
 def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float, tcn_transition_prob: np.ndarray = None) -> tuple[np.ndarray, np.ndarray]:
     """Apply Conformal Prediction prediction sets and TCN transition signal to filter out uncertain/OOS trades."""
     y_set = regime_probs >= thr_cp
@@ -218,6 +202,8 @@ def load_layered_pa_pipeline():
         dropout=0.0,
         bottleneck_dim=tcn_bd,
         num_classes=n_cls,
+        readout_type=str(tcn_meta.get("readout_type", "last_timestep")),
+        min_attention_seq_len=int(tcn_meta.get("min_attention_seq_len", 4)),
     ).to(device)
     tcn_model.load_state_dict(
         torch.load(

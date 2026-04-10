@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import os
 import pickle
-import time as _time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
@@ -17,26 +16,16 @@ from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, c
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
-from core.indicators import atr as compute_atr
-from core.pa_rules import add_pa_features
 from core.mamba_pa_state import PAStateMamba
 from core.tcn_pa_state import PAStateTCN, FocalLoss
+from core.trainers.pa_feature_cache import load_or_build_pa_features
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
 
 def _load_and_compute_pa(symbol: str) -> pd.DataFrame:
-    raw = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}.csv"))
-    raw["time_key"] = pd.to_datetime(raw["time_key"])
-    raw = raw.sort_values("time_key").reset_index(drop=True)
-
-    atr_1m = compute_atr(raw, length=14)
-    print(f"  [{symbol}] Computing PA features on {len(raw):,} 1-min bars …")
-    t0 = _time.time()
-    df_pa = add_pa_features(raw, atr_1m, timeframe="5min")
-    print(f"  [{symbol}] PA features done in {_time.time()-t0:.1f}s  → {df_pa.shape[1]} cols")
-    return df_pa
+    return load_or_build_pa_features(symbol, DATA_DIR, timeframe="5min")
 
 
 def _load_labels(symbol: str) -> pd.DataFrame:
@@ -117,6 +106,49 @@ def _create_tcn_windows(feat_1m: np.ndarray, seq_len: int) -> tuple[np.ndarray, 
     return windows, end_idx
 
 
+def _nan_safe_ffill_bfill_2d(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    filled = np.asarray(arr, dtype=np.float32).copy()
+    mask = np.isnan(filled)
+    if not mask.any():
+        return filled
+
+    row_idx = np.arange(filled.shape[0], dtype=np.int32)[:, None]
+
+    last_valid = np.where(~mask, row_idx, -1)
+    np.maximum.accumulate(last_valid, axis=0, out=last_valid)
+    cols = np.broadcast_to(np.arange(filled.shape[1]), filled.shape)
+    valid_last = last_valid >= 0
+    filled[valid_last] = filled[last_valid[valid_last], cols[valid_last]]
+
+    mask = np.isnan(filled)
+    if mask.any():
+        next_valid = np.where(~mask, row_idx, filled.shape[0])
+        np.minimum.accumulate(next_valid[::-1], axis=0, out=next_valid[::-1])
+        valid_next = next_valid < filled.shape[0]
+        filled[valid_next] = filled[next_valid[valid_next], cols[valid_next]]
+    return filled
+
+
+def ensure_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
+    missing_cols = [c for c in BO_FEAT_COLS if c not in df.columns]
+    if not missing_cols:
+        return df
+
+    if "symbol" in df.columns:
+        parts: list[pd.DataFrame] = []
+        for _, grp in df.groupby("symbol", sort=False):
+            parts.append(compute_breakout_features(grp))
+        bo_feats = pd.concat(parts).loc[df.index]
+    else:
+        bo_feats = compute_breakout_features(df)
+
+    for col in missing_cols:
+        df[col] = bo_feats[col].to_numpy(dtype=np.float32, copy=False)
+    return df
+
+
 def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -> pd.DataFrame:
     """
     Real TCN forward only — no uniform-prior placeholders.
@@ -184,6 +216,8 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             dropout=0.0,
             bottleneck_dim=bottleneck_dim,
             num_classes=n_tcn_classes,
+            readout_type=str(meta.get("readout_type", "last_timestep")),
+            min_attention_seq_len=int(meta.get("min_attention_seq_len", 4)),
         )
         sd = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(sd)
@@ -197,7 +231,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
         feat_std = np.asarray(meta["std"], dtype=np.float32)
         feat_std = np.where(feat_std < 1e-8, 1.0, feat_std)
     
-        work = df.copy()
+        work = df.copy(deep=False)
     
         sym_outputs: list[pd.DataFrame] = []
     
@@ -251,8 +285,8 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             regime_probs_arr[end_idx] = p_regs
             embeddings[end_idx] = embs
 
-            regime_probs_arr = pd.DataFrame(regime_probs_arr).ffill().bfill().values.astype(np.float32)
-            embeddings = pd.DataFrame(embeddings).ffill().bfill().values.astype(np.float32)
+            regime_probs_arr = _nan_safe_ffill_bfill_2d(regime_probs_arr)
+            embeddings = _nan_safe_ffill_bfill_2d(embeddings)
 
             if np.isnan(regime_probs_arr).any():
                 raise RuntimeError(f"TCN regime probs still NaN for symbol {sym!r} after ffill/bfill.")
@@ -281,14 +315,12 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
         merged = work.merge(tcn_1m, on=["symbol", "time_key"], how="left")
         merged = merged.sort_values(["symbol", "time_key"])
         tcn_cols = [c for c in tcn_derived_list if c in merged.columns]
-        for c in _tq(
-            tcn_cols,
-            desc="  TCN post-merge ffill",
-            unit="col",
-            leave=False,
-        ):
-            merged[c] = merged.groupby("symbol", group_keys=False)[c].transform(
-                lambda s: s.ffill().bfill()
+        if tcn_cols:
+            merged[tcn_cols] = (
+                merged.groupby("symbol", sort=False)[tcn_cols]
+                .ffill()
+                .bfill()
+                .astype(np.float32, copy=False)
             )
 
         # --- INJECT OOF CACHE TO PREVENT DATA LEAKAGE ---
@@ -682,6 +714,8 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
         feat_cols = _unique_cols(feat_cols + _mamba_derived_feature_names())
     else:
         print("  Experimental Mamba requested but no checkpoint found; continuing with TCN (+PA) features only.", flush=True)
+
+    df = ensure_breakout_features(df)
 
     base_feats, hmm_feats, garch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")

@@ -26,11 +26,25 @@ from core.trainers.tcn_utils import _tq, _tqdm_disabled
 # Layer 1 label is Triple Barrier (Up, Down, TimeStop).
 TCN_HEAD_NUM_CLASSES = len(TCN_REGIME_FUT_PROB_COLS)
 TCN_HEAD_TARGET_NAMES = ["Bull_Hit", "Bear_Hit", "Chop_Timeout"]
+TCN_READOUT_TYPE = os.environ.get("TCN_READOUT_TYPE", "attention").strip().lower() or "attention"
+TCN_MIN_ATTENTION_SEQ_LEN = max(1, int(os.environ.get("TCN_MIN_ATTENTION_SEQ_LEN", "4")))
+
+
+def _materialize_tcn_tensor(X_mm: np.memmap) -> torch.Tensor:
+    keep_in_ram = os.environ.get("TCN_DATASET_IN_RAM", "1").strip().lower() not in {"0", "false", "no"}
+    if keep_in_ram:
+        print("  Materializing TCN dataset in RAM once for all folds…", flush=True)
+        x_np = np.array(X_mm, copy=True)
+    else:
+        print("  Using memmap-backed TCN dataset tensor…", flush=True)
+        x_np = np.asarray(X_mm)
+    return torch.from_numpy(x_np)
 
 
 def _train_tcn_model(
-    X_mm: np.memmap,
-    y: np.ndarray,
+    X_t: torch.Tensor,
+    y_t: torch.Tensor,
+    y_np: np.ndarray,
     train_idx: np.ndarray,
     cal_idx: np.ndarray,
     n_features: int,
@@ -50,8 +64,6 @@ def _train_tcn_model(
         flush=True,
     )
 
-    X_t = torch.from_numpy(np.array(X_mm))
-    y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
     base_ds = TensorDataset(X_t, y_t)
     train_ds = Subset(base_ds, train_idx)
     cal_ds = Subset(base_ds, cal_idx)
@@ -75,14 +87,20 @@ def _train_tcn_model(
         dropout=TCN_DROPOUT,
         bottleneck_dim=TCN_BOTTLENECK_DIM,
         num_classes=TCN_HEAD_NUM_CLASSES,
+        readout_type=TCN_READOUT_TYPE,
+        min_attention_seq_len=TCN_MIN_ATTENTION_SEQ_LEN,
     ).to(dev)
 
     if show_model_summary:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"  Model params: {n_params:,}  (SLIM_CHANNELS={SLIM_CHANNELS})")
-        print(f"  Architecture: channels={SLIM_CHANNELS}, kernel={TCN_KERNEL_SIZE}, dropout={TCN_DROPOUT}")
+        print(
+            f"  Architecture: channels={SLIM_CHANNELS}, kernel={TCN_KERNEL_SIZE}, "
+            f"dropout={TCN_DROPOUT}, readout={TCN_READOUT_TYPE}, "
+            f"min_attn_seq_len={TCN_MIN_ATTENTION_SEQ_LEN}"
+        )
 
-    y_tr = y[train_idx]
+    y_tr = y_np[train_idx]
     class_counts = np.bincount(y_tr, minlength=TCN_HEAD_NUM_CLASSES).astype(float)
     class_counts = np.maximum(class_counts, 1.0)
     class_freq = class_counts / class_counts.sum()
@@ -120,8 +138,9 @@ def _train_tcn_model(
         train_loss = 0.0
         n_batches = 0
         for xb, yb in train_dl:
-            xb, yb = xb.to(dev), yb.to(dev)
-            optimizer.zero_grad()
+            xb = xb.to(dev, non_blocking=pin)
+            yb = yb.to(dev, non_blocking=pin)
+            optimizer.zero_grad(set_to_none=True)
             logits = model(xb)
             loss = criterion_train(logits, yb)
             loss.backward()
@@ -136,7 +155,8 @@ def _train_tcn_model(
         cal_correct = cal_total = 0
         with torch.no_grad():
             for xb, yb in cal_dl:
-                xb, yb = xb.to(dev), yb.to(dev)
+                xb = xb.to(dev, non_blocking=pin)
+                yb = yb.to(dev, non_blocking=pin)
                 logits = model(xb)
                 cal_loss += criterion_eval(logits, yb).item() * len(yb)
                 cal_correct += (logits.argmax(1) == yb).sum().item()
@@ -187,6 +207,8 @@ def train_tcn(
     ts: np.ndarray,
     syms: np.ndarray,
 ):
+    X_t = _materialize_tcn_tensor(X_mm)
+    y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
     skip_oof = _env_truthy("TCN_SKIP_OOF")
     oof_path = os.path.join(MODEL_DIR, "tcn_oof_cache.pkl")
 
@@ -227,8 +249,6 @@ def train_tcn(
         oof_embeds = np.zeros((len(train_idx), TCN_BOTTLENECK_DIM), dtype=np.float32)
         oof_regime_probs = np.zeros((len(train_idx), TCN_HEAD_NUM_CLASSES), dtype=np.float32)
 
-        print("  Loading memmap into RAM for fast training…", flush=True)
-        X_tseq = torch.from_numpy(np.array(X_mm))
         for fold in _tq(range(n_folds), desc="OOF CV folds", unit="fold", dynamic_ncols=True, file=sys.stderr):
             start_idx = fold * fold_size
             end_idx = (fold + 1) * fold_size if fold < n_folds - 1 else len(train_idx)
@@ -237,7 +257,8 @@ def train_tcn(
             train_fold_idx = np.concatenate([train_idx[:start_idx], train_idx[end_idx:]])
 
             fold_model = _train_tcn_model(
-                X_mm,
+                X_t,
+                y_t,
                 y,
                 train_fold_idx,
                 val_fold_idx,
@@ -246,13 +267,13 @@ def train_tcn(
                 show_model_summary=False,
             )
 
-            val_ds = TensorDataset(X_tseq[val_fold_idx])
+            val_ds = TensorDataset(X_t[val_fold_idx])
             val_dl = DataLoader(val_ds, batch_size=4096, shuffle=False)
 
             fold_embs, fold_rp = [], []
             with torch.inference_mode():
                 for (xb,) in val_dl:
-                    xb = xb.to(DEVICE)
+                    xb = xb.to(DEVICE, non_blocking=(DEVICE.type in ("cuda", "mps")))
                     r_log, emb = fold_model.forward_with_embedding(xb)
                     fold_rp.append(torch.softmax(r_log, dim=1).cpu().numpy())
                     fold_embs.append(emb.cpu().numpy())
@@ -272,14 +293,12 @@ def train_tcn(
             pickle.dump(oof_cache, f)
         print(f"\n  Saved OOF cache -> {oof_path}")
 
-        del X_tseq
         gc.collect()
-
-    X_t = torch.from_numpy(np.array(X_mm))
 
     # 2. Final Model Training (same max_epochs / patience as OOF — Scheme A)
     final_model = _train_tcn_model(
-        X_mm,
+        X_t,
+        y_t,
         y,
         train_idx,
         cal_idx,
@@ -289,7 +308,6 @@ def train_tcn(
     )
 
     # Evaluate on test set
-    y_t = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64, copy=False)))
     test_ds = TensorDataset(X_t, y_t)
     test_ds_sub = Subset(test_ds, test_idx)
     test_dl = DataLoader(test_ds_sub, batch_size=4096, shuffle=False)
@@ -297,7 +315,8 @@ def train_tcn(
     all_preds, all_labels = [], []
     with torch.no_grad():
         for xb, yb in test_dl:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            xb = xb.to(DEVICE, non_blocking=(DEVICE.type in ("cuda", "mps")))
+            yb = yb.to(DEVICE, non_blocking=(DEVICE.type in ("cuda", "mps")))
             logits = final_model(xb)
             all_preds.append(logits.argmax(1).cpu().numpy())
             all_labels.append(yb.cpu().numpy())

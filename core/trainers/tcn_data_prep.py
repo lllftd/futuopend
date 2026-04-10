@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import os
 import pickle
-import time as _time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
@@ -17,23 +16,14 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
-from core.indicators import atr as compute_atr
-from core.pa_rules import add_pa_features
 from core.tcn_pa_state import FocalLoss, PAStateTCN
+from core.trainers.pa_feature_cache import load_or_build_pa_features
 
 from core.trainers.tcn_constants import *
 from core.trainers.tcn_utils import _tq  # not included in `import *` (leading underscore)
 
 def _load_and_compute_pa(symbol: str) -> pd.DataFrame:
-    raw = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}.csv"))
-    raw["time_key"] = pd.to_datetime(raw["time_key"])
-    raw = raw.sort_values("time_key").reset_index(drop=True)
-    atr_1m = compute_atr(raw, length=14)
-    print(f"  [{symbol}] Computing PA features on {len(raw):,} bars…")
-    t0 = _time.time()
-    df = add_pa_features(raw, atr_1m, timeframe="5min")
-    print(f"  [{symbol}] Done in {_time.time()-t0:.1f}s → {df.shape[1]} cols")
-    return df
+    return load_or_build_pa_features(symbol, DATA_DIR, timeframe="5min")
 
 
 def _load_labels(symbol: str) -> pd.DataFrame:
@@ -274,8 +264,9 @@ def prepare_data():
     upper_barriers = closes + atr_mult * atrs
     lower_barriers = closes - atr_mult * atrs
     
-    highs = df["high"].values
-    lows = df["low"].values
+    highs = df["high"].to_numpy(dtype=np.float32, copy=False)
+    lows = df["low"].to_numpy(dtype=np.float32, copy=False)
+    time_ns = df["time_key"].to_numpy(dtype="datetime64[ns]").astype("int64", copy=False)
     n_rows = len(df)
     labels = np.full(n_rows, 2, dtype=np.int64) # Default to 2 (Time Stop / Chop)
     
@@ -285,42 +276,43 @@ def prepare_data():
     
     print(f"  Applying Triple Barrier Labeling (Horizon={horizon}, ATR_mult={atr_mult})...", flush=True)
     # Fast vectorized-compatible loop over symbols
+    overnight_gap_ns = int(4 * 60 * 60 * 1_000_000_000)
     for start_idx, end_idx in zip(sym_starts, sym_boundaries):
-        for i in range(start_idx, end_idx):
-            # Check if this is the end of a trading day.
-            # If the gap to the next bar is > 4 hours (e.g. overnight), we shouldn't scan across the gap
-            # to hit a barrier on the next day's open.
-            win_end = min(i + horizon + 1, end_idx)
-            
-            # Find actual valid end index for scanning without crossing overnight
-            # (We only look for barrier hits WITHIN the same trading day)
-            valid_win_end = i + 1
-            for k in range(i + 1, win_end):
-                time_diff = (df["time_key"].iloc[k] - df["time_key"].iloc[k-1]).total_seconds()
-                if time_diff > 14400: # 4 hours
-                    break
-                valid_win_end = k + 1
-            
-            upper_limit = upper_barriers[i]
-            lower_limit = lower_barriers[i]
-            
-            # Scan future horizon for barrier hits
-            for j in range(i + 1, valid_win_end):
-                hit_up = highs[j] >= upper_limit
-                hit_dn = lows[j] <= lower_limit
-                
+        sym_times = time_ns[start_idx:end_idx]
+        sym_highs = highs[start_idx:end_idx]
+        sym_lows = lows[start_idx:end_idx]
+        sym_upper = upper_barriers[start_idx:end_idx]
+        sym_lower = lower_barriers[start_idx:end_idx]
+        sym_len = end_idx - start_idx
+
+        next_break = np.full(sym_len, sym_len, dtype=np.int32)
+        if sym_len > 1:
+            breaks_after = np.diff(sym_times) > overnight_gap_ns
+            next_break_idx = sym_len
+            for rel_idx in range(sym_len - 2, -1, -1):
+                if breaks_after[rel_idx]:
+                    next_break_idx = rel_idx + 1
+                next_break[rel_idx] = next_break_idx
+
+        for rel_i in range(sym_len):
+            valid_end = min(rel_i + horizon + 1, next_break[rel_i], sym_len)
+            if valid_end <= rel_i + 1:
+                continue
+
+            upper_limit = sym_upper[rel_i]
+            lower_limit = sym_lower[rel_i]
+            for rel_j in range(rel_i + 1, valid_end):
+                hit_up = sym_highs[rel_j] >= upper_limit
+                hit_dn = sym_lows[rel_j] <= lower_limit
                 if hit_up and hit_dn:
-                    # Rare: both hit in same bar. Check open/close proxy or favor the one it crossed more deeply.
-                    # Simple heuristic: assume the trend direction won
-                    labels[i] = 2 # Mark as chop if it's wildly oscillating
+                    labels[start_idx + rel_i] = 2
                     break
-                elif hit_up:
-                    labels[i] = 0 # Bullish Hit
+                if hit_up:
+                    labels[start_idx + rel_i] = 0
                     break
-                elif hit_dn:
-                    labels[i] = 1 # Bearish Hit
+                if hit_dn:
+                    labels[start_idx + rel_i] = 1
                     break
-                # If neither hit, continue scanning. If loop finishes without hit, it remains 2.
 
     df["state_label"] = labels
 

@@ -3,13 +3,11 @@ from __future__ import annotations
 import gc
 import os
 import pickle
-import warnings
 from typing import Any
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import (
@@ -21,12 +19,6 @@ from sklearn.metrics import (
     classification_report,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
-from tqdm.auto import tqdm
-
-from core.indicators import atr as compute_atr
-from core.pa_rules import add_pa_features
-from core.tcn_pa_state import PAStateTCN, FocalLoss
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *

@@ -19,7 +19,7 @@ from core.trainers.tcn_constants import (
     TCN_BOTTLENECK_DIM,
 )
 from core.trainers.tcn_data_prep import prepare_data as prepare_tcn_data
-from core.trainers.layer1a_tcn import train_tcn
+from core.trainers.layer1a_tcn import train_tcn, TCN_MIN_ATTENTION_SEQ_LEN, TCN_READOUT_TYPE
 from core.trainers.layer1b_mamba import train_mamba, MAMBA_STATE_CLASSIFIER_FILE
 
 # Layer 2-4 (LGBM) Imports
@@ -112,6 +112,8 @@ def run_layer1a_tcn():
                 "kernel_size": TCN_KERNEL_SIZE,
                 "dropout": TCN_DROPOUT,
                 "bottleneck_dim": TCN_BOTTLENECK_DIM,
+                "readout_type": TCN_READOUT_TYPE,
+                "min_attention_seq_len": TCN_MIN_ATTENTION_SEQ_LEN,
                 "is_dual_head": False,
                 "tcn_head": "regime_transition_15_bottleneck",
                 "num_regime_classes": len(TCN_REGIME_FUT_PROB_COLS),

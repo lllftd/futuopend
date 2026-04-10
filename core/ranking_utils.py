@@ -88,31 +88,6 @@ def ranking_row_to_rule_params(row: pd.Series) -> RuleParams:
     )
 
 
-def load_best_rule_params(
-    ranking_path: Path,
-    symbols: Iterable[str],
-    *,
-    required_columns: Iterable[str] = (),
-) -> dict[str, RuleParams]:
-    if not ranking_path.exists():
-        raise FileNotFoundError(f"Refined ranking file not found: {ranking_path}.")
-
-    ranking = pd.read_csv(ranking_path)
-    missing = {"dataset", *required_columns}.difference(ranking.columns)
-    if missing:
-        raise RuntimeError(f"Ranking file is missing required columns: {sorted(missing)}")
-
-    params_by_symbol: dict[str, RuleParams] = {}
-    for symbol in symbols:
-        symbol_upper = symbol.upper()
-        subset = ranking.loc[ranking["dataset"].astype(str).str.upper() == symbol_upper].copy()
-        if subset.empty:
-            raise RuntimeError(f"No ranking rows found for symbol {symbol_upper} in {ranking_path}.")
-        subset = subset.sort_values(["sharpe", "total_return", "win_rate"], ascending=[False, False, False])
-        params_by_symbol[symbol_upper] = ranking_row_to_rule_params(subset.iloc[0])
-    return params_by_symbol
-
-
 def load_best_params_and_rows(
     ranking_path: Path,
     symbols: Iterable[str],

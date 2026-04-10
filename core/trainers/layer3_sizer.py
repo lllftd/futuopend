@@ -3,20 +3,12 @@ from __future__ import annotations
 import gc
 import os
 import pickle
-import warnings
 from typing import Any
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import torch
-from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
-from sklearn.model_selection import train_test_split
-from tqdm.auto import tqdm
-
-from core.indicators import atr as compute_atr
-from core.pa_rules import add_pa_features
+from sklearn.metrics import roc_auc_score
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
@@ -159,11 +151,7 @@ def train_execution_sizer(
     chunk = _layer3_chunk_rows()
     print(f"  Memory: chunked predicts (LAYER3_CHUNK={chunk}); shallow df, no full feature matrices")
 
-    work = df.copy(deep=False)
-    bo_frame = compute_breakout_features(work)
-    for c in BO_FEAT_COLS:
-        work[c] = bo_frame[c].values
-    del bo_frame
+    work = ensure_breakout_features(df.copy(deep=False))
 
     n = len(work)
     cal_regime = np.empty((n, NUM_REGIME_CLASSES), dtype=np.float32)
