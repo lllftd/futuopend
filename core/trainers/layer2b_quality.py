@@ -21,6 +21,7 @@ from core.pa_rules import add_pa_features
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
+from core.trainers.lgbm_utils import _theta_decay_from_bars
 from core.trainers.data_prep import *
 
 def _train_regime_opp_regression_models(
