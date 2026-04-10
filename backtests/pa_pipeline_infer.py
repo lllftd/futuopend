@@ -69,11 +69,11 @@ def _compute_opportunity_triplet_infer(
         m = st == argmax_idx
         if not m.any():
             continue
-        mf = models[predicted_regime]["mfe"].predict(X[m])
-        ma = models[predicted_regime]["mae"].predict(X[m])
-        mf = np.clip(mf, 0.0, None)
-        ma = np.clip(ma, 0.01, None)
-        opp[m] = mf / (ma + 0.1)
+        mfe_p_log = models[predicted_regime]["mfe"].predict(X[m])
+        mae_p_log = models[predicted_regime]["mae"].predict(X[m])
+        mf = np.clip(np.expm1(mfe_p_log), 0.0, None)
+        ma = np.clip(np.expm1(mae_p_log), 0.01, None)
+        opp[m] = np.log1p(mf) - np.log1p(ma)
         mfe_p[m] = mf
         mae_p[m] = ma
     return opp, mfe_p, mae_p
@@ -92,7 +92,7 @@ def _l2b_triplet_from_trade_prob(p_trade: np.ndarray) -> tuple[np.ndarray, np.nd
     pt = np.clip(p_trade.astype(np.float64), 0.0, 1.0)
     mf = np.clip(2.0 * pt, 0.0, 5.0)
     ma = np.clip(0.5 + 0.5 * (1.0 - pt), 0.01, 4.0)
-    opp = mf / (ma + 0.1)
+    opp = np.log1p(mf) - np.log1p(ma)
     return opp.astype(np.float32), mf.astype(np.float32), ma.astype(np.float32)
 
 

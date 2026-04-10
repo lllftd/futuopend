@@ -87,16 +87,19 @@ def _train_regime_opp_regression_models(
             continue
         idx_sub = np.where(mtr)[0]
         X_g = X_tr[idx_sub]
-        y_mfe_g = mfe_tr[idx_sub]
-        y_mae_g = mae_tr[idx_sub]
+        y_mfe_g_raw = mfe_tr[idx_sub]
+        y_mae_g_raw = mae_tr[idx_sub]
         
-        w_base = _opp_regression_sample_weights(y_mfe_g, predicted_regime)
+        w_base = _opp_regression_sample_weights(y_mfe_g_raw, predicted_regime)
+
+        y_mfe_g = np.log1p(y_mfe_g_raw)
+        y_mae_g = np.log1p(y_mae_g_raw)
 
         if nca >= 200:
             idx_va = np.where(mca)[0]
             X_va = X_ca[idx_va]
-            y_mfe_va = mfe_ca[idx_va]
-            y_mae_va = mae_ca[idx_va]
+            y_mfe_va = np.log1p(mfe_ca[idx_va])
+            y_mae_va = np.log1p(mae_ca[idx_va])
         else:
             tail = min(5000, ntr)
             X_va = X_g[-tail:]
@@ -109,7 +112,7 @@ def _train_regime_opp_regression_models(
         m_mfe = lgb.train(
             base_reg, d_mfe_tr, num_boost_round=reg_rounds, valid_sets=[d_mfe_va], callbacks=cb,
         )
-        w_mae = _opp_regression_sample_weights(y_mae_g, predicted_regime)
+        w_mae = _opp_regression_sample_weights(y_mae_g_raw, predicted_regime)
         d_mae_tr = lgb.Dataset(X_g, label=y_mae_g, weight=w_mae, feature_name=all_bo_feats, free_raw_data=False)
         d_mae_va = lgb.Dataset(X_va, label=y_mae_va, feature_name=all_bo_feats, free_raw_data=False)
         print(f"    [L2b regression] {predicted_regime}: train MAE head …", flush=True)
@@ -132,10 +135,10 @@ def _train_regime_opp_regression_models(
         m = gix_cal == argmax_idx
         if not m.any():
             continue
-        mfe_p = models[predicted_regime]["mfe"].predict(X_ca[m])
-        mae_p = models[predicted_regime]["mae"].predict(X_ca[m])
-        mfe_p = np.clip(mfe_p, 0.0, None)
-        mae_p = np.clip(mae_p, 0.01, None)
+        mfe_p_log = models[predicted_regime]["mfe"].predict(X_ca[m])
+        mae_p_log = models[predicted_regime]["mae"].predict(X_ca[m])
+        mfe_p = np.clip(np.expm1(mfe_p_log), 0.0, None)
+        mae_p = np.clip(np.expm1(mae_p_log), 0.01, None)
         opp_cal[m] = np.log1p(mfe_p) - np.log1p(mae_p)
 
     opp_nonzero = opp_cal[opp_cal != 0]
@@ -212,10 +215,10 @@ def _compute_opportunity_triplet(
         m = st == argmax_idx
         if not m.any():
             continue
-        mf = models[predicted_regime]["mfe"].predict(X[m])
-        ma = models[predicted_regime]["mae"].predict(X[m])
-        mf = np.clip(mf, 0.0, None)
-        ma = np.clip(ma, 0.01, None)
+        mfe_p_log = models[predicted_regime]["mfe"].predict(X[m])
+        mae_p_log = models[predicted_regime]["mae"].predict(X[m])
+        mf = np.clip(np.expm1(mfe_p_log), 0.0, None)
+        ma = np.clip(np.expm1(mae_p_log), 0.01, None)
         opp[m] = np.log1p(mf) - np.log1p(ma)
         mfe_p[m] = mf
         mae_p[m] = ma
