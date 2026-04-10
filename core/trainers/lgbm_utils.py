@@ -367,25 +367,26 @@ def _opp_regression_sample_weights(mfe_tgt: np.ndarray, regime_name: str) -> np.
     """
     Differentiated percentile weighting to force the model to focus on high-MFE (breakout) samples.
     """
-    mfe_series = pd.Series(mfe_tgt)
-    # Ensure rank calculation handles empty or very small arrays gracefully
-    if len(mfe_series) == 0:
-        return np.ones(0, dtype=np.float64)
-        
-    mfe_percentile = mfe_series.rank(pct=True).values
+    weights = np.ones(len(mfe_tgt), dtype=np.float64)
     
-    weight = np.where(
-        mfe_percentile > 0.9, 5.0,          # top 10% breakout
-        np.where(mfe_percentile > 0.7, 2.5,  # 70~90%
-                 np.where(mfe_percentile > 0.5, 1.5,  # 50~70%
-                          1.0))               # bottom 50%
-    )
+    # Mask out the zeros (non-breakouts) to calculate meaningful percentiles on actual breakouts
+    active_mask = mfe_tgt > 0.05
+    if active_mask.sum() > 10:
+        active_series = pd.Series(mfe_tgt[active_mask])
+        pct = active_series.rank(pct=True).values
+        
+        weights[active_mask] = np.where(
+            pct > 0.90, 5.0,          # top 10% of active breakouts
+            np.where(pct > 0.70, 2.5,  # 70~90% of active breakouts
+                     np.where(pct > 0.50, 1.5,  # 50~70% of active breakouts
+                              1.0))
+        )
     
     # Keep the existing domain-specific logic as a multiplier
     if regime_name.startswith("range"):
-        weight = np.where(mfe_tgt < 0.2, weight * 0.3, weight)
+        weights = np.where(mfe_tgt < 0.2, weights * 0.3, weights)
         
-    return weight
+    return weights
 
 
 def _l2b_reg_objective_params() -> dict:
