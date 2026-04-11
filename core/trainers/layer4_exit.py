@@ -17,7 +17,7 @@ from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.data_prep import *
 from core.trainers.l4_sequence import L4ExitSequenceModel
-from core.trainers.layer2b_quality import _apply_cp_skip
+from core.trainers.layer2b_quality import _apply_cp_skip, _attach_l2b_regime_context_features, _transition_threshold_add
 from core.trainers.layer3_sizer import (
     _layer3_fill_regime_calibrated,
     _layer3_attach_regime_probs_to_work,
@@ -65,11 +65,7 @@ def _build_exit_policy_dataset(
     low_px = work["low"].values.astype(np.float64)
     close_px = work["close"].values.astype(np.float64)
     safe_atr = np.where(work["lbl_atr"].values > 1e-3, work["lbl_atr"].values.astype(np.float64), 1e-3)
-    opt_exit = (
-        work["optimal_exit_bar"].fillna(0).values.astype(np.int32)
-        if "optimal_exit_bar" in work.columns
-        else _optimal_exit_target_arrays(work)[2].astype(np.int32)
-    )
+    opt_exit = _layer4_policy_opt_exit_array(work)
     if "optimal_net_edge_atr" in work.columns:
         opt_net = work["optimal_net_edge_atr"].fillna(0.0).values.astype(np.float64)
     else:
@@ -112,9 +108,14 @@ def _build_exit_policy_dataset(
         live_mfe = 0.0
         live_mae = 0.0
         max_j = min(int(sym_end[i]), i + max_hold)
+        same_split_max_j = i
+        for jj in range(i, max_j + 1):
+            if int(split_code[jj]) != entry_split:
+                break
+            same_split_max_j = jj
         opt_bar = max(1, int(opt_exit[i]))
-        trade_end_j = min(max_j, i + opt_bar)
-        if trade_end_j <= i or int(split_code[trade_end_j]) != entry_split:
+        trade_end_j = min(same_split_max_j, i + opt_bar)
+        if trade_end_j <= i:
             continue
         opt_edge = float(opt_net[i])
         seq_start = len(rows_x)
@@ -188,6 +189,12 @@ def _build_exit_policy_dataset(
         np.asarray(seq_ends, dtype=np.int32),
         np.asarray(seq_times),
     )
+
+
+def _layer4_policy_opt_exit_array(work: pd.DataFrame) -> np.ndarray:
+    if "optimal_exit_bar" in work.columns:
+        return work["optimal_exit_bar"].fillna(0).values.astype(np.int32)
+    return _optimal_exit_target_arrays(work)[2].astype(np.int32)
 
 
 def _resolve_l4_seq_device() -> torch.device:
@@ -420,6 +427,7 @@ def train_exit_manager_layer4(
     )
     _layer3_attach_regime_probs_to_work(work, cal_regime)
     _layer3_attach_regime_raw_probs_to_work(work, raw_regime)
+    _attach_l2b_regime_context_features(work, cal_regime)
 
     garch_cols = sorted([c for c in work.columns if c.startswith("pa_garch_") and str(work[c].dtype) not in {"object", "category"}])
     layer2_feats = trade_quality_models["feature_cols"]
@@ -435,8 +443,8 @@ def train_exit_manager_layer4(
     non_train_rows = ~train_rows
     if non_train_rows.any():
         tcn_transition_prob_eval = tcn_transition_prob_all[non_train_rows] if tcn_transition_prob_all is not None else None
-        p_long_adj, _ = _apply_cp_skip(cal_regime[non_train_rows], p_long_gate[non_train_rows], thr_cp, tcn_transition_prob_eval)
-        p_short_adj, _ = _apply_cp_skip(cal_regime[non_train_rows], p_short_gate[non_train_rows], thr_cp, tcn_transition_prob_eval)
+        p_long_adj, _ = _apply_cp_skip(cal_regime[non_train_rows], p_long_gate[non_train_rows], thr_cp, tcn_transition_prob_eval, side="long")
+        p_short_adj, _ = _apply_cp_skip(cal_regime[non_train_rows], p_short_gate[non_train_rows], thr_cp, tcn_transition_prob_eval, side="short")
         p_long_gate[non_train_rows] = p_long_adj
         p_short_gate[non_train_rows] = p_short_adj
     p_long_gate, p_short_gate = _apply_structure_veto_to_gates(work, p_long_gate, p_short_gate)
@@ -445,12 +453,12 @@ def train_exit_manager_layer4(
     l2b_opp = np.empty(n, dtype=np.float32)
     l2b_mfe = np.empty(n, dtype=np.float32)
     l2b_mae = np.empty(n, dtype=np.float32)
+    l2b_opp_regime = np.empty((n, len(REGIME_NOW_PROB_COLS)), dtype=np.float32)
     _layer3_fill_l2b_triplet_arrays(
-        trade_quality_models, work, layer2_feats, p_trade_max, l2b_opp, l2b_mfe, l2b_mae, chunk,
+        trade_quality_models, work, layer2_feats, p_trade_max, l2b_opp, l2b_mfe, l2b_mae, l2b_opp_regime, chunk,
         tqdm_desc="Layer4 L2b triplet (reg)",
     )
 
-    tcn_prob_cols = [c for c in TCN_REGIME_FUT_PROB_COLS if c in work.columns]
     mamba_prob_cols = [c for c in MAMBA_REGIME_FUT_PROB_COLS if c in work.columns]
     pa_key_cols = [c for c in LAYER3_PA_KEY_FEATURES if c in work.columns][:24]
     regime_feat = cal_regime.copy()
@@ -459,38 +467,113 @@ def train_exit_manager_layer4(
     triplet_blk = np.hstack([l2b_opp.reshape(-1, 1), l2b_mfe.reshape(-1, 1), l2b_mae.reshape(-1, 1)]).astype(np.float32, copy=False)
     sc_conf = regime_feat.max(axis=1, keepdims=True).astype(np.float32, copy=False)
     regime_blk = np.hstack([regime_feat, sc_conf]).astype(np.float32, copy=False)
-    tcn_mat = work[tcn_prob_cols].to_numpy(dtype=np.float32, copy=False) if tcn_prob_cols else np.empty((n, 0), np.float32)
     mamba_mat = work[mamba_prob_cols].to_numpy(dtype=np.float32, copy=False) if mamba_prob_cols else np.empty((n, 0), np.float32)
     pa_mat = work[pa_key_cols].to_numpy(dtype=np.float32, copy=False) if pa_key_cols else np.empty((n, 0), np.float32)
     g_mat = work[garch_cols].to_numpy(dtype=np.float32, copy=False) if garch_cols else np.empty((n, 0), dtype=np.float32)
 
-    base_X = np.hstack([triplet_blk, regime_blk, tcn_mat, mamba_mat, g_mat, pa_mat, inter_blk])
+    base_X = np.hstack([triplet_blk, regime_blk, mamba_mat, g_mat, pa_mat, inter_blk])
     base_feature_cols = (
         ["l2b_opportunity_score", "l2b_pred_mfe", "l2b_pred_mae"]
         + REGIME_NOW_PROB_COLS
         + ["regime_now_conf"]
-        + tcn_prob_cols + mamba_prob_cols + garch_cols + pa_key_cols + L2B_OPP_X_REGIME_COLS
+        + mamba_prob_cols + garch_cols + pa_key_cols + L2B_OPP_X_REGIME_COLS
     )
     policy_feature_cols = _layer4_policy_feature_names(base_feature_cols)
     side_arr = np.where(p_long_gate >= p_short_gate, 1.0, -1.0).astype(np.float32)
-    thr_long = trade_quality_models["thresholds"]["long"]
-    thr_short = trade_quality_models["thresholds"]["short"]
-    train_thr_long = float(os.environ.get("L4_TRAIN_GATE_THRESHOLD_LONG", "0.50"))
-    train_thr_short = float(os.environ.get("L4_TRAIN_GATE_THRESHOLD_SHORT", "0.50"))
+    thr_long = float(trade_quality_models["thresholds"]["long"])
+    thr_short = float(trade_quality_models["thresholds"]["short"])
+    # Match L2b infer thresholds by default; 0.50 was a legacy default and often gates zero train rows.
+    train_thr_long = float(os.environ.get("L4_TRAIN_GATE_THRESHOLD_LONG", str(thr_long)))
+    train_thr_short = float(os.environ.get("L4_TRAIN_GATE_THRESHOLD_SHORT", str(thr_short)))
+    thr_add_all = _transition_threshold_add(tcn_transition_prob_all, n)
     gate_mask = np.zeros(n, dtype=bool)
-    gate_mask[train_rows] = (p_long_gate[train_rows] >= train_thr_long) | (p_short_gate[train_rows] >= train_thr_short)
-    gate_mask[non_train_rows] = (p_long_gate[non_train_rows] >= thr_long) | (p_short_gate[non_train_rows] >= thr_short)
+    gate_mask[train_rows] = (p_long_gate[train_rows] >= (train_thr_long + thr_add_all[train_rows])) | (p_short_gate[train_rows] >= (train_thr_short + thr_add_all[train_rows]))
+    gate_mask[non_train_rows] = (p_long_gate[non_train_rows] >= (thr_long + thr_add_all[non_train_rows])) | (p_short_gate[non_train_rows] >= (thr_short + thr_add_all[non_train_rows]))
 
-    X_policy, y_exit, y_value, t_state, seq_starts, seq_ends, seq_times = _build_exit_policy_dataset(
-        work,
-        base_X,
-        gate_mask,
-        side_arr,
-        policy_feature_cols,
-        exit_epsilon_atr=exit_eps,
-    )
+    opt_exit_arr = _layer4_policy_opt_exit_array(work)
+    time_arr_ns = work["time_key"].values
+    in_eval_window = time_arr_ns < np.datetime64(TEST_END)
+    ignore_gate = os.environ.get("L4_POLICY_IGNORE_GATE", "").strip().lower() in {"1", "true", "yes"}
+    train_gate_on = int(gate_mask[train_rows].sum())
+    train_opt_exit_pos = int(((opt_exit_arr > 0) & train_rows).sum())
+
+    policy_build_mode = "strict"
+    if ignore_gate:
+        policy_build_mode = "ignore_gate_opt_exit"
+        gate_eff = (opt_exit_arr > 0) & in_eval_window
+        print("  Layer4: L4_POLICY_IGNORE_GATE=1 — building policy rows from opt_exit_bar>0 (t<TEST_END), ignoring L2b gate.")
+        X_policy, y_exit, y_value, t_state, seq_starts, seq_ends, seq_times = _build_exit_policy_dataset(
+            work, base_X, gate_eff, side_arr, policy_feature_cols, exit_epsilon_atr=exit_eps,
+        )
+    elif train_gate_on == 0 and train_opt_exit_pos > 0:
+        policy_build_mode = "auto_label_fallback_zero_train_gate"
+        gate_label = (opt_exit_arr > 0) & in_eval_window
+        print(
+            "  Layer4: train split has 0 gated entries but opt_exit_bar>0 labels exist; "
+            "building policy rows from labels only (t<TEST_END). Inference still uses L2b thresholds.",
+        )
+        X_policy, y_exit, y_value, t_state, seq_starts, seq_ends, seq_times = _build_exit_policy_dataset(
+            work, base_X, gate_label, side_arr, policy_feature_cols, exit_epsilon_atr=exit_eps,
+        )
+    else:
+        X_policy, y_exit, y_value, t_state, seq_starts, seq_ends, seq_times = _build_exit_policy_dataset(
+            work,
+            base_X,
+            gate_mask,
+            side_arr,
+            policy_feature_cols,
+            exit_epsilon_atr=exit_eps,
+        )
+
+    if len(X_policy) == 0 and not ignore_gate:
+        lo = float(os.environ.get("L4_GATE_FALLBACK_MIN_PROB", "0.08"))
+        gate_loose = ((p_long_gate >= lo) | (p_short_gate >= lo)) & in_eval_window
+        X_policy, y_exit, y_value, t_state, seq_starts, seq_ends, seq_times = _build_exit_policy_dataset(
+            work, base_X, gate_loose, side_arr, policy_feature_cols, exit_epsilon_atr=exit_eps,
+        )
+        if len(X_policy) > 0:
+            policy_build_mode = f"fallback_min_prob_{lo:g}"
+            print(
+                f"  Layer4: strict gate produced 0 policy rows; using fallback gate "
+                f"(max(p_long,p_short)>={lo:g}, ~{int(gate_loose.sum()):,} bars).",
+            )
+
+    if len(X_policy) == 0 and not ignore_gate:
+        gate_label = (opt_exit_arr > 0) & in_eval_window
+        X_policy, y_exit, y_value, t_state, seq_starts, seq_ends, seq_times = _build_exit_policy_dataset(
+            work, base_X, gate_label, side_arr, policy_feature_cols, exit_epsilon_atr=exit_eps,
+        )
+        if len(X_policy) > 0:
+            policy_build_mode = "fallback_opt_exit_positive"
+            print(
+                "  Layer4: gate fallbacks still empty; using label-driven entries only "
+                "(opt_exit_bar>0, t<TEST_END). Inference still uses L2b thresholds.",
+            )
+
     if len(X_policy) == 0:
-        raise RuntimeError("Layer 4 policy dataset is empty. Check gating thresholds and labeled optimal exit columns.")
+        n_dbg = len(work)
+        gated = int(gate_mask.sum())
+        gated_train = train_gate_on
+        pos_exit = int((opt_exit_arr > 0).sum())
+        pos_exit_train = train_opt_exit_pos
+        cand = int((gate_mask & (side_arr != 0) & (opt_exit_arr > 0)).sum())
+        loose_lo = float(os.environ.get("L4_GATE_FALLBACK_MIN_PROB", "0.08"))
+        gate_loose_dbg = ((p_long_gate >= loose_lo) | (p_short_gate >= loose_lo)) & in_eval_window
+        cand_loose = int((gate_loose_dbg & (side_arr != 0) & (opt_exit_arr > 0)).sum())
+        cand_label = int(((opt_exit_arr > 0) & in_eval_window & (side_arr != 0)).sum())
+        print(
+            f"  Layer4 empty-dataset debug: rows={n_dbg:,} gate_on={gated:,} "
+            f"train_gate_on={gated_train:,} opt_exit_bar>0={pos_exit:,} "
+            f"train_opt_exit_bar>0={pos_exit_train:,} gate∩opt_exit={cand:,} "
+            f"fallback_loose∩opt_exit={cand_loose:,} label∩opt_exit={cand_label:,} "
+            f"(train_thr L/S={train_thr_long:.2f}/{train_thr_short:.2f}, "
+            f"infer_thr L/S={thr_long:.3f}/{thr_short:.3f})",
+        )
+        raise RuntimeError(
+            "Layer 4 policy dataset is empty after strict + fallback gates. "
+            "Likely optimal_exit_bar is all zero, or no bar has opt_exit>0 with a valid next bar/symbol segment. "
+            "Set L4_POLICY_IGNORE_GATE=1 to force label-only, or fix labels / TRAIN_END–TEST_END windows.",
+        )
 
     train_mask = t_state < np.datetime64(TRAIN_END)
     val_mask = (t_state >= np.datetime64(TRAIN_END)) & (t_state < np.datetime64(CAL_END))
@@ -653,6 +736,7 @@ def train_exit_manager_layer4(
     meta = {
         "l4_schema": 5 if seq_model is not None and seq_meta.get("trained") else 4,
         "type": "exit_policy_barwise",
+        "policy_dataset_gate_mode": policy_build_mode,
         "feature_cols": policy_feature_cols,
         "base_feature_cols": base_feature_cols,
         "dynamic_feature_cols": L4_POLICY_DYNAMIC_FEATURES,

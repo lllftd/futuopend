@@ -25,16 +25,27 @@ from backtests.pa_pipeline_infer import (
     OOS_PRED_CHUNK,
     OOS_START,
     RESULTS_DIR,
+    _compute_opportunity_triplet_infer,
+    _compute_opportunity_triplet_with_regime_opp_infer,
     _chunked_booster_predict,
     _apply_cp_skip,
+    _ensure_tcn_summary_features_infer,
     _tq,
     load_layered_pa_pipeline,
     materialize_layer3_features_v2,
+)
+from core.trainers.layer2b_quality import (
+    _attach_l2b_regime_context_features,
+    _align_feature_matrix_to_names,
+    _build_l2b_directional_feature_matrix,
+    _compose_two_stage_gate_probs,
+    _tcn_transition_risk_profile,
 )
 from core.trainers.constants import (
     BO_FEAT_COLS,
     REGIME_NOW_PROB_COLS,
     TCN_REGIME_FUT_PROB_COLS,
+    TCN_TRANSITION_PROB_COL,
     MAMBA_REGIME_FUT_PROB_COLS,
 )
 from core.trainers.data_prep import (
@@ -88,6 +99,7 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         df[col] = regime_probs_arr[:, j]
     eps = 1e-9
     df["tcn_regime_fut_entropy"] = -np.sum(regime_probs_arr * np.log(np.maximum(regime_probs_arr, eps)), axis=1)
+    _ensure_tcn_summary_features_infer(df)
 
     if p.get("mamba"):
         m_feats = p["mamba_meta"]["feat_cols"]
@@ -144,15 +156,36 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         df[col] = cal_regime[:, j]
         df[f"{col}_raw"] = raw_regime[:, j]
     df["regime_now_conf"] = cal_regime.max(axis=1)
+    _attach_l2b_regime_context_features(df, cal_regime)
 
     print(f"[{symbol}] Layer 2b: Trade Stack")
-    l2b_feats = [c for c in p["tq_meta"]["feature_cols"] if c in df.columns]
+    for c in p["tq_meta"]["feature_cols"]:
+        if c not in df.columns:
+            df[c] = 0.0
+    l2b_feats = list(p["tq_meta"]["feature_cols"])
     l2b_x = df[l2b_feats].fillna(0).values.astype(np.float32)
     rp = df[REGIME_NOW_PROB_COLS].values.astype(np.float32)
     
-    # Step 1: Separate LONG and SHORT Gates
-    p_long_raw = 1.0 / (1.0 + np.exp(-_chunked_booster_predict(p["l2b_s1_long"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step1 LONG [{symbol}]")))
-    p_short_raw = 1.0 / (1.0 + np.exp(-_chunked_booster_predict(p["l2b_s1_short"], l2b_x, OOS_PRED_CHUNK, desc=f"L2b step1 SHORT [{symbol}]")))
+    # Step 1 / 2: trade gate + direction gate
+    gate_feature_cols = p["tq_meta"].get("gate_feature_cols")
+    tcn_prob = df[TCN_TRANSITION_PROB_COL].values.astype(np.float32) if TCN_TRANSITION_PROB_COL in df.columns else None
+    if gate_feature_cols:
+        l2b_opp, l2b_mfe, l2b_mae, l2b_opp_regime = _compute_opportunity_triplet_with_regime_opp_infer(
+            l2b_x, rp, p["l2b_opp"]
+        )
+        gate_x_full, gate_cols = _build_l2b_directional_feature_matrix(
+            rp, l2b_opp, l2b_mfe, l2b_mae, l2b_opp_regime, tcn_prob
+        )
+        gate_x = _align_feature_matrix_to_names(gate_x_full, gate_cols, gate_feature_cols)
+    else:
+        gate_x = l2b_x
+    if p.get("l2b_s1_trade") is not None and p.get("l2b_s2_dir") is not None:
+        p_trade_raw = _chunked_booster_predict(p["l2b_s1_trade"], gate_x, OOS_PRED_CHUNK, desc=f"L2b stage1 TRADE [{symbol}]")
+        p_dir_long = _chunked_booster_predict(p["l2b_s2_dir"], gate_x, OOS_PRED_CHUNK, desc=f"L2b stage2 DIRECTION [{symbol}]")
+        p_long_raw, p_short_raw = _compose_two_stage_gate_probs(p_trade_raw, p_dir_long)
+    else:
+        p_long_raw = _chunked_booster_predict(p["l2b_s1_long"], gate_x, OOS_PRED_CHUNK, desc=f"L2b step1 LONG [{symbol}]")
+        p_short_raw = _chunked_booster_predict(p["l2b_s1_short"], gate_x, OOS_PRED_CHUNK, desc=f"L2b step1 SHORT [{symbol}]")
     
     p_range_mass = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
     p_long_raw = p_long_raw * (1.0 - 0.7 * p_range_mass)
@@ -160,9 +193,8 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     
     # Apply CP / TCN skip
     thr_cp = p["tq_meta"]["hierarchy_thresholds"].get("thr_cp", 0.0)
-    tcn_prob = df["tcn_transition_prob"].values.astype(np.float32) if "tcn_transition_prob" in df.columns else None
-    p_long_gate, _ = _apply_cp_skip(rp, p_long_raw, thr_cp, tcn_prob)
-    p_short_gate, _ = _apply_cp_skip(rp, p_short_raw, thr_cp, tcn_prob)
+    p_long_gate, _ = _apply_cp_skip(rp, p_long_raw, thr_cp, tcn_prob, side="long")
+    p_short_gate, _ = _apply_cp_skip(rp, p_short_raw, thr_cp, tcn_prob, side="short")
     long_setup = df["pa_ctx_setup_long"].values.astype(np.float32) if "pa_ctx_setup_long" in df.columns else np.zeros(len(df), dtype=np.float32)
     short_setup = df["pa_ctx_setup_short"].values.astype(np.float32) if "pa_ctx_setup_short" in df.columns else np.zeros(len(df), dtype=np.float32)
     follow_long = df["pa_ctx_follow_through_long"].values.astype(np.float32) if "pa_ctx_follow_through_long" in df.columns else np.zeros(len(df), dtype=np.float32)
@@ -177,13 +209,12 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
     p_short_gate = p_short_gate * short_allow
     
     p_trade = np.maximum(p_long_gate, p_short_gate)
-    p_long = (p_long_gate > p_short_gate).astype(np.float32)
 
     print(f"[{symbol}] Layer 3: Execution Sizer")
     df["tq_p_trade"] = p_trade
     df["tq_p_skip"] = 1.0 - p_trade
-    df["tq_p_long"] = p_long
-    df["tq_p_short"] = 1.0 - p_long
+    df["tq_p_long"] = p_long_gate
+    df["tq_p_short"] = p_short_gate
     materialize_layer3_features_v2(
         df,
         p,
@@ -198,12 +229,18 @@ def run_single_symbol(symbol: str, p: dict) -> pd.DataFrame:
         pg_raw = _chunked_booster_predict(
             p["l3_gate"], l3_x, OOS_PRED_CHUNK, desc=f"L3 gate [{symbol}]",
         )
-        pg = 1.0 / (1.0 + np.exp(-pg_raw))
+        pg = pg_raw
         ps = _chunked_booster_predict(
             p["l3_size"], l3_x, OOS_PRED_CHUNK, desc=f"L3 size [{symbol}]",
         )
         l3_pos_mult = float(p["l3_meta"].get("pos_multiplier", 3.0))
-        exec_size = np.clip(pg * ps * l3_pos_mult, -1.0, 1.0)
+        if TCN_TRANSITION_PROB_COL in df.columns:
+            tcn_risk = df[TCN_TRANSITION_PROB_COL].values.astype(np.float32)
+            risk_prof = _tcn_transition_risk_profile(tcn_risk)
+            risk_scale = risk_prof["pos_scale"] if risk_prof is not None else 1.0
+        else:
+            risk_scale = 1.0
+        exec_size = np.clip(pg * ps * l3_pos_mult * risk_scale, -1.0, 1.0)
     else:
         exec_size = _chunked_booster_predict(
             p["l3_model"], l3_x, OOS_PRED_CHUNK, desc=f"L3 sizer [{symbol}]",

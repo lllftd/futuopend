@@ -5,7 +5,6 @@ import sys
 import torch
 import lightgbm as lgb
 import numpy as np
-import datetime
 
 # Layer 1 (TCN) Imports
 from core.trainers.tcn_constants import (
@@ -55,6 +54,9 @@ class Logger:
 
     def write(self, message):
         self.terminal.write(message)
+        # tqdm (and similar) redraw the current line with '\r'; keep those out of layer*.log files
+        if message and "\r" in message:
+            return
         self.log.write(message)
 
     def flush(self):
@@ -69,17 +71,28 @@ class Logger:
         sys.stderr = self.original_stderr
         self.log.close()
 
-def setup_logger(layer_name):
-    """Sets up a logger for the given layer."""
+# Fixed log filenames (overwrite each run): only these five under logs/
+_LAYER_LOG_FILES = {
+    "layer1a": "layer1a.log",
+    "layer2a": "layer2a.log",
+    "layer2b": "layer2b.log",
+    "layer3": "layer3.log",
+    "layer4": "layer4.log",
+}
+
+
+def setup_logger(layer_key: str):
+    """Tee stdout/stderr to terminal and exactly one overwrite log per stage."""
+    if layer_key not in _LAYER_LOG_FILES:
+        raise ValueError(f"setup_logger: unknown layer_key={layer_key!r}; expected one of {sorted(_LAYER_LOG_FILES)}")
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"train_{layer_name}.log")
-    print(f"\n>> Redirecting output to: {log_file}")
+    log_file = os.path.join(log_dir, _LAYER_LOG_FILES[layer_key])
+    print(f"\n>> Layer log (overwrite): {log_file}")
     return Logger(log_file)
 
 def run_layer1a_tcn():
-    logger = setup_logger("layer1a_tcn")
+    logger = setup_logger("layer1a")
     try:
         print("\n" + "=" * 70)
         print("  [1] TCN — Future Transition Signal (binary, +15 bars)")
@@ -146,7 +159,7 @@ def run_layer1b_mamba():
             "Layer 1b Mamba is experimental and disabled by default. "
             "Set ENABLE_EXPERIMENTAL_MAMBA=1 to run it explicitly."
         )
-    logger = setup_logger("layer1b_mamba")
+    logger = setup_logger("layer1a")
     try:
         print("\n" + "=" * 70)
         print("  [1b] Experimental Mamba — Future Transition Signal")
@@ -236,13 +249,9 @@ def load_layer2a_artifacts():
     return regime_model, regime_cal, thr_cp
 
 def load_layer2b_artifacts():
-    long_path = os.path.join(MODEL_DIR, "trade_gate_long.txt")
-    if not os.path.exists(long_path):
-        raise FileNotFoundError(f"Missing Layer 2b model at {long_path}. Cannot skip Layer 2b.")
-    
     with open(os.path.join(MODEL_DIR, "trade_quality_meta.pkl"), "rb") as f:
         meta = pickle.load(f)
-    
+
     regb = meta.get("regression_gate", {})
     step1_regression_bundle = {
         "thr_vec": np.array(regb.get("thr_vec", [])),
@@ -257,16 +266,28 @@ def load_layer2b_artifacts():
         if mae_file and os.path.exists(os.path.join(MODEL_DIR, mae_file)):
             step1_regression_bundle[f"{regime}_mae"] = lgb.Booster(model_file=os.path.join(MODEL_DIR, mae_file))
 
-    step1_long_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, meta["model_files"]["step1_long"]))
-    step1_short_model = lgb.Booster(model_file=os.path.join(MODEL_DIR, meta["model_files"]["step1_short"]))
-    
-    return {
+    model_files = meta.get("model_files", {})
+    out = {
+        "l2b_schema": int(meta.get("l2b_schema", 1)),
         "step1_regression": step1_regression_bundle,
-        "step1_long": step1_long_model,
-        "step1_short": step1_short_model,
         "thresholds": meta["hierarchy_thresholds"],
         "feature_cols": meta["feature_cols"],
+        "gate_feature_cols": meta.get("gate_feature_cols"),
+        "gate_architecture": meta.get("gate_architecture", "legacy_dual_binary"),
     }
+    if "step1_has_trade" in model_files and "step2_direction" in model_files:
+        out["step1_has_trade"] = lgb.Booster(model_file=os.path.join(MODEL_DIR, model_files["step1_has_trade"]))
+        out["step2_direction"] = lgb.Booster(model_file=os.path.join(MODEL_DIR, model_files["step2_direction"]))
+        return out
+
+    long_name = model_files.get("step1_long", "trade_gate_long.txt")
+    short_name = model_files.get("step1_short", "trade_gate_short.txt")
+    long_path = os.path.join(MODEL_DIR, long_name)
+    if not os.path.exists(long_path):
+        raise FileNotFoundError(f"Missing Layer 2b model at {long_path}. Cannot skip Layer 2b.")
+    out["step1_long"] = lgb.Booster(model_file=long_path)
+    out["step1_short"] = lgb.Booster(model_file=os.path.join(MODEL_DIR, short_name))
+    return out
 
 def run_lgbm_layers(start_from="layer2a"):
     configure_compute_threads()

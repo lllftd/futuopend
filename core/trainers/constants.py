@@ -21,6 +21,14 @@ RANGE_REGIME_INDICES = [4, 5]
 TCN_REGIME_FUT_PROB_COLS = ["tcn_barrier_hit_up", "tcn_barrier_hit_dn", "tcn_barrier_chop"]
 MAMBA_REGIME_FUT_PROB_COLS = ["mamba_transition_same", "mamba_transition_prob"]
 TCN_BOTTLENECK_DIM = max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
+TCN_TRANSITION_PROB_COL = "tcn_transition_prob"
+TCN_BARRIER_DIR_DIFF_COL = "tcn_barrier_dir_diff"
+TCN_FEATURES_ENABLED = os.environ.get("TCN_FEATURES_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
+TCN_FEATURES_FOR_L2B = [
+    TCN_TRANSITION_PROB_COL,
+    "tcn_regime_fut_entropy",
+    TCN_BARRIER_DIR_DIFF_COL,
+]
 
 LGBM_EXCLUDE_PA_STRING_COLS = {
     "symbol", "time_key", "date", "market_state", "code", "name",
@@ -71,6 +79,43 @@ PA_CTX_FEATURES = [
 ]
 
 L2B_OPP_X_REGIME_COLS = [f"l2b_opp_x_{r}" for r in REGIME_NOW_PROB_COLS]
+L2B_PER_REGIME_OPP_COLS = [f"l2b_opp_{r}" for r in REGIME_NOW_PROB_COLS]
+L2B_OPP_SUMMARY_COLS = [
+    "l2b_opp_best_regime",
+    "l2b_opp_worst_regime",
+    "l2b_opp_regime_std",
+    "l2b_opp_regime_range",
+    "l2b_opp_top2_weighted",
+    "l2b_conf_x_opp",
+]
+L2B_REGIME_CONTEXT_COLS = [
+    "l2b_bull_mass",
+    "l2b_bear_mass",
+    "l2b_range_mass",
+    "l2b_regime_margin",
+    "l2b_regime_entropy",
+]
+L2B_DIRECTIONAL_BASE_COLS = [
+    "l2b_opportunity_score",
+    "l2b_pred_mfe",
+    "l2b_pred_mae",
+    "l2b_mfe_mae_gap",
+    "l2b_mfe_mae_ratio",
+    "l2b_bull_edge",
+    "l2b_bear_edge",
+    "l2b_range_drag",
+    "l2b_regime_conf",
+    *L2B_REGIME_CONTEXT_COLS,
+]
+L2B_META_GATE_PROB_COLS = ["l2b_gate_long", "l2b_gate_short"]
+L2B_META_GATE_DERIVED_COLS = ["l2b_gate_spread", "l2b_gate_max", "l2b_gate_entropy"]
+L2B_META_GATE_ALL_COLS = L2B_META_GATE_PROB_COLS + L2B_META_GATE_DERIVED_COLS
+L3_INTERACTION_FEATURE_COLS = [
+    "l3_gate_x_mfe",
+    "l3_gate_x_rr",
+    "l3_gate_spread_x_opp",
+    "l3_signal_agree",
+]
 
 LAYER3_PA_KEY_FEATURES = (
     "pa_ctx_setup_long", "pa_ctx_setup_short",

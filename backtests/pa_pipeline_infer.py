@@ -23,6 +23,20 @@ from core.mamba_pa_state import PAStateMamba
 from core.trainers.tcn_constants import STATE_CLASSIFIER_FILE as TCN_STATE_DICT_BASENAME
 from core.trainers.layer1b_mamba import MAMBA_STATE_CLASSIFIER_FILE
 from core.trainers.l4_sequence import L4ExitSequenceModel
+from core.trainers.constants import (
+    L2B_META_GATE_ALL_COLS,
+    TCN_BARRIER_DIR_DIFF_COL,
+    TCN_FEATURES_FOR_L2B,
+    TCN_REGIME_FUT_PROB_COLS,
+    TCN_TRANSITION_PROB_COL,
+)
+from core.trainers.layer2b_quality import (
+    _build_l2b_gate_meta_features,
+    _build_l3_interaction_features,
+    _build_l2b_directional_feature_matrix,
+    _regime_context_from_probs,
+    _tcn_transition_risk_profile,
+)
 
 OOS_PRED_CHUNK = max(4096, int(os.environ.get("OOS_PRED_CHUNK", "65536")))
 
@@ -57,21 +71,44 @@ REGIMES_6 = (
 )
 
 
+def _ensure_tcn_summary_features_infer(df) -> None:
+    required = list(TCN_REGIME_FUT_PROB_COLS)
+    if not all(c in df.columns for c in required):
+        return
+    if TCN_TRANSITION_PROB_COL not in df.columns:
+        chop = np.asarray(df["tcn_barrier_chop"], dtype=np.float32)
+        df[TCN_TRANSITION_PROB_COL] = np.clip(1.0 - chop, 0.0, 1.0)
+    if TCN_BARRIER_DIR_DIFF_COL not in df.columns:
+        up = np.asarray(df["tcn_barrier_hit_up"], dtype=np.float32)
+        dn = np.asarray(df["tcn_barrier_hit_dn"], dtype=np.float32)
+        df[TCN_BARRIER_DIR_DIFF_COL] = up - dn
+
+
 def _compute_opportunity_triplet_infer(
     X: np.ndarray,
     regime_probs: np.ndarray,
     models: dict[str, dict[str, lgb.Booster]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    opp, mfe_p, mae_p, _ = _compute_opportunity_triplet_with_regime_opp_infer(X, regime_probs, models)
+    return opp, mfe_p, mae_p
+
+
+def _compute_opportunity_triplet_with_regime_opp_infer(
+    X: np.ndarray,
+    regime_probs: np.ndarray,
+    models: dict[str, dict[str, lgb.Booster]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(X)
     opp = np.zeros(n, dtype=np.float64)
     mfe_p = np.zeros(n, dtype=np.float64)
     mae_p = np.zeros(n, dtype=np.float64)
+    opp_regime = np.zeros((n, len(REGIMES_6)), dtype=np.float64)
     if n == 0 or not models:
-        return opp, mfe_p, mae_p
+        return opp, mfe_p, mae_p, opp_regime
 
     available = [idx for idx, regime in enumerate(REGIMES_6) if regime in models]
     if not available:
-        return opp, mfe_p, mae_p
+        return opp, mfe_p, mae_p, opp_regime
 
     mfe_stack: list[np.ndarray] = []
     mae_stack: list[np.ndarray] = []
@@ -90,10 +127,14 @@ def _compute_opportunity_triplet_infer(
         out=np.full_like(weights, 1.0 / weights.shape[1]),
         where=denom > 1e-12,
     )
-    mfe_p = np.sum(weights * np.column_stack(mfe_stack), axis=1)
-    mae_p = np.sum(weights * np.column_stack(mae_stack), axis=1)
+    mfe_mat = np.column_stack(mfe_stack)
+    mae_mat = np.column_stack(mae_stack)
+    opp_mat = np.log1p(mfe_mat) - np.log1p(mae_mat)
+    opp_regime[:, available] = opp_mat
+    mfe_p = np.sum(weights * mfe_mat, axis=1)
+    mae_p = np.sum(weights * mae_mat, axis=1)
     opp = np.log1p(mfe_p) - np.log1p(mae_p)
-    return opp, mfe_p, mae_p
+    return opp, mfe_p, mae_p, opp_regime
 
 
 def _l2b_triplet_from_trade_prob(p_trade: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -119,6 +160,7 @@ def materialize_layer3_features_v2(
     n = len(df)
     if n == 0:
         return
+    _ensure_tcn_summary_features_infer(df)
     rp = df[regime_prob_cols].values.astype(np.float32)
     raw_route_cols = [f"{c}_raw" for c in regime_prob_cols]
     route_probs = (
@@ -131,41 +173,97 @@ def materialize_layer3_features_v2(
         o = np.empty(n, dtype=np.float32)
         mf = np.empty(n, dtype=np.float32)
         ma = np.empty(n, dtype=np.float32)
+        opp_regime = np.empty((n, len(REGIMES_6)), dtype=np.float32)
         n_chunk = (n + chunk - 1) // chunk
         for start in _tq(range(0, n, chunk), desc=desc or "L3 L2b triplet", unit="chunk", total=n_chunk):
             end = min(start + chunk, n)
-            oc, mfc, mac = _compute_opportunity_triplet_infer(l2b_x[start:end], route_probs[start:end], models)
+            oc, mfc, mac, orc = _compute_opportunity_triplet_with_regime_opp_infer(
+                l2b_x[start:end], route_probs[start:end], models
+            )
             o[start:end] = oc.astype(np.float32)
             mf[start:end] = mfc.astype(np.float32)
             ma[start:end] = mac.astype(np.float32)
+            opp_regime[start:end] = orc.astype(np.float32)
     else:
         o, mf, ma = _l2b_triplet_from_trade_prob(df["tq_p_trade"].values.astype(np.float32))
+        opp_regime = np.repeat(o.reshape(-1, 1), len(REGIMES_6), axis=1).astype(np.float32)
 
-    df["l2b_opportunity_score"] = o
-    df["l2b_pred_mfe"] = mf
-    df["l2b_pred_mae"] = ma
-    rp64 = rp.astype(np.float64)
-    o64 = o.astype(np.float64)
-    for k, regime in enumerate(REGIMES_6):
-        df[f"l2b_opp_x_{regime}"] = o64 * rp64[:, k]
+    tcn_prob = df[TCN_TRANSITION_PROB_COL].values.astype(np.float32) if TCN_TRANSITION_PROB_COL in df.columns else None
+    l2b_dir_blk, l2b_dir_cols = _build_l2b_directional_feature_matrix(rp, o, mf, ma, opp_regime, tcn_prob)
+    for idx, col in enumerate(l2b_dir_cols):
+        df[col] = l2b_dir_blk[:, idx]
+    if "tq_p_long" in df.columns and "tq_p_short" in df.columns:
+        gate_blk, gate_cols = _build_l2b_gate_meta_features(
+            df["tq_p_long"].values.astype(np.float32),
+            df["tq_p_short"].values.astype(np.float32),
+        )
+        for idx, col in enumerate(gate_cols):
+            df[col] = gate_blk[:, idx]
+        interaction_blk, interaction_cols = _build_l3_interaction_features(
+            o,
+            mf,
+            ma,
+            df["tq_p_long"].values.astype(np.float32),
+            df["tq_p_short"].values.astype(np.float32),
+        )
+        for idx, col in enumerate(interaction_cols):
+            df[col] = interaction_blk[:, idx]
 
-    for c in meta.get("garch_cols", []) + meta.get("pa_key_cols", []) + meta.get("tcn_prob_cols", []):
+    tcn_feature_cols = meta.get("tcn_feature_cols", meta.get("tcn_prob_cols", TCN_FEATURES_FOR_L2B))
+    interaction_cols = meta.get("interaction_feature_cols", list(L3_INTERACTION_FEATURE_COLS))
+    for c in meta.get("garch_cols", []) + meta.get("pa_key_cols", []) + tcn_feature_cols + interaction_cols + list(L2B_META_GATE_ALL_COLS):
         if c not in df.columns:
             df[c] = 0.0
-def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float, tcn_transition_prob: np.ndarray = None) -> tuple[np.ndarray, np.ndarray]:
-    """Apply Conformal Prediction prediction sets and TCN transition signal to filter out uncertain/OOS trades."""
-    y_set = regime_probs >= thr_cp
+def _apply_cp_skip(
+    regime_probs: np.ndarray,
+    p_trade: np.ndarray,
+    thr_cp: float,
+    tcn_transition_prob: np.ndarray = None,
+    *,
+    side: str = "trade",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply direction-aware CP skip plus continuous TCN risk shrink."""
+    rp = np.clip(np.asarray(regime_probs, dtype=np.float64), 0.0, None)
+    denom = rp.sum(axis=1, keepdims=True)
+    rp = np.divide(
+        rp,
+        denom,
+        out=np.full_like(rp, 1.0 / max(rp.shape[1], 1)),
+        where=denom > 1e-12,
+    )
+    y_set = rp >= thr_cp
     set_size = y_set.sum(axis=1)
     contains_bull = y_set[:, 0] | y_set[:, 1]
     contains_bear = y_set[:, 2] | y_set[:, 3]
     is_conflicting = contains_bull & contains_bear
-    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0)
-    
-    if tcn_transition_prob is not None:
-        high_transition_risk = tcn_transition_prob > 0.70
-        skip_cp = skip_cp | high_transition_risk
-        
+    ctx = _regime_context_from_probs(rp)
+    bull_mass = ctx["bull_mass"]
+    bear_mass = ctx["bear_mass"]
+    range_mass = ctx["range_mass"]
+    conf = ctx["conf"]
+    margin = ctx["margin"]
+    entropy = ctx["entropy"]
+    entropy_skip_thr = float(os.environ.get("L2B_CP_ENTROPY_SKIP_THR", "1.45"))
+    margin_skip_thr = float(os.environ.get("L2B_CP_MARGIN_SKIP_THR", "0.08"))
+    conf_skip_thr = float(os.environ.get("L2B_CP_CONF_SKIP_THR", "0.34"))
+    range_skip_thr = float(os.environ.get("L2B_CP_RANGE_SKIP_THR", "0.60"))
+    opp_mass_buffer = float(os.environ.get("L2B_CP_OPPOSITE_BUFFER", "0.03"))
+    ambiguous = (entropy >= entropy_skip_thr) | (margin <= margin_skip_thr) | (conf <= conf_skip_thr)
+    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0) | (ambiguous & (range_mass >= range_skip_thr))
+    if side == "long":
+        opposite_hit = contains_bear | (bear_mass >= bull_mass - opp_mass_buffer)
+        skip_cp = skip_cp | (opposite_hit & ambiguous)
+    elif side == "short":
+        opposite_hit = contains_bull | (bull_mass >= bear_mass - opp_mass_buffer)
+        skip_cp = skip_cp | (opposite_hit & ambiguous)
+    else:
+        skip_cp = skip_cp | (ambiguous & (np.abs(bull_mass - bear_mass) <= 0.05))
+
     p_trade_adj = p_trade.copy()
+    prof = _tcn_transition_risk_profile(tcn_transition_prob)
+    if prof is not None:
+        p_trade_adj = p_trade_adj * prof["prob_scale"]
+        skip_cp = skip_cp | prof["is_high"]
     p_trade_adj[skip_cp] = 0.0
     return p_trade_adj, skip_cp
 
@@ -279,9 +377,19 @@ def load_layered_pa_pipeline():
         raise FileNotFoundError(
             "L2b regression Step1: no opp models loaded; check regression_gate.model_files.",
         )
-    l2b_step1_long = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_gate_long.txt"))
-    l2b_step1_short = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_gate_short.txt"))
-    l2b_step3 = lgb.Booster(model_file=os.path.join(MODEL_DIR, "trade_grade_step3.txt"))
+    tq_model_files = tq_meta.get("model_files", {})
+    l2b_step1_trade = None
+    l2b_step2_dir = None
+    l2b_step1_long = None
+    l2b_step1_short = None
+    if "step1_has_trade" in tq_model_files and "step2_direction" in tq_model_files:
+        l2b_step1_trade = lgb.Booster(model_file=os.path.join(MODEL_DIR, tq_model_files["step1_has_trade"]))
+        l2b_step2_dir = lgb.Booster(model_file=os.path.join(MODEL_DIR, tq_model_files["step2_direction"]))
+    else:
+        l2b_step1_long = lgb.Booster(model_file=os.path.join(MODEL_DIR, tq_model_files.get("step1_long", "trade_gate_long.txt")))
+        l2b_step1_short = lgb.Booster(model_file=os.path.join(MODEL_DIR, tq_model_files.get("step1_short", "trade_gate_short.txt")))
+    l2b_step3_path = os.path.join(MODEL_DIR, "trade_grade_step3.txt")
+    l2b_step3 = lgb.Booster(model_file=l2b_step3_path) if os.path.exists(l2b_step3_path) else None
 
     with open(os.path.join(MODEL_DIR, "execution_sizer_meta.pkl"), "rb") as f:
         l3_meta = pickle.load(f)
@@ -360,6 +468,8 @@ def load_layered_pa_pipeline():
         "l2b_opp": l2b_opp,
         "l2b_opp_thr_vec": l2b_opp_thr_vec,
         "l2b_soft_opp_thr": l2b_soft_opp_thr,
+        "l2b_s1_trade": l2b_step1_trade,
+        "l2b_s2_dir": l2b_step2_dir,
         "l2b_s1_long": l2b_step1_long,
         "l2b_s1_short": l2b_step1_short,
         "l2b_s3": l2b_step3,

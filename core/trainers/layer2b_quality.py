@@ -4,16 +4,25 @@ import gc
 import os
 import pickle
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.isotonic import IsotonicRegression
-from sklearn.mixture import GaussianMixture
-from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix, precision_score, recall_score, fbeta_score, classification_report
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    fbeta_score,
+    log_loss,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+)
 from tqdm.auto import tqdm
 
 from core.indicators import atr as compute_atr
@@ -23,6 +32,106 @@ from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
 from core.trainers.lgbm_utils import _theta_decay_from_bars
 from core.trainers.data_prep import *
+
+
+def _train_one_regime_opp_pair(
+    predicted_regime: str,
+    argmax_idx: int,
+    X_tr: np.ndarray,
+    X_ca: np.ndarray,
+    st_tr: np.ndarray,
+    st_ca: np.ndarray,
+    rp_tr: np.ndarray,
+    rp_ca: np.ndarray,
+    st_tr_pred: np.ndarray,
+    st_ca_pred: np.ndarray,
+    mfe_tr: np.ndarray,
+    mae_tr: np.ndarray,
+    mfe_ca: np.ndarray,
+    mae_ca: np.ndarray,
+    all_bo_feats: list[str],
+    base_reg: dict[str, Any],
+    reg_rounds: int,
+    reg_es: int,
+    route_power: float,
+    min_route_weight_sum: float,
+) -> tuple[str, dict[str, lgb.Booster] | None]:
+    """One regime: MFE + MAE heads on full train with soft route weights. Returns (name, models or None)."""
+    mtr = st_tr_pred == argmax_idx
+    mca = st_ca_pred == argmax_idx
+    ntr, nca = int(mtr.sum()), int(mca.sum())
+    route_w_tr = np.power(np.clip(rp_tr[:, argmax_idx], 1e-6, 1.0), route_power)
+    route_w_ca = np.power(np.clip(rp_ca[:, argmax_idx], 1e-6, 1.0), route_power)
+    eff_w_tr = float(route_w_tr.sum())
+    eff_w_ca = float(route_w_ca.sum())
+    eff_n_tr = int((rp_tr[:, argmax_idx] >= 0.15).sum())
+    eff_n_ca = int((rp_ca[:, argmax_idx] >= 0.15).sum())
+    train_match = float((st_tr[mtr] == argmax_idx).mean()) if ntr else float("nan")
+    cal_match = float((st_ca[mca] == argmax_idx).mean()) if nca else float("nan")
+    print(
+        f"  [L2b regression] {predicted_regime}: "
+        f"train_rows(routed)={ntr:,}  cal_rows(routed)={nca:,}  "
+        f"soft_weight_sum(train/cal)={eff_w_tr:.1f}/{eff_w_ca:.1f}  "
+        f"effective_rows(train/cal)={eff_n_tr:,}/{eff_n_ca:,}  "
+        f"label_match(train/cal)={train_match:.1%}/{cal_match:.1%}",
+        flush=True,
+    )
+    if eff_w_tr < min_route_weight_sum:
+        print(
+            f"    [warn] {predicted_regime}: too little soft-routed weight "
+            f"(sum={eff_w_tr:.1f} < {min_route_weight_sum:.1f}) — skipping pair.",
+            flush=True,
+        )
+        return predicted_regime, None
+
+    X_g = X_tr
+    y_mfe_g = mfe_tr
+    y_mae_g = mae_tr
+    w_base = _opp_regression_sample_weights(y_mfe_g, predicted_regime) * route_w_tr
+
+    if eff_w_ca >= 50.0:
+        X_va = X_ca
+        y_mfe_va = mfe_ca
+        y_mae_va = mae_ca
+        route_w_val = route_w_ca
+    else:
+        tail = min(5000, len(X_g))
+        X_va = X_g[-tail:]
+        y_mfe_va = y_mfe_g[-tail:]
+        y_mae_va = y_mae_g[-tail:]
+        route_w_val = route_w_tr[-tail:]
+
+    cb = _lgb_train_callbacks(reg_es)
+    d_mfe_tr = lgb.Dataset(X_g, label=y_mfe_g, weight=w_base, feature_name=all_bo_feats, free_raw_data=False)
+    d_mfe_va = lgb.Dataset(X_va, label=y_mfe_va, weight=route_w_val, feature_name=all_bo_feats, free_raw_data=False)
+    print(f"    [L2b regression] {predicted_regime}: train MFE head …", flush=True)
+    m_mfe = lgb.train(
+        base_reg, d_mfe_tr, num_boost_round=reg_rounds, valid_sets=[d_mfe_va], callbacks=cb,
+    )
+    w_mae = _opp_regression_sample_weights(y_mae_g, predicted_regime) * route_w_tr
+    d_mae_tr = lgb.Dataset(X_g, label=y_mae_g, weight=w_mae, feature_name=all_bo_feats, free_raw_data=False)
+    d_mae_va = lgb.Dataset(X_va, label=y_mae_va, weight=route_w_val, feature_name=all_bo_feats, free_raw_data=False)
+    print(f"    [L2b regression] {predicted_regime}: train MAE head …", flush=True)
+    m_mae = lgb.train(
+        base_reg, d_mae_tr, num_boost_round=reg_rounds, valid_sets=[d_mae_va], callbacks=cb,
+    )
+    return predicted_regime, {"mfe": m_mfe, "mae": m_mae}
+
+
+def _resolve_l2b_reg_parallel_workers() -> tuple[int, str]:
+    """How many regime heads to train concurrently. Empty / ``auto`` ⇒ ``~sqrt(cpu)``, capped at 6."""
+    raw = os.environ.get("L2B_REG_PARALLEL_WORKERS", "").strip()
+    n_reg = len(REGIMES_6)
+    cpu = max(1, os.cpu_count() or 4)
+    if not raw or raw.lower() == "auto":
+        w = int(max(1, round(cpu**0.5)))
+        w = min(w, n_reg)
+        return w, f"auto (cpu={cpu})"
+    n = int(raw)
+    if n <= 1:
+        return 1, "sequential"
+    return min(n, n_reg), f"manual={n}"
+
 
 def _train_regime_opp_regression_models(
     X: np.ndarray,
@@ -47,6 +156,10 @@ def _train_regime_opp_regression_models(
     Six regimes ⇒ fewer routed cal rows per bucket than old 3-way groups — default min row
     count is lower (``L2B_OPP_CAL_MIN_ROWS``). A global soft-mixture threshold is also
     calibrated on the full cal split for downstream mixture routing.
+
+    Parallelism: by default picks a worker count from ``cpu_count`` (roughly ``sqrt(n_cpu)``, max 6).
+    Override with ``L2B_REG_PARALLEL_WORKERS``: ``0`` / ``1`` = sequential; a positive int = cap;
+    ``auto`` = same as unset.
     """
     reg_rounds = 1500 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ROUNDS", "4000"))
     reg_es = 150 if FAST_TRAIN_MODE else int(os.environ.get("L2B_REG_ES", "300"))
@@ -68,71 +181,114 @@ def _train_regime_opp_regression_models(
         "n_jobs": _lgbm_n_jobs(),
         **_l2b_reg_objective_params(),
     }
-    cb = _lgb_train_callbacks(reg_es)
     models: dict[str, dict[str, lgb.Booster]] = {}
 
     X_tr = X[train_mask]
     X_ca = X[cal_mask]
     st_tr = state_label[train_mask]
     st_ca = state_label[cal_mask]
-    rp_tr = regime_route_probs[train_mask]
-    rp_ca = regime_route_probs[cal_mask]
+    rp_tr = np.clip(regime_route_probs[train_mask].astype(np.float64, copy=False), 0.0, None)
+    rp_ca = np.clip(regime_route_probs[cal_mask].astype(np.float64, copy=False), 0.0, None)
     st_tr_pred = np.argmax(rp_tr, axis=1).astype(np.int64, copy=False)
     st_ca_pred = np.argmax(rp_ca, axis=1).astype(np.int64, copy=False)
     mfe_tr = mfe[train_mask]
     mae_tr = mae[train_mask]
     mfe_ca = mfe[cal_mask]
     mae_ca = mae[cal_mask]
+    route_power = float(os.environ.get("L2B_ROUTE_WEIGHT_POWER", "0.75"))
+    min_route_weight_sum = float(os.environ.get("L2B_ROUTE_WEIGHT_MIN_SUM", "600.0"))
 
-    for argmax_idx, predicted_regime in enumerate(REGIMES_6):
-        mtr = st_tr_pred == argmax_idx
-        mca = st_ca_pred == argmax_idx
-        ntr, nca = int(mtr.sum()), int(mca.sum())
-        train_match = float((st_tr[mtr] == argmax_idx).mean()) if ntr else float("nan")
-        cal_match = float((st_ca[mca] == argmax_idx).mean()) if nca else float("nan")
+    n_par, par_how = _resolve_l2b_reg_parallel_workers()
+    base_train = base_reg
+    if n_par > 1:
+        nj0 = int(base_reg.get("n_jobs", _lgbm_n_jobs()))
+        nj = max(1, min(nj0, max(1, (os.cpu_count() or 8) // n_par)))
+        base_train = {**base_reg, "n_jobs": nj}
         print(
-            f"  [L2b regression] {predicted_regime}: "
-            f"train_rows(routed)={ntr:,}  cal_rows(routed)={nca:,}  "
-            f"label_match(train/cal)={train_match:.1%}/{cal_match:.1%}"
+            f"  [L2b regression] parallel regime training: workers={n_par}  "
+            f"LightGBM n_jobs per head={nj}  ({par_how}; sequential: L2B_REG_PARALLEL_WORKERS=1)",
+            flush=True,
         )
-        if ntr < 2000:
-            print(f"    [warn] {predicted_regime}: too few train rows — skipping pair (needs ≥2000).")
-            continue
-        idx_sub = np.where(mtr)[0]
-        X_g = X_tr[idx_sub]
-        y_mfe_g = mfe_tr[idx_sub]
-        y_mae_g = mae_tr[idx_sub]
-        
-        w_base = _opp_regression_sample_weights(y_mfe_g, predicted_regime)
 
-        if nca >= 200:
-            idx_va = np.where(mca)[0]
-            X_va = X_ca[idx_va]
-            y_mfe_va = mfe_ca[idx_va]
-            y_mae_va = mae_ca[idx_va]
-        else:
-            tail = min(5000, ntr)
-            X_va = X_g[-tail:]
-            y_mfe_va = y_mfe_g[-tail:]
-            y_mae_va = y_mae_g[-tail:]
+    def _regime_task(t: tuple[int, str]) -> tuple[str, dict[str, lgb.Booster] | None]:
+        argmax_idx, predicted_regime = t
+        return _train_one_regime_opp_pair(
+            predicted_regime,
+            argmax_idx,
+            X_tr,
+            X_ca,
+            st_tr,
+            st_ca,
+            rp_tr,
+            rp_ca,
+            st_tr_pred,
+            st_ca_pred,
+            mfe_tr,
+            mae_tr,
+            mfe_ca,
+            mae_ca,
+            all_bo_feats,
+            base_train,
+            reg_rounds,
+            reg_es,
+            route_power,
+            min_route_weight_sum,
+        )
 
-        d_mfe_tr = lgb.Dataset(X_g, label=y_mfe_g, weight=w_base, feature_name=all_bo_feats, free_raw_data=False)
-        d_mfe_va = lgb.Dataset(X_va, label=y_mfe_va, feature_name=all_bo_feats, free_raw_data=False)
-        print(f"    [L2b regression] {predicted_regime}: train MFE head …", flush=True)
-        m_mfe = lgb.train(
-            base_reg, d_mfe_tr, num_boost_round=reg_rounds, valid_sets=[d_mfe_va], callbacks=cb,
-        )
-        w_mae = _opp_regression_sample_weights(y_mae_g, predicted_regime)
-        d_mae_tr = lgb.Dataset(X_g, label=y_mae_g, weight=w_mae, feature_name=all_bo_feats, free_raw_data=False)
-        d_mae_va = lgb.Dataset(X_va, label=y_mae_va, feature_name=all_bo_feats, free_raw_data=False)
-        print(f"    [L2b regression] {predicted_regime}: train MAE head …", flush=True)
-        m_mae = lgb.train(
-            base_reg, d_mae_tr, num_boost_round=reg_rounds, valid_sets=[d_mae_va], callbacks=cb,
-        )
-        models[predicted_regime] = {"mfe": m_mfe, "mae": m_mae}
+    if n_par <= 1:
+        for argmax_idx, predicted_regime in enumerate(REGIMES_6):
+            name, pair = _regime_task((argmax_idx, predicted_regime))
+            if pair is not None:
+                models[name] = pair
+    else:
+        tasks = [(i, REGIMES_6[i]) for i in range(len(REGIMES_6))]
+        with ThreadPoolExecutor(max_workers=n_par) as ex:
+            for name, pair in ex.map(_regime_task, tasks):
+                if pair is not None:
+                    models[name] = pair
 
     if not models:
         raise RuntimeError("Regime opportunity regression: no group had enough data.")
+
+    # --- A: per-regime regression quality on cal (routed by raw L2a argmax) ---
+    print("  [L2b diagnostics] A. Per-regime heads (cal, routed):", flush=True)
+    for argmax_idx, predicted_regime in enumerate(REGIMES_6):
+        if predicted_regime not in models:
+            continue
+        m = st_ca_pred == argmax_idx
+        n_r = int(m.sum())
+        if n_r < 10:
+            print(f"    {predicted_regime}: skip (n_cal_routed={n_r})", flush=True)
+            continue
+        X_r = X_ca[m]
+        y_mfe_r = mfe_ca[m]
+        y_mae_r = mae_ca[m]
+        pred_mfe = np.clip(models[predicted_regime]["mfe"].predict(X_r), 0.0, None)
+        pred_mae = np.clip(models[predicted_regime]["mae"].predict(X_r), 0.01, None)
+        r2_mfe = float(r2_score(y_mfe_r, pred_mfe)) if n_r > 2 else float("nan")
+        r2_mae = float(r2_score(y_mae_r, pred_mae)) if n_r > 2 else float("nan")
+        print(
+            f"    {predicted_regime}: MFE R²={r2_mfe:.3f}, MAE R²={r2_mae:.3f}  (n={n_r:,})",
+            flush=True,
+        )
+        print(
+            f"      MFE pred [{pred_mfe.min():.4f}, {pred_mfe.max():.4f}]  "
+            f"true [{y_mfe_r.min():.4f}, {y_mfe_r.max():.4f}]",
+            flush=True,
+        )
+        print(
+            f"      MAE pred [{pred_mae.min():.4f}, {pred_mae.max():.4f}]  "
+            f"true [{y_mae_r.min():.4f}, {y_mae_r.max():.4f}]",
+            flush=True,
+        )
+        t_spread = float(y_mfe_r.max() - y_mfe_r.min())
+        p_spread = float(pred_mfe.max() - pred_mfe.min())
+        if t_spread > 1e-6:
+            print(
+                f"      MFE spread ratio pred/true={p_spread / t_spread:.3f} "
+                f"(<<1 often means compressed preds)",
+                flush=True,
+            )
 
     # L2a routing: argmax on raw regime probs → class index k == predicted_regime REGIMES_6[k]
     gix_cal = st_ca_pred
@@ -224,26 +380,38 @@ def _available_l2b_regime_indices(models: dict[str, dict[str, lgb.Booster]]) -> 
     return [idx for idx, regime in enumerate(REGIMES_6) if regime in models]
 
 
-def _compute_opportunity_triplet(
+def _compute_opportunity_triplet_with_regime_opp(
     X: np.ndarray,
     regime_probs: np.ndarray,
     models: dict[str, dict[str, lgb.Booster]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Soft mixture over regime experts: expected MFE/MAE then log opportunity."""
+    *,
+    tqdm_regime_desc: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Soft-mixture triplet plus per-regime opportunity matrix for directional features."""
     n = len(X)
     opp = np.zeros(n, dtype=np.float64)
     mfe_p = np.zeros(n, dtype=np.float64)
     mae_p = np.zeros(n, dtype=np.float64)
+    opp_regime = np.zeros((n, len(REGIMES_6)), dtype=np.float64)
     if n == 0 or not models:
-        return opp, mfe_p, mae_p
+        return opp, mfe_p, mae_p, opp_regime
 
     available = _available_l2b_regime_indices(models)
     if not available:
-        return opp, mfe_p, mae_p
+        return opp, mfe_p, mae_p, opp_regime
 
     mfe_stack: list[np.ndarray] = []
     mae_stack: list[np.ndarray] = []
-    for idx in available:
+    regime_iter = available
+    if tqdm_regime_desc:
+        regime_iter = _tq(
+            available,
+            desc=tqdm_regime_desc,
+            total=len(available),
+            unit="regime",
+            leave=False,
+        )
+    for idx in regime_iter:
         regime = REGIMES_6[idx]
         mf = np.clip(models[regime]["mfe"].predict(X), 0.0, None)
         ma = np.clip(models[regime]["mae"].predict(X), 0.01, None)
@@ -252,7 +420,7 @@ def _compute_opportunity_triplet(
 
     weights = np.clip(regime_probs[:, available].astype(np.float64, copy=False), 0.0, None)
     if weights.shape[1] == 0:
-        return opp, mfe_p, mae_p
+        return opp, mfe_p, mae_p, opp_regime
     denom = weights.sum(axis=1, keepdims=True)
     weights = np.divide(
         weights,
@@ -262,9 +430,25 @@ def _compute_opportunity_triplet(
     )
     mfe_mat = np.column_stack(mfe_stack)
     mae_mat = np.column_stack(mae_stack)
+    opp_mat = np.log1p(mfe_mat) - np.log1p(mae_mat)
+    opp_regime[:, available] = opp_mat
     mfe_p = np.sum(weights * mfe_mat, axis=1)
     mae_p = np.sum(weights * mae_mat, axis=1)
     opp = np.log1p(mfe_p) - np.log1p(mae_p)
+    return opp, mfe_p, mae_p, opp_regime
+
+
+def _compute_opportunity_triplet(
+    X: np.ndarray,
+    regime_probs: np.ndarray,
+    models: dict[str, dict[str, lgb.Booster]],
+    *,
+    tqdm_regime_desc: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Soft mixture over regime experts: expected MFE/MAE then log opportunity."""
+    opp, mfe_p, mae_p, _ = _compute_opportunity_triplet_with_regime_opp(
+        X, regime_probs, models, tqdm_regime_desc=tqdm_regime_desc
+    )
     return opp, mfe_p, mae_p
 
 
@@ -275,6 +459,136 @@ def _compute_opportunity_scores(
 ) -> np.ndarray:
     o, _, _ = _compute_opportunity_triplet(X, regime_probs, models)
     return o
+
+
+def _regime_context_from_probs(regime_probs: np.ndarray) -> dict[str, np.ndarray]:
+    rp = np.clip(regime_probs.astype(np.float64, copy=False), 0.0, None)
+    denom = rp.sum(axis=1, keepdims=True)
+    rp = np.divide(
+        rp,
+        denom,
+        out=np.full_like(rp, 1.0 / max(rp.shape[1], 1)),
+        where=denom > 1e-12,
+    )
+    bull_mass = rp[:, 0] + rp[:, 1]
+    bear_mass = rp[:, 2] + rp[:, 3]
+    range_mass = rp[:, 4] + rp[:, 5]
+    conf = rp.max(axis=1)
+    rp_sorted = np.sort(rp, axis=1)
+    margin = rp_sorted[:, -1] - rp_sorted[:, -2]
+    entropy = -np.sum(rp * np.log(np.clip(rp, 1e-12, None)), axis=1)
+    return {
+        "bull_mass": bull_mass,
+        "bear_mass": bear_mass,
+        "range_mass": range_mass,
+        "conf": conf,
+        "margin": margin,
+        "entropy": entropy,
+    }
+
+
+def _attach_l2b_regime_context_features(work: pd.DataFrame, regime_probs: np.ndarray) -> None:
+    ctx = _regime_context_from_probs(regime_probs)
+    work["l2b_bull_mass"] = ctx["bull_mass"]
+    work["l2b_bear_mass"] = ctx["bear_mass"]
+    work["l2b_range_mass"] = ctx["range_mass"]
+    work["l2b_regime_margin"] = ctx["margin"]
+    work["l2b_regime_entropy"] = ctx["entropy"]
+
+
+def _build_l2b_directional_feature_matrix(
+    regime_probs: np.ndarray,
+    opp: np.ndarray,
+    mfe: np.ndarray,
+    mae: np.ndarray,
+    regime_opp: np.ndarray | None = None,
+    tcn_transition_prob: np.ndarray | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    rp = np.clip(regime_probs.astype(np.float64, copy=False), 0.0, None)
+    denom = rp.sum(axis=1, keepdims=True)
+    rp = np.divide(
+        rp,
+        denom,
+        out=np.full_like(rp, 1.0 / max(rp.shape[1], 1)),
+        where=denom > 1e-12,
+    )
+    ctx = _regime_context_from_probs(rp)
+    opp64 = opp.astype(np.float64, copy=False)
+    mfe64 = mfe.astype(np.float64, copy=False)
+    mae64 = mae.astype(np.float64, copy=False)
+    mfe_mae_gap = mfe64 - mae64
+    mfe_mae_ratio = np.divide(mfe64, np.maximum(mae64, 0.05))
+    bull_edge = opp64 * ctx["bull_mass"]
+    bear_edge = opp64 * ctx["bear_mass"]
+    range_drag = opp64 * ctx["range_mass"]
+    opp_x_regime = opp64[:, None] * rp
+    if regime_opp is None:
+        regime_opp64 = np.repeat(opp64.reshape(-1, 1), rp.shape[1], axis=1)
+    else:
+        regime_opp64 = np.asarray(regime_opp, dtype=np.float64)
+    opp_best = regime_opp64.max(axis=1)
+    opp_worst = regime_opp64.min(axis=1)
+    opp_std = regime_opp64.std(axis=1)
+    opp_range = opp_best - opp_worst
+    top2_idx = np.argsort(rp, axis=1)[:, -2:]
+    top2_weights = np.take_along_axis(rp, top2_idx, axis=1)
+    top2_opp = np.take_along_axis(regime_opp64, top2_idx, axis=1)
+    top2_denom = np.maximum(top2_weights.sum(axis=1), 1e-12)
+    opp_top2_weighted = np.sum(top2_weights * top2_opp, axis=1) / top2_denom
+    conf_x_opp = ctx["conf"] * opp64
+
+    blocks = [
+        opp64.reshape(-1, 1),
+        mfe64.reshape(-1, 1),
+        mae64.reshape(-1, 1),
+        mfe_mae_gap.reshape(-1, 1),
+        mfe_mae_ratio.reshape(-1, 1),
+        bull_edge.reshape(-1, 1),
+        bear_edge.reshape(-1, 1),
+        range_drag.reshape(-1, 1),
+        ctx["conf"].reshape(-1, 1),
+        ctx["bull_mass"].reshape(-1, 1),
+        ctx["bear_mass"].reshape(-1, 1),
+        ctx["range_mass"].reshape(-1, 1),
+        ctx["margin"].reshape(-1, 1),
+        ctx["entropy"].reshape(-1, 1),
+        opp_best.reshape(-1, 1),
+        opp_worst.reshape(-1, 1),
+        opp_std.reshape(-1, 1),
+        opp_range.reshape(-1, 1),
+        opp_top2_weighted.reshape(-1, 1),
+        conf_x_opp.reshape(-1, 1),
+        rp,
+        opp_x_regime,
+        regime_opp64,
+    ]
+    cols = (
+        list(L2B_DIRECTIONAL_BASE_COLS)
+        + list(L2B_OPP_SUMMARY_COLS)
+        + list(REGIME_NOW_PROB_COLS)
+        + list(L2B_OPP_X_REGIME_COLS)
+        + list(L2B_PER_REGIME_OPP_COLS)
+    )
+    if tcn_transition_prob is not None:
+        blocks.append(np.asarray(tcn_transition_prob, dtype=np.float64).reshape(-1, 1))
+        cols.append("tcn_transition_prob")
+    return np.hstack(blocks).astype(np.float32, copy=False), cols
+
+
+def _align_feature_matrix_to_names(
+    X: np.ndarray,
+    feature_names: list[str],
+    target_names: list[str],
+) -> np.ndarray:
+    if feature_names == target_names:
+        return X
+    pos = {name: idx for idx, name in enumerate(feature_names)}
+    out = np.zeros((len(X), len(target_names)), dtype=np.float32)
+    for j, name in enumerate(target_names):
+        idx = pos.get(name)
+        if idx is not None:
+            out[:, j] = X[:, idx]
+    return out
 
 
 def _l2b_triplet_from_trade_prob(p_trade: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -292,6 +606,69 @@ def _opp_to_synthetic_p_trade(opp: np.ndarray, thr_row: np.ndarray, kappa: float
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
+def _compose_two_stage_gate_probs(
+    p_trade: np.ndarray,
+    p_long_given_trade: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compose Stage1(has_trade) and Stage2(direction) into LONG/SHORT gate probabilities."""
+    pt = np.clip(np.asarray(p_trade, dtype=np.float64), 0.0, 1.0)
+    pd = np.clip(np.asarray(p_long_given_trade, dtype=np.float64), 0.0, 1.0)
+    p_long = pt * pd
+    p_short = pt * (1.0 - pd)
+    return p_long, p_short
+
+
+def _build_l2b_gate_meta_features(
+    p_long_gate: np.ndarray,
+    p_short_gate: np.ndarray,
+) -> tuple[np.ndarray, list[str]]:
+    """Compact gate-derived features for Layer 3."""
+    pl = np.clip(np.asarray(p_long_gate, dtype=np.float64), 0.0, 1.0)
+    ps = np.clip(np.asarray(p_short_gate, dtype=np.float64), 0.0, 1.0)
+    spread = pl - ps
+    gate_max = np.maximum(pl, ps)
+    denom = np.maximum(pl + ps, 1e-9)
+    p_dir = np.clip(pl / denom, 1e-9, 1.0 - 1e-9)
+    entropy = -(p_dir * np.log(p_dir) + (1.0 - p_dir) * np.log(1.0 - p_dir))
+    blk = np.hstack([
+        pl.reshape(-1, 1),
+        ps.reshape(-1, 1),
+        spread.reshape(-1, 1),
+        gate_max.reshape(-1, 1),
+        entropy.reshape(-1, 1),
+    ]).astype(np.float32, copy=False)
+    return blk, list(L2B_META_GATE_ALL_COLS)
+
+
+def _build_l3_interaction_features(
+    opp: np.ndarray,
+    mfe: np.ndarray,
+    mae: np.ndarray,
+    p_long_gate: np.ndarray,
+    p_short_gate: np.ndarray,
+) -> tuple[np.ndarray, list[str]]:
+    """Small set of explicit L3 interactions between gate confidence and L2b economics."""
+    opp64 = np.asarray(opp, dtype=np.float64)
+    mfe64 = np.asarray(mfe, dtype=np.float64)
+    mae64 = np.asarray(mae, dtype=np.float64)
+    pl = np.clip(np.asarray(p_long_gate, dtype=np.float64), 0.0, 1.0)
+    ps = np.clip(np.asarray(p_short_gate, dtype=np.float64), 0.0, 1.0)
+    gate_max = np.maximum(pl, ps)
+    gate_spread = pl - ps
+    rr_ratio = np.divide(mfe64, np.maximum(mae64, 0.05))
+    gate_x_mfe = gate_max * mfe64
+    gate_x_rr = gate_max * rr_ratio
+    gate_spread_x_opp = gate_spread * opp64
+    signal_agree = ((gate_max >= 0.20) & (rr_ratio >= 1.5)).astype(np.float64)
+    blk = np.hstack([
+        gate_x_mfe.reshape(-1, 1),
+        gate_x_rr.reshape(-1, 1),
+        gate_spread_x_opp.reshape(-1, 1),
+        signal_agree.reshape(-1, 1),
+    ]).astype(np.float32, copy=False)
+    return blk, list(L3_INTERACTION_FEATURE_COLS)
+
+
 def _layer3_fill_trade_stack_probs_gates(
     trade_quality_models: dict,
     work: pd.DataFrame,
@@ -304,27 +681,50 @@ def _layer3_fill_trade_stack_probs_gates(
 ) -> None:
     s1_long = trade_quality_models.get("step1_long")
     s1_short = trade_quality_models.get("step1_short")
+    s1_trade = trade_quality_models.get("step1_has_trade")
+    s2_dir = trade_quality_models.get("step2_direction")
     regb = trade_quality_models.get("step1_regression")
 
     regime_mat = work[list(REGIME_NOW_PROB_COLS)].to_numpy(dtype=np.float32, copy=False)
     models = _l2b_nested_opp_models(regb) if regb else {}
     thr_vec = regb["thr_vec"] if regb else None
+    gate_feature_cols = trade_quality_models.get("gate_feature_cols")
+    has_two_stage = s1_trade is not None and s2_dir is not None
+    has_legacy = s1_long is not None and s1_short is not None
+    tcn_full = work["tcn_transition_prob"].to_numpy(dtype=np.float32, copy=False) if "tcn_transition_prob" in work.columns else None
 
     n = len(work)
     n_chunk = (n + chunk - 1) // chunk
     for i in _tq(range(0, n, chunk), desc=tqdm_desc, total=n_chunk, unit="chunk"):
         j = min(i + chunk, n)
         x_b = work[layer2_feats].iloc[i:j].to_numpy(dtype=np.float32, copy=False)
+        rp = regime_mat[i:j]
+        tcn_chunk = tcn_full[i:j] if tcn_full is not None else None
 
-        if s1_long is not None and s1_short is not None:
-            pl = 1.0 / (1.0 + np.exp(-s1_long.predict(x_b)))
-            ps = 1.0 / (1.0 + np.exp(-s1_short.predict(x_b)))
-            rp = regime_mat[i:j]
+        if has_two_stage or has_legacy:
+            target_gate_cols = gate_feature_cols
+            if not target_gate_cols:
+                model_for_schema = s1_trade if has_two_stage else s1_long
+                target_gate_cols = [str(c) for c in model_for_schema.feature_name()]
+            if set(target_gate_cols).issubset(set(layer2_feats)):
+                x_gate = _align_feature_matrix_to_names(x_b, layer2_feats, target_gate_cols)
+            else:
+                opp, mfe_p, mae_p, opp_regime = _compute_opportunity_triplet_with_regime_opp(x_b, rp, models)
+                x_gate_full, x_gate_cols = _build_l2b_directional_feature_matrix(
+                    rp, opp, mfe_p, mae_p, opp_regime, tcn_chunk
+                )
+                x_gate = _align_feature_matrix_to_names(x_gate_full, x_gate_cols, target_gate_cols)
+            if s1_trade is not None and s2_dir is not None:
+                pt = s1_trade.predict(x_gate)
+                pd = s2_dir.predict(x_gate)
+                pl, ps = _compose_two_stage_gate_probs(pt, pd)
+            else:
+                pl = s1_long.predict(x_gate)
+                ps = s1_short.predict(x_gate)
             p_rm = rp[:, RANGE_REGIME_INDICES].sum(axis=1)
             p_long_gate[i:j] = pl * (1.0 - 0.7 * p_rm)
             p_short_gate[i:j] = ps * (1.0 - 0.7 * p_rm)
         else:
-            rp = regime_mat[i:j]
             opp = _compute_opportunity_scores(x_b, rp, models)
             soft_thr = float(regb.get("soft_opp_threshold", np.nan)) if regb else float("nan")
             if np.isfinite(soft_thr):
@@ -338,7 +738,7 @@ def _layer3_fill_trade_stack_probs_gates(
 
 
 def _print_quality_label_outcome_stats(df: pd.DataFrame, y6: np.ndarray) -> None:
-    """Mean MFE/ATR, MAE/ATR, RR by KMeans-derived quality class (A/B sanity check)."""
+    """Mean MFE/ATR, MAE/ATR, RR by trade-quality class."""
     lbl_atr = df["lbl_atr"].values
     safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
     mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
@@ -361,141 +761,294 @@ def _print_quality_label_outcome_stats(df: pd.DataFrame, y6: np.ndarray) -> None
             print(f"    Δ({name}): Δmfe={dmfe:+.3f}  Δrr={drr:+.3f}")
 
 
-def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
-    """
-    Build 6-class joint discrete labels using Unsupervised Clustering (K-Means)
-    on outcome metrics (MFE/ATR, MAE/ATR, RR, log1p(Hold_Time)) for breakouts.
-    This replaces the rule-based approach with data-driven statistical groupings.
-    """
+def _quality_label_rule_params() -> dict[str, Any]:
+    """Economically meaningful label thresholds for Layer 2b."""
+    mode = os.environ.get("L2B_LABEL_DIRECTION_MODE", "hybrid_ratio").strip().lower() or "hybrid_ratio"
+    if mode not in {"strict", "ratio", "hybrid_ratio"}:
+        mode = "hybrid_ratio"
+    return {
+        "direction_mode": mode,
+        "rr_thr": float(os.environ.get("L2B_LABEL_RR_THR", "2.0")),
+        "min_mfe": float(os.environ.get("L2B_LABEL_MIN_MFE", "0.5")),
+        "ratio_thr": float(os.environ.get("L2B_LABEL_RATIO_THR", "1.20")),
+        "ratio_min_mfe": float(os.environ.get("L2B_LABEL_RATIO_MIN_MFE", "0.20")),
+        "weak_rr_thr": float(os.environ.get("L2B_LABEL_WEAK_RR_THR", "1.25")),
+        "weak_min_mfe": float(os.environ.get("L2B_LABEL_WEAK_MIN_MFE", "0.35")),
+        "weak_ratio_thr": float(os.environ.get("L2B_LABEL_WEAK_RATIO_THR", "1.10")),
+        "weak_ratio_min_mfe": float(os.environ.get("L2B_LABEL_WEAK_RATIO_MIN_MFE", "0.15")),
+    }
+
+
+def _trade_quality_rule_state(df: pd.DataFrame) -> dict[str, Any]:
+    """Precompute label-rule metrics and masks so training and diagnostics stay consistent."""
     lbl_atr = df["lbl_atr"].values
     safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
     mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
     mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
     hold_time = np.maximum(df["exit_bar"].fillna(0).values.astype(float), 0.0)
-    
-    # ---------------------------------------------------------
-    # OPTIONS GAMMA SCALPING: Time-decay on MFE
-    # ---------------------------------------------------------
-    # Penalize slow favorable moves so trade-quality labels reflect theta-sensitive intraday options.
+
+    # Penalize slow favorable moves so labels reflect theta-sensitive intraday options.
     gamma_decay = _theta_decay_from_bars(hold_time)
     mfe = mfe * gamma_decay
-    
     rr = mfe / np.maximum(mae, 0.1)
-    # Right-skewed hold lengths: log1p before Z-score so K-Means isn't dominated by rare long holds
-    log_hold_time = np.log1p(hold_time)
+    ratio = mfe / np.maximum(mae, 0.1)
 
     qbull = df["quality_bull_breakout"].fillna(0).values.astype(int)
     qbear = df["quality_bear_breakout"].fillna(0).values.astype(int)
     state = df["state_label"].fillna(2).values.astype(int)
+    params = _quality_label_rule_params()
+
+    both_breakout = (qbull == 1) & (qbear == 1)
+    long_mask = (qbull == 1) & (qbear == 0)
+    short_mask = (qbear == 1) & (qbull == 0)
+    no_breakout = (qbull == 0) & (qbear == 0)
+    bull_state = np.isin(state, (0, 1))
+    bear_state = np.isin(state, (2, 3))
+    range_state = np.isin(state, (4, 5))
+    directional_chop = mae > mfe
+
+    breakout_trade_strict = (rr >= params["rr_thr"]) & (mfe >= params["min_mfe"])
+    breakout_trade_ratio = (ratio >= params["ratio_thr"]) & (mfe >= params["ratio_min_mfe"])
+    weak_trade_strict = (rr >= params["weak_rr_thr"]) & (mfe >= params["weak_min_mfe"])
+    weak_trade_ratio = (ratio >= params["weak_ratio_thr"]) & (mfe >= params["weak_ratio_min_mfe"])
+
+    mode = str(params["direction_mode"])
+    if mode == "strict":
+        breakout_trade_final = breakout_trade_strict
+        weak_trade_final = weak_trade_strict
+    elif mode == "ratio":
+        breakout_trade_final = breakout_trade_ratio
+        weak_trade_final = weak_trade_ratio
+    else:
+        breakout_trade_final = breakout_trade_strict | breakout_trade_ratio
+        weak_trade_final = weak_trade_strict | weak_trade_ratio
+
+    breakout_long_strict = long_mask & breakout_trade_strict
+    breakout_short_strict = short_mask & breakout_trade_strict
+    breakout_long_ratio = long_mask & breakout_trade_ratio
+    breakout_short_ratio = short_mask & breakout_trade_ratio
+    breakout_long_final = long_mask & breakout_trade_final
+    breakout_short_final = short_mask & breakout_trade_final
+
+    trend_long_strict = no_breakout & bull_state & weak_trade_strict
+    trend_short_strict = no_breakout & bear_state & weak_trade_strict
+    trend_long_ratio = no_breakout & bull_state & weak_trade_ratio
+    trend_short_ratio = no_breakout & bear_state & weak_trade_ratio
+    trend_long_final = no_breakout & bull_state & weak_trade_final
+    trend_short_final = no_breakout & bear_state & weak_trade_final
+
+    strict_trade_mask = breakout_long_strict | breakout_short_strict | trend_long_strict | trend_short_strict
+    ratio_trade_mask = breakout_long_ratio | breakout_short_ratio | trend_long_ratio | trend_short_ratio
+    final_trade_mask = breakout_long_final | breakout_short_final | trend_long_final | trend_short_final
+
+    breakout_ambiguous = (long_mask | short_mask) & ~(breakout_long_final | breakout_short_final)
+    relaxed_only_breakout = (long_mask | short_mask) & breakout_trade_ratio & ~breakout_trade_strict
+    relaxed_only_weak = no_breakout & weak_trade_ratio & ~weak_trade_strict & (bull_state | bear_state)
+
+    return {
+        "params": params,
+        "mfe": mfe,
+        "mae": mae,
+        "rr": rr,
+        "ratio": ratio,
+        "qbull": qbull,
+        "qbear": qbear,
+        "state": state,
+        "both_breakout": both_breakout,
+        "long_mask": long_mask,
+        "short_mask": short_mask,
+        "no_breakout": no_breakout,
+        "range_state": range_state,
+        "directional_chop": directional_chop,
+        "breakout_long_strict": breakout_long_strict,
+        "breakout_short_strict": breakout_short_strict,
+        "breakout_long_ratio": breakout_long_ratio,
+        "breakout_short_ratio": breakout_short_ratio,
+        "breakout_long_final": breakout_long_final,
+        "breakout_short_final": breakout_short_final,
+        "trend_long_strict": trend_long_strict,
+        "trend_short_strict": trend_short_strict,
+        "trend_long_ratio": trend_long_ratio,
+        "trend_short_ratio": trend_short_ratio,
+        "trend_long_final": trend_long_final,
+        "trend_short_final": trend_short_final,
+        "strict_trade_mask": strict_trade_mask,
+        "ratio_trade_mask": ratio_trade_mask,
+        "final_trade_mask": final_trade_mask,
+        "breakout_ambiguous": breakout_ambiguous,
+        "relaxed_only_breakout": relaxed_only_breakout,
+        "relaxed_only_weak": relaxed_only_weak,
+    }
+
+
+def _build_trade_quality_targets(df: pd.DataFrame) -> np.ndarray:
+    """
+    Build 4-class trade-quality labels from deterministic MFE/MAE economics.
+
+    LONG / SHORT:
+      directional breakout (or weak directional rescue) with sufficient
+      risk-reward and absolute favorable excursion.
+    CHOP:
+      ambiguous direction or adverse move dominates favorable move.
+    NEUTRAL:
+      everything else.
+    """
+    rule = _trade_quality_rule_state(df)
+    params = rule["params"]
+    both_breakout = rule["both_breakout"]
+    long_mask = rule["long_mask"]
+    short_mask = rule["short_mask"]
+    breakout_ambiguous = rule["breakout_ambiguous"]
+    directional_chop = rule["directional_chop"]
+    no_breakout = rule["no_breakout"]
+    range_state = rule["range_state"]
 
     y = np.full(len(df), 1, dtype=int)  # default NEUTRAL
 
-    both_breakout = (qbull == 1) & (qbear == 1)
     y[both_breakout] = 2  # CHOP
-
-    long_mask = (qbull == 1) & (qbear == 0)
-    short_mask = (qbear == 1) & (qbull == 0)
     print(
-        f"  [L2b labels] KMeans setup — long={int(long_mask.sum()):,} short={int(short_mask.sum()):,} rows …",
+        "  [L2b labels] directional setup — "
+        f"mode={params['direction_mode']}  "
+        f"rr_thr={params['rr_thr']:.2f}  min_mfe={params['min_mfe']:.2f}  "
+        f"ratio_thr={params['ratio_thr']:.2f}  ratio_min_mfe={params['ratio_min_mfe']:.2f}  "
+        f"weak_rr_thr={params['weak_rr_thr']:.2f}  weak_min_mfe={params['weak_min_mfe']:.2f}  "
+        f"weak_ratio_thr={params['weak_ratio_thr']:.2f}  weak_ratio_min_mfe={params['weak_ratio_min_mfe']:.2f}  "
+        f"long={int(long_mask.sum()):,} short={int(short_mask.sum()):,} rows …",
         flush=True,
     )
 
-    def _cluster_and_assign(mask: np.ndarray, is_long: bool):
-        indices = np.where(mask)[0]
-        if len(indices) < 3:
-            # Fallback if too few samples
-            y[mask] = 0 if is_long else 3
-            return
-
-        # Features: [MFE, MAE, RR, log1p(Hold_Time)] then Z-score below
-        X_cluster = np.column_stack([
-            mfe[indices],
-            mae[indices],
-            rr[indices],
-            log_hold_time[indices],
-        ])
-
-        # Find train indices within this mask to avoid data leakage
-        train_indices_mask = mask & (df["time_key"].values < np.datetime64(TRAIN_END))
-        
-        # If train set is too small, fallback to using all indices for stats
-        if train_indices_mask.sum() < 5:
-            train_indices = indices
-            X_train_cluster = X_cluster
-        else:
-            train_indices = np.where(train_indices_mask)[0]
-            X_train_cluster = np.column_stack([
-                mfe[train_indices],
-                mae[train_indices],
-                rr[train_indices],
-                log_hold_time[train_indices],
-            ])
-
-        # Z-score normalization using train statistics
-        X_mean = X_train_cluster.mean(axis=0)
-        X_std = X_train_cluster.std(axis=0) + 1e-6
-        X_scaled = (X_cluster - X_mean) / X_std
-        X_train_scaled = (X_train_cluster - X_mean) / X_std
-
-        # GMM clustering into 2 classes (TRADE, CHOP)
-        gmm = GaussianMixture(n_components=2, covariance_type='full', random_state=42, n_init=5)
-        gmm.fit(X_train_scaled)
-        clusters = gmm.predict(X_scaled)
-        train_clusters = clusters[np.isin(indices, train_indices)]
-
-        # Interpret clusters based on heuristic score on train data
-        cluster_scores = []
-        for c in range(2):
-            c_mask = (train_clusters == c)
-            if not c_mask.any():
-                cluster_scores.append(-1000)
-                continue
-            c_mfe = mfe[train_indices][c_mask].mean()
-            c_mae = mae[train_indices][c_mask].mean()
-            c_rr = rr[train_indices][c_mask].mean()
-            score = c_mfe + c_rr - c_mae
-            cluster_scores.append(score)
-
-        # Sort clusters by score descending
-        ranked_clusters = np.argsort(cluster_scores)[::-1]
-        
-        # Best score -> TRADE
-        # Lowest score -> CHOP
-        trade_cluster = ranked_clusters[0]
-        chop_cluster = ranked_clusters[1]
-
-        label_trade = 0 if is_long else 3
-        label_chop = 2
-
-        for c, label in [(trade_cluster, label_trade), 
-                         (chop_cluster, label_chop)]:
-            c_idx = indices[clusters == c]
-            y[c_idx] = label
-
-    # Apply clustering separately for longs and shorts
-    if long_mask.any():
-        print(
-            f"  [L2b labels] KMeans long breakouts: n={int(long_mask.sum()):,} …",
-            flush=True,
-        )
-        _cluster_and_assign(long_mask, is_long=True)
-    if short_mask.any():
-        print(
-            f"  [L2b labels] KMeans short breakouts: n={int(short_mask.sum()):,} …",
-            flush=True,
-        )
-        _cluster_and_assign(short_mask, is_long=False)
+    y[rule["breakout_long_final"]] = 0
+    y[rule["breakout_short_final"]] = 3
+    y[breakout_ambiguous & directional_chop] = 2
+    y[breakout_ambiguous & ~directional_chop] = 1
 
     # Non-breakout bars in trend regimes may still offer weak directional quality.
-    no_breakout = (qbull == 0) & (qbear == 0)
-    trend_long_weak = no_breakout & (state == 0) & (mfe >= 0.35) & (rr >= 0.40)
-    trend_short_weak = no_breakout & (state == 1) & (mfe >= 0.35) & (rr >= 0.40)
-    y[trend_long_weak] = 0
-    y[trend_short_weak] = 3
-    range_state = np.isin(state, (4, 5))
+    y[rule["trend_long_final"]] = 0
+    y[rule["trend_short_final"]] = 3
     y[no_breakout & range_state] = 2
-    y[no_breakout & ~range_state & ~(trend_long_weak | trend_short_weak)] = 1
+    y[no_breakout & ~range_state & ~(rule["trend_long_final"] | rule["trend_short_final"])] = 1
+
+    print(
+        "  [L2b labels] assignment summary — "
+        f"breakout_long={int(rule['breakout_long_final'].sum()):,}  "
+        f"breakout_short={int(rule['breakout_short_final'].sum()):,}  "
+        f"ambiguous_to_chop={int((breakout_ambiguous & directional_chop).sum()):,}  "
+        f"weak_long={int(rule['trend_long_final'].sum()):,}  "
+        f"weak_short={int(rule['trend_short_final'].sum()):,}",
+        flush=True,
+    )
+    print(
+        "  [L2b labels] funnel wideners — "
+        f"strict_trade={int(rule['strict_trade_mask'].sum()):,}  "
+        f"relaxed_trade={int(rule['ratio_trade_mask'].sum()):,}  "
+        f"final_trade={int(rule['final_trade_mask'].sum()):,}  "
+        f"relaxed_only_breakout={int(rule['relaxed_only_breakout'].sum()):,}  "
+        f"relaxed_only_weak={int(rule['relaxed_only_weak'].sum()):,}",
+        flush=True,
+    )
     return y
+
+
+def _diagnose_l2b_label_funnel(df: pd.DataFrame, y6: np.ndarray, train_end: str) -> None:
+    """Print label funnel diagnostics across train/cal/test splits."""
+    rule = _trade_quality_rule_state(df)
+    params = rule["params"]
+    qbull = rule["qbull"]
+    qbear = rule["qbear"]
+    mfe = rule["mfe"]
+    mae = rule["mae"]
+    rr = rule["rr"]
+    ratio = rule["ratio"]
+    t = df["time_key"].values
+
+    split_masks = [
+        ("full", np.ones(len(df), dtype=bool)),
+        ("train", t < np.datetime64(train_end)),
+        ("cal", (t >= np.datetime64(train_end)) & (t < np.datetime64(CAL_END))),
+        ("test", (t >= np.datetime64(CAL_END)) & (t < np.datetime64(TEST_END))),
+    ]
+
+    print("\n[L2b label funnel]")
+    print(
+        "  Directional thresholds: "
+        f"mode={params['direction_mode']}  "
+        f"rr_thr={params['rr_thr']:.2f}  min_mfe={params['min_mfe']:.2f}  "
+        f"ratio_thr={params['ratio_thr']:.2f}  ratio_min_mfe={params['ratio_min_mfe']:.2f}  "
+        f"weak_rr_thr={params['weak_rr_thr']:.2f}  weak_min_mfe={params['weak_min_mfe']:.2f}  "
+        f"weak_ratio_thr={params['weak_ratio_thr']:.2f}  weak_ratio_min_mfe={params['weak_ratio_min_mfe']:.2f}",
+        flush=True,
+    )
+    for split_name, mask in split_masks:
+        n = int(mask.sum())
+        if n <= 0:
+            continue
+        long_breakout = mask & (qbull == 1) & (qbear == 0)
+        short_breakout = mask & (qbear == 1) & (qbull == 0)
+        both_breakout = mask & (qbull == 1) & (qbear == 1)
+        long_label = mask & (y6 == 0)
+        short_label = mask & (y6 == 3)
+        chop_label = mask & (y6 == 2)
+        neutral_label = mask & (y6 == 1)
+        print(
+            f"  {split_name:>5s}: rows={n:,}  "
+            f"LONG={int(long_label.sum()):,} ({long_label.mean():.2%})  "
+            f"SHORT={int(short_label.sum()):,} ({short_label.mean():.2%})  "
+            f"CHOP={int(chop_label.sum()):,} ({chop_label.mean():.2%})  "
+            f"NEUTRAL={int(neutral_label.sum()):,} ({neutral_label.mean():.2%})",
+            flush=True,
+        )
+        print(
+            f"        breakouts: long={int(long_breakout.sum()):,}  "
+            f"short={int(short_breakout.sum()):,}  both={int(both_breakout.sum()):,}",
+            flush=True,
+        )
+        strict_long = mask & (rule["breakout_long_strict"] | rule["trend_long_strict"])
+        strict_short = mask & (rule["breakout_short_strict"] | rule["trend_short_strict"])
+        ratio_long = mask & (rule["breakout_long_ratio"] | rule["trend_long_ratio"])
+        ratio_short = mask & (rule["breakout_short_ratio"] | rule["trend_short_ratio"])
+        final_long = mask & long_label
+        final_short = mask & short_label
+        strict_trade = strict_long | strict_short
+        ratio_trade = ratio_long | ratio_short
+        final_trade = mask & np.isin(y6, list(TRADABLE_CLASS_IDS))
+        print(
+            f"        strict  LONG={strict_long.mean():.2%} SHORT={strict_short.mean():.2%} TRADE={strict_trade.mean():.2%}",
+            flush=True,
+        )
+        print(
+            f"        relaxed LONG={ratio_long.mean():.2%} SHORT={ratio_short.mean():.2%} TRADE={ratio_trade.mean():.2%}",
+            flush=True,
+        )
+        print(
+            f"        final   LONG={final_long.mean():.2%} SHORT={final_short.mean():.2%} TRADE={final_trade.mean():.2%}",
+            flush=True,
+        )
+        if long_breakout.any():
+            strict_conv = strict_long[long_breakout].mean()
+            ratio_conv = ratio_long[long_breakout].mean()
+            final_conv = final_long[long_breakout].mean()
+            print(
+                f"        long breakout -> tradable strict/relaxed/final={strict_conv:.2%}/{ratio_conv:.2%}/{final_conv:.2%}",
+                flush=True,
+            )
+        if short_breakout.any():
+            strict_conv = strict_short[short_breakout].mean()
+            ratio_conv = ratio_short[short_breakout].mean()
+            final_conv = final_short[short_breakout].mean()
+            print(
+                f"        short breakout -> tradable strict/relaxed/final={strict_conv:.2%}/{ratio_conv:.2%}/{final_conv:.2%}",
+                flush=True,
+            )
+        flat_mask = mask & ~final_trade
+        if final_trade.any() and flat_mask.any():
+            for name, arr in (("mfe", mfe), ("mae", mae), ("rr", rr), ("ratio", ratio)):
+                trade_q = np.percentile(arr[final_trade], [50, 75, 90])
+                flat_q = np.percentile(arr[flat_mask], [50, 75, 90])
+                print(
+                    f"        {name}: trade p50/p75/p90={trade_q[0]:.3f}/{trade_q[1]:.3f}/{trade_q[2]:.3f}  "
+                    f"flat={flat_q[0]:.3f}/{flat_q[1]:.3f}/{flat_q[2]:.3f}",
+                    flush=True,
+                )
 
 
 def _binary_recency_weights(timestamps: np.ndarray) -> np.ndarray:
@@ -516,6 +1069,38 @@ def _binary_scale_pos_weight(y: np.ndarray, *, max_spw: float = 50.0) -> float:
     if neg <= 0:
         return 1.0
     return float(np.clip(neg / max(pos, 1), 1.0, max_spw))
+
+
+def _regression_quality_bucket(spearman_r: float, r2: float) -> str:
+    if np.isfinite(spearman_r) and np.isfinite(r2):
+        if spearman_r > 0.30 and r2 > 0.10:
+            return "good_regression"
+        if 0.15 <= spearman_r <= 0.30 and 0.02 <= r2 <= 0.10:
+            return "coarse_ranking_only"
+        if spearman_r < 0.15 and r2 < 0.02:
+            return "mostly_noise"
+    return "mixed_signal"
+
+
+def _print_regression_quality_report(pred: np.ndarray, actual: np.ndarray, name: str) -> None:
+    pred_s = pd.Series(np.asarray(pred, dtype=np.float64))
+    actual_s = pd.Series(np.asarray(actual, dtype=np.float64))
+    mask = pred_s.notna() & actual_s.notna()
+    n = int(mask.sum())
+    if n < 10:
+        print(f"    {name}: skip (n={n})", flush=True)
+        return
+    pred_v = pred_s[mask].to_numpy(dtype=np.float64, copy=False)
+    actual_v = actual_s[mask].to_numpy(dtype=np.float64, copy=False)
+    pearson_r = float(np.corrcoef(pred_v, actual_v)[0, 1]) if n > 2 and np.std(pred_v) > 1e-12 and np.std(actual_v) > 1e-12 else float("nan")
+    spearman_r = float(pred_s[mask].corr(actual_s[mask], method="spearman"))
+    r2 = float(r2_score(actual_v, pred_v)) if n > 2 else float("nan")
+    bucket = _regression_quality_bucket(spearman_r, r2)
+    print(
+        f"    {name}: Pearson r={pearson_r:.4f}  Spearman rho={spearman_r:.4f}  "
+        f"R2={r2:.4f}  n={n:,}  verdict={bucket}",
+        flush=True,
+    )
 
 
 def _reconstruct_quality_classes(
@@ -547,21 +1132,91 @@ def _reconstruct_quality_classes(
     return pred
 
 
-def _apply_cp_skip(regime_probs: np.ndarray, p_trade: np.ndarray, thr_cp: float, tcn_transition_prob: np.ndarray = None) -> tuple[np.ndarray, np.ndarray]:
-    """Apply Conformal Prediction prediction sets and TCN transition signal to filter out uncertain/OOS trades."""
-    y_set = regime_probs >= thr_cp
+def _tcn_transition_risk_profile(tcn_transition_prob: np.ndarray | None) -> dict[str, np.ndarray] | None:
+    if tcn_transition_prob is None:
+        return None
+    risk = np.clip(np.asarray(tcn_transition_prob, dtype=np.float64), 0.0, 1.0)
+    prob_weight = float(os.environ.get("TCN_RISK_PROB_WEIGHT", "0.85"))
+    pos_weight = float(os.environ.get("TCN_RISK_POS_WEIGHT", "0.95"))
+    thr_weight = float(os.environ.get("TCN_RISK_THR_WEIGHT", "0.18"))
+    min_prob_scale = float(os.environ.get("TCN_RISK_MIN_PROB_SCALE", "0.05"))
+    min_pos_scale = float(os.environ.get("TCN_RISK_MIN_POS_SCALE", "0.10"))
+    hard_veto_thr = float(os.environ.get("TCN_RISK_HARD_VETO_THRESHOLD", "0.98"))
+    mid_thr = float(os.environ.get("TCN_RISK_MID_THRESHOLD", "0.45"))
+    high_thr = float(os.environ.get("TCN_RISK_HIGH_THRESHOLD", "0.70"))
+
+    prob_scale = np.clip(1.0 - prob_weight * risk, min_prob_scale, 1.0)
+    pos_scale = np.clip(1.0 - pos_weight * risk, min_pos_scale, 1.0)
+    thr_add = thr_weight * risk
+    is_high = risk >= hard_veto_thr
+    is_mid = (risk >= mid_thr) & (risk < high_thr) & ~is_high
+    return {
+        "risk": risk,
+        "is_mid": is_mid,
+        "is_high": is_high,
+        "prob_scale": prob_scale,
+        "pos_scale": pos_scale,
+        "thr_add": thr_add,
+    }
+
+
+def _transition_threshold_add(tcn_transition_prob: np.ndarray | None, n: int) -> np.ndarray:
+    prof = _tcn_transition_risk_profile(tcn_transition_prob)
+    if prof is None:
+        return np.zeros(n, dtype=np.float64)
+    return prof["thr_add"]
+
+
+def _apply_cp_skip(
+    regime_probs: np.ndarray,
+    p_trade: np.ndarray,
+    thr_cp: float,
+    tcn_transition_prob: np.ndarray = None,
+    *,
+    side: str = "trade",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply direction-aware CP skip plus continuous TCN risk shrink."""
+    rp = np.clip(np.asarray(regime_probs, dtype=np.float64), 0.0, None)
+    denom = rp.sum(axis=1, keepdims=True)
+    rp = np.divide(
+        rp,
+        denom,
+        out=np.full_like(rp, 1.0 / max(rp.shape[1], 1)),
+        where=denom > 1e-12,
+    )
+    y_set = rp >= thr_cp
     set_size = y_set.sum(axis=1)
     contains_bull = y_set[:, 0] | y_set[:, 1]
     contains_bear = y_set[:, 2] | y_set[:, 3]
     is_conflicting = contains_bull & contains_bear
-    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0)
-    
-    # Optional: Hard Skip if TCN predicts very high transition probability
-    if tcn_transition_prob is not None:
-        high_transition_risk = tcn_transition_prob > 0.70
-        skip_cp = skip_cp | high_transition_risk
-        
+    ctx = _regime_context_from_probs(rp)
+    bull_mass = ctx["bull_mass"]
+    bear_mass = ctx["bear_mass"]
+    range_mass = ctx["range_mass"]
+    conf = ctx["conf"]
+    margin = ctx["margin"]
+    entropy = ctx["entropy"]
+    entropy_skip_thr = float(os.environ.get("L2B_CP_ENTROPY_SKIP_THR", "1.45"))
+    margin_skip_thr = float(os.environ.get("L2B_CP_MARGIN_SKIP_THR", "0.08"))
+    conf_skip_thr = float(os.environ.get("L2B_CP_CONF_SKIP_THR", "0.34"))
+    range_skip_thr = float(os.environ.get("L2B_CP_RANGE_SKIP_THR", "0.60"))
+    opp_mass_buffer = float(os.environ.get("L2B_CP_OPPOSITE_BUFFER", "0.03"))
+    ambiguous = (entropy >= entropy_skip_thr) | (margin <= margin_skip_thr) | (conf <= conf_skip_thr)
+    skip_cp = (set_size >= 3) | is_conflicting | (set_size == 0) | (ambiguous & (range_mass >= range_skip_thr))
+    if side == "long":
+        opposite_hit = contains_bear | (bear_mass >= bull_mass - opp_mass_buffer)
+        skip_cp = skip_cp | (opposite_hit & ambiguous)
+    elif side == "short":
+        opposite_hit = contains_bull | (bull_mass >= bear_mass - opp_mass_buffer)
+        skip_cp = skip_cp | (opposite_hit & ambiguous)
+    else:
+        skip_cp = skip_cp | (ambiguous & (np.abs(bull_mass - bear_mass) <= 0.05))
+
     p_trade_adj = p_trade.copy()
+    prof = _tcn_transition_risk_profile(tcn_transition_prob)
+    if prof is not None:
+        p_trade_adj = p_trade_adj * prof["prob_scale"]
+        skip_cp = skip_cp | prof["is_high"]
     p_trade_adj[skip_cp] = 0.0
     return p_trade_adj, skip_cp
 
@@ -575,7 +1230,7 @@ def train_trade_quality_classifier(
 ):
     print("\n" + "=" * 70)
     print("  LAYER 2b: Hierarchical Trade-Quality Stack (regression Step1)")
-    print("  y = trade_quality (KMeans outcomes); X excludes regime probabilities")
+    print("  y = trade_quality (deterministic RR outcomes); X excludes regime probabilities")
     print("  Step1 6-regime opp gate  |  Step2 LONG/SHORT")
     print("=" * 70)
 
@@ -592,6 +1247,7 @@ def train_trade_quality_classifier(
         pct = 100.0 * cnt / max(len(work), 1)
         print(f"    {QUALITY_CLASS_NAMES[c]:>8s}: {cnt:>9,}  ({pct:>5.2f}%)")
     _print_quality_label_outcome_stats(work, work["trade_quality_label"].values)
+    _diagnose_l2b_label_funnel(work, work["trade_quality_label"].values, TRAIN_END)
 
     # Breakout-context features are computed for all bars, so NEUTRAL/CHOP are covered too.
     print("  [L2b prep] Breakout / bar-context features …", flush=True)
@@ -646,6 +1302,7 @@ def train_trade_quality_classifier(
     for j, col in enumerate(REGIME_NOW_PROB_COLS):
         work[col] = cal_regime[:, j]
     work["regime_now_conf"] = cal_regime.max(axis=1)
+    _attach_l2b_regime_context_features(work, cal_regime)
     raw_regime = raw_regime.astype(np.float32, copy=False)
 
     print("  [L2b prep] Resolving feature groups (PA / HMM / GARCH / TCN) …", flush=True)
@@ -658,7 +1315,19 @@ def train_trade_quality_classifier(
         if c.startswith("pa_hmm_") and str(work[c].dtype) not in {"object", "category"}
     ]
 
-    all_bo_feats_raw = _unique_cols(feat_cols + BO_FEAT_COLS + sorted(garch_cols))
+    tcn_whitelist = [c for c in TCN_FEATURES_FOR_L2B if c in work.columns]
+    if TCN_FEATURES_ENABLED:
+        l2b_base_feats = [c for c in feat_cols if (not c.startswith("tcn_")) or (c in tcn_whitelist)]
+    else:
+        l2b_base_feats = [c for c in feat_cols if not c.startswith("tcn_")]
+    all_bo_feats_raw = _unique_cols(
+        l2b_base_feats
+        + BO_FEAT_COLS
+        + sorted(garch_cols)
+        + list(REGIME_NOW_PROB_COLS)
+        + ["regime_now_conf"]
+        + list(L2B_REGIME_CONTEXT_COLS)
+    )
     all_bo_feats = _numeric_feature_cols_for_matrix(work, all_bo_feats_raw)
     if not all_bo_feats:
         raise ValueError("Layer 2b: no numeric features left after filtering.")
@@ -670,8 +1339,12 @@ def train_trade_quality_classifier(
     print(f"    TCN-derived:{len(pa_tcn)}")
     print(f"    Mamba-deriv:{len(pa_mamba)}")
     print(f"    Breakout:   {len(BO_FEAT_COLS)}")
-    print(f"    Regime probs: not in X (Layer 2a outputs; used for reconstruct + Layer 3 only)")
+    print(f"    Regime probs/context: {len(REGIME_NOW_PROB_COLS) + 1 + len(L2B_REGIME_CONTEXT_COLS)}")
     print(f"    TOTAL L2b:  {len(all_bo_feats)}")
+    print(
+        f"    TCN whitelist active: {TCN_FEATURES_ENABLED}  "
+        f"selected={', '.join(tcn_whitelist) if tcn_whitelist else 'none'}"
+    )
     if hmm_cols:
         print(f"  HMM features included: {', '.join(sorted(hmm_cols)[:6])}"
               + (" ..." if len(hmm_cols) > 6 else ""))
@@ -739,7 +1412,8 @@ def train_trade_quality_classifier(
         "monotone_constraints_method": "advanced",
     }
     rounds = 1800 if FAST_TRAIN_MODE else 4000
-    es = 90 if FAST_TRAIN_MODE else 140
+    es_trade = 90 if FAST_TRAIN_MODE else int(os.environ.get("L2B_TRADE_ES", "200"))
+    es_dir = 90 if FAST_TRAIN_MODE else 140
     
     reg_models: dict[str, dict[str, lgb.Booster]] = {}
     thr_vec = np.ones(len(REGIMES_6), dtype=np.float64)
@@ -750,7 +1424,7 @@ def train_trade_quality_classifier(
     )
     mfe_full, mae_full = _mfe_mae_atr_arrays(work)
     st_full = work["state_label"].values.astype(int)
-    rp_route_full = raw_regime
+    rp_route_full = cal_regime.astype(np.float32, copy=False)
     reg_models, _, thr_vec, soft_opp_thr = _train_regime_opp_regression_models(
         X,
         st_full,
@@ -762,6 +1436,49 @@ def train_trade_quality_classifier(
         rp_route_full,
         y_trade_cal,
     )
+
+    # --- B: soft-mixture opportunity triplet on train/cal/test (used by meta gates / Layer 3) ---
+    rp_train_soft = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[train_mask]
+    rp_cal_soft = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
+    rp_test_soft = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
+    opp_train_t, mfe_train_t, mae_train_t, opp_regime_train = _compute_opportunity_triplet_with_regime_opp(
+        X_train, rp_train_soft, reg_models, tqdm_regime_desc="L2b soft-mix triplet (train)"
+    )
+    opp_cal_t, mfe_cal_t, mae_cal_t, opp_regime_cal = _compute_opportunity_triplet_with_regime_opp(
+        X_cal, rp_cal_soft, reg_models, tqdm_regime_desc="L2b soft-mix triplet (cal)"
+    )
+    opp_test_t, mfe_test_t, mae_test_t, opp_regime_test = _compute_opportunity_triplet_with_regime_opp(
+        X_test, rp_test_soft, reg_models, tqdm_regime_desc="L2b soft-mix triplet (test)"
+    )
+    y_cal_6 = y6[cal_mask]
+    print("  [L2b diagnostics] B. Opportunity triplet (soft mixture, cal):", flush=True)
+    print(
+        f"    opp=log1p(mfe_mix)-log1p(mae_mix): mean={opp_cal_t.mean():.4f}  "
+        f"P95={np.percentile(opp_cal_t, 95):.4f}  min/max=[{opp_cal_t.min():.4f}, {opp_cal_t.max():.4f}]",
+        flush=True,
+    )
+    print(
+        f"    mfe_mix: mean={mfe_cal_t.mean():.4f}  mae_mix: mean={mae_cal_t.mean():.4f}",
+        flush=True,
+    )
+    m_l = y_cal_6 == 0
+    m_s = y_cal_6 == 3
+    if m_l.any():
+        ol = opp_cal_t[m_l]
+        print(
+            f"    LONG-class rows: mean={ol.mean():.4f}  P95={np.percentile(ol, 95):.4f}  n={m_l.sum():,}",
+            flush=True,
+        )
+    if m_s.any():
+        os_ = opp_cal_t[m_s]
+        print(
+            f"    SHORT-class rows: mean={os_.mean():.4f}  P95={np.percentile(os_, 95):.4f}  n={m_s.sum():,}",
+            flush=True,
+        )
+    print("  [L2b diagnostics] B2. Regression quality (cal, soft mixture):", flush=True)
+    _print_regression_quality_report(mfe_cal_t, mfe_full[cal_mask], "pred_mfe vs actual_mfe")
+    _print_regression_quality_report(mae_cal_t, mae_full[cal_mask], "pred_mae vs actual_mae")
+
     os.makedirs(MODEL_DIR, exist_ok=True)
     for regime in REGIMES_6:
         if regime not in reg_models:
@@ -777,67 +1494,121 @@ def train_trade_quality_classifier(
         step1_regression_bundle[f"{regime}_mfe"] = pair["mfe"]
         step1_regression_bundle[f"{regime}_mae"] = pair["mae"]
 
-    print("  [L2b train] Dedicated Step1 LONG gate binary classifier …", flush=True)
-    c_long, clean_long = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 LONG")
-    w_long_train = _binary_recency_weights(t[train_mask])
-    w_long_cal = _binary_recency_weights(t[cal_mask])
-    d_long_train = lgb.Dataset(X_train, label=y_long_train, weight=w_long_train, feature_name=all_bo_feats, free_raw_data=False)
-    d_long_cal = lgb.Dataset(X_cal, label=y_long_cal, weight=w_long_cal, feature_name=all_bo_feats, free_raw_data=False)
-    long_spw = _binary_scale_pos_weight(y_long_train)
-    print(f"    [L2b gate] LONG pos_rate={y_long_train.mean():.3%} scale_pos_weight={long_spw:.2f}")
+    tcn_transition_prob_train = work["tcn_transition_prob"].values.astype(np.float32)[train_mask] if "tcn_transition_prob" in work.columns else None
+    tcn_transition_prob_cal = work["tcn_transition_prob"].values.astype(np.float32)[cal_mask] if "tcn_transition_prob" in work.columns else None
+    tcn_transition_prob_test = work["tcn_transition_prob"].values.astype(np.float32)[test_mask] if "tcn_transition_prob" in work.columns else None
+    thr_add_cal = _transition_threshold_add(tcn_transition_prob_cal, len(y_trade_cal))
+    thr_add_test = _transition_threshold_add(tcn_transition_prob_test, len(y_trade_test))
+    X_gate_train, gate_feature_cols = _build_l2b_directional_feature_matrix(
+        rp_train_soft, opp_train_t, mfe_train_t, mae_train_t, opp_regime_train, tcn_transition_prob_train
+    )
+    X_gate_cal, gate_feature_cols_cal = _build_l2b_directional_feature_matrix(
+        rp_cal_soft, opp_cal_t, mfe_cal_t, mae_cal_t, opp_regime_cal, tcn_transition_prob_cal
+    )
+    X_gate_test, gate_feature_cols_test = _build_l2b_directional_feature_matrix(
+        rp_test_soft, opp_test_t, mfe_test_t, mae_test_t, opp_regime_test, tcn_transition_prob_test
+    )
+    if gate_feature_cols != gate_feature_cols_cal or gate_feature_cols != gate_feature_cols_test:
+        raise ValueError("Layer 2b gate feature schema mismatch across train/cal/test.")
 
-    common_params_long = common_params.copy()
-    common_params_long.update({
+    print("  [L2b train] Stage1 has-trade binary classifier …", flush=True)
+    c_trade, clean_trade = _lgb_train_callbacks_with_round_tqdm(es_trade, rounds, "L2b Stage1 TRADE")
+    w_trade_train = _binary_recency_weights(t[train_mask])
+    w_trade_cal = _binary_recency_weights(t[cal_mask])
+    d_trade_train = lgb.Dataset(X_gate_train, label=y_trade_train, weight=w_trade_train, feature_name=gate_feature_cols, free_raw_data=False)
+    d_trade_cal = lgb.Dataset(X_gate_cal, label=y_trade_cal, weight=w_trade_cal, feature_name=gate_feature_cols, free_raw_data=False)
+    trade_spw = _binary_scale_pos_weight(y_trade_train)
+    print(f"    [L2b gate] TRADE pos_rate={y_trade_train.mean():.3%} scale_pos_weight={trade_spw:.2f}")
+
+    common_params_trade = common_params.copy()
+    common_params_trade.update({
         "objective": "binary",
         "metric": "binary_logloss",
-        "scale_pos_weight": long_spw,
+        "scale_pos_weight": trade_spw,
+        "min_child_samples": int(os.environ.get("L2B_TRADE_MIN_CHILD", "24")),
+        "lambda_l1": float(os.environ.get("L2B_TRADE_L1", "0.05")),
+        "lambda_l2": float(os.environ.get("L2B_TRADE_L2", "0.75")),
     })
+    # Meta gate uses gate_feature_cols, not all_bo_feats — regression monotone_constraints length must not be reused.
+    common_params_trade.pop("monotone_constraints", None)
+    common_params_trade.pop("monotone_constraints_method", None)
 
     try:
-        step1_long_model = lgb.train(
-            common_params_long, d_long_train, num_boost_round=rounds, valid_sets=[d_long_cal], callbacks=c_long,
+        step1_trade_model = lgb.train(
+            common_params_trade, d_trade_train, num_boost_round=rounds, valid_sets=[d_trade_cal], callbacks=c_trade,
         )
     finally:
-        for fn in clean_long:
+        for fn in clean_trade:
             fn()
 
-    print("  [L2b train] Dedicated Step1 SHORT gate binary classifier …", flush=True)
-    c_short, clean_short = _lgb_train_callbacks_with_round_tqdm(es, rounds, "L2b Step1 SHORT")
-    w_short_train = _binary_recency_weights(t[train_mask])
-    w_short_cal = _binary_recency_weights(t[cal_mask])
-    d_short_train = lgb.Dataset(X_train, label=y_short_train, weight=w_short_train, feature_name=all_bo_feats, free_raw_data=False)
-    d_short_cal = lgb.Dataset(X_cal, label=y_short_cal, weight=w_short_cal, feature_name=all_bo_feats, free_raw_data=False)
-    short_spw = _binary_scale_pos_weight(y_short_train)
-    print(f"    [L2b gate] SHORT pos_rate={y_short_train.mean():.3%} scale_pos_weight={short_spw:.2f}")
+    dir_train_mask = y_trade_train == 1
+    dir_cal_mask = y_trade_cal == 1
+    if dir_train_mask.sum() < 200:
+        raise RuntimeError("Layer 2b direction gate: too few tradable train rows for Stage2.")
+    X_dir_train = X_gate_train[dir_train_mask]
+    y_dir_train = y_long_train[dir_train_mask]
+    w_dir_train = w_trade_train[dir_train_mask]
+    if dir_cal_mask.sum() >= 50:
+        X_dir_cal = X_gate_cal[dir_cal_mask]
+        y_dir_cal = y_long_cal[dir_cal_mask]
+        w_dir_cal = w_trade_cal[dir_cal_mask]
+    else:
+        tail = min(5000, len(X_dir_train))
+        X_dir_cal = X_dir_train[-tail:]
+        y_dir_cal = y_dir_train[-tail:]
+        w_dir_cal = w_dir_train[-tail:]
 
-    common_params_short = common_params.copy()
-    common_params_short.update({
+    print("  [L2b train] Stage2 long-vs-short direction classifier …", flush=True)
+    c_dir, clean_dir = _lgb_train_callbacks_with_round_tqdm(es_dir, rounds, "L2b Stage2 DIRECTION")
+    d_dir_train = lgb.Dataset(X_dir_train, label=y_dir_train, weight=w_dir_train, feature_name=gate_feature_cols, free_raw_data=False)
+    d_dir_cal = lgb.Dataset(X_dir_cal, label=y_dir_cal, weight=w_dir_cal, feature_name=gate_feature_cols, free_raw_data=False)
+    long_share = float(y_dir_train.mean()) if len(y_dir_train) else float("nan")
+    print(
+        f"    [L2b gate] DIRECTION tradable_rows(train/cal)={int(dir_train_mask.sum()):,}/{int(dir_cal_mask.sum()):,}  "
+        f"long_share(train)={long_share:.3%}",
+        flush=True,
+    )
+
+    common_params_dir = common_params.copy()
+    common_params_dir.update({
         "objective": "binary",
         "metric": "binary_logloss",
-        "scale_pos_weight": short_spw,
     })
+    common_params_dir.pop("monotone_constraints", None)
+    common_params_dir.pop("monotone_constraints_method", None)
 
     try:
-        step1_short_model = lgb.train(
-            common_params_short, d_short_train, num_boost_round=rounds, valid_sets=[d_short_cal], callbacks=c_short,
+        step2_direction_model = lgb.train(
+            common_params_dir, d_dir_train, num_boost_round=rounds, valid_sets=[d_dir_cal], callbacks=c_dir,
         )
     finally:
-        for fn in clean_short:
+        for fn in clean_dir:
             fn()
-    
-    rp_cal = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[cal_mask]
-    p_long_cal = step1_long_model.predict(X_cal)
-    p_short_cal = step1_short_model.predict(X_cal)
-    
+
+    rp_cal = rp_cal_soft
+    p_trade_cal_raw = step1_trade_model.predict(X_gate_cal)
+    p_dir_long_cal = step2_direction_model.predict(X_gate_cal)
+    p_long_cal, p_short_cal = _compose_two_stage_gate_probs(p_trade_cal_raw, p_dir_long_cal)
+
     # 1. Range Regime Penalty: heavily slash probabilities in range regimes
     p_range_mass_cal = rp_cal[:, RANGE_REGIME_INDICES].sum(axis=1)
     p_long_cal = p_long_cal * (1.0 - 0.7 * p_range_mass_cal)
     p_short_cal = p_short_cal * (1.0 - 0.7 * p_range_mass_cal)
-    
+    p_trade_cal = p_trade_cal_raw * (1.0 - 0.7 * p_range_mass_cal)
+
     # 2. Threshold Search: Prioritize Precision via F0.5 score + strict Precision floor >= 10%
+    best_trade_f1, best_trade_thr = 0.0, 0.7
+    for thr_c in np.arange(0.08, 0.95, 0.02):
+        pr = (p_trade_cal >= (thr_c + thr_add_cal)).astype(int)
+        f1v = f1_score(y_trade_cal, pr, zero_division=0)
+        prec = precision_score(y_trade_cal, pr, zero_division=0)
+        if f1v > best_trade_f1 and prec >= 0.05:
+            best_trade_f1, best_trade_thr = f1v, thr_c
+    thr_trade_cal = best_trade_thr if best_trade_f1 > 0 else 0.85
+
     best_f05_l, best_thr_l = 0.0, 0.7
     for thr_c in np.arange(0.08, 0.95, 0.02):
-        pr = (p_long_cal >= thr_c).astype(int)
+        pr = (p_long_cal >= (thr_c + thr_add_cal)).astype(int)
         f05 = fbeta_score(y_long_cal, pr, beta=0.5, zero_division=0)
         prec = precision_score(y_long_cal, pr, zero_division=0)
         # Relaxed precision floor from 10% to 5% to force SHORT/LONG discovery at the cost of lower hit rate
@@ -847,59 +1618,131 @@ def train_trade_quality_classifier(
 
     best_f05_s, best_thr_s = 0.0, 0.7
     for thr_c in np.arange(0.08, 0.95, 0.02):
-        pr = (p_short_cal >= thr_c).astype(int)
+        pr = (p_short_cal >= (thr_c + thr_add_cal)).astype(int)
         f05 = fbeta_score(y_short_cal, pr, beta=0.5, zero_division=0)
         prec = precision_score(y_short_cal, pr, zero_division=0)
         if f05 > best_f05_s and prec >= 0.05:
             best_f05_s, best_thr_s = f05, thr_c
     thr_short_cal = best_thr_s if best_f05_s > 0 else 0.85
-    
-    tcn_transition_prob_cal = work["tcn_transition_prob"].values.astype(np.float32)[cal_mask] if "tcn_transition_prob" in work.columns else None
-    p_long_cal, _ = _apply_cp_skip(rp_cal, p_long_cal, thr_cp, tcn_transition_prob_cal)
-    p_short_cal, _ = _apply_cp_skip(rp_cal, p_short_cal, thr_cp, tcn_transition_prob_cal)
-    
-    pr_l_cal = (p_long_cal >= thr_long_cal).astype(int)
-    pr_s_cal = (p_short_cal >= thr_short_cal).astype(int)
+
+    p_trade_cal, _ = _apply_cp_skip(rp_cal, p_trade_cal, thr_cp, tcn_transition_prob_cal, side="trade")
+    p_long_cal, _ = _apply_cp_skip(rp_cal, p_long_cal, thr_cp, tcn_transition_prob_cal, side="long")
+    p_short_cal, _ = _apply_cp_skip(rp_cal, p_short_cal, thr_cp, tcn_transition_prob_cal, side="short")
+
+    def _gate_prob_dist_report(p: np.ndarray, name: str) -> None:
+        if len(p) == 0:
+            return
+        q50, q90, q99 = np.percentile(p, [50, 90, 99])
+        print(
+            f"  [L2b diagnostics] C. {name}: mean={p.mean():.4f}  p50={q50:.4f}  "
+            f"p90={q90:.4f}  p99={q99:.4f}  max={p.max():.4f}",
+            flush=True,
+        )
+
+    def _gate_thr_band_report(p: np.ndarray, thr: float, name: str, stage_note: str, band: float = 0.02) -> None:
+        if len(p) == 0:
+            return
+        near = np.abs(p - thr) <= band
+        below = p < thr - band
+        above = p > thr + band
+        print(
+            f"  [L2b diagnostics] C. {name} gate probs ({stage_note}): "
+            f"thr={thr:.3f}  mean={p.mean():.4f}  "
+            f"in (thr±{band})={near.mean():.2%}  below={below.mean():.2%}  above={above.mean():.2%}",
+            flush=True,
+        )
+
+    _gate_prob_dist_report(p_trade_cal_raw, "TRADE raw probs (cal, pre-range)")
+    _gate_prob_dist_report(p_trade_cal, "TRADE probs (cal, post range+CP)")
+    _gate_thr_band_report(p_trade_cal_raw, thr_trade_cal, "TRADE raw", "cal, pre-range")
+    _gate_thr_band_report(p_trade_cal, thr_trade_cal, "TRADE", "cal, post range+CP")
+    _gate_thr_band_report(p_long_cal, thr_long_cal, "LONG", "cal, post range+CP")
+    _gate_thr_band_report(p_short_cal, thr_short_cal, "SHORT", "cal, post range+CP")
+
+    pr_trade_stage1_cal = (p_trade_cal >= (thr_trade_cal + thr_add_cal)).astype(int)
+    pr_l_cal = (p_long_cal >= (thr_long_cal + thr_add_cal)).astype(int)
+    pr_s_cal = (p_short_cal >= (thr_short_cal + thr_add_cal)).astype(int)
     pr_trade_cal = pr_l_cal | pr_s_cal
-    
+
+    if dir_cal_mask.any():
+        dir_pred_cal = (p_dir_long_cal[dir_cal_mask] >= 0.50).astype(int)
+        dir_acc_cal = accuracy_score(y_dir_cal, dir_pred_cal)
+        dir_f1_cal = f1_score(y_dir_cal, dir_pred_cal, zero_division=0)
+        print(
+            f"  [L2b diagnostics] Stage2 direction (cal, tradable only): "
+            f"acc={dir_acc_cal:.4f}  f1={dir_f1_cal:.4f}",
+            flush=True,
+        )
+
+    f1_trade_stage1 = f1_score(y_trade_cal, pr_trade_stage1_cal, zero_division=0)
+    rec_trade_stage1 = recall_score(y_trade_cal, pr_trade_stage1_cal, zero_division=0)
+    prec_trade_stage1 = precision_score(y_trade_cal, pr_trade_stage1_cal, zero_division=0)
     f1_cal_at_thr = f1_score(y_trade_cal, pr_trade_cal, zero_division=0)
     n_trade_pred_cal = int(pr_trade_cal.sum())
     rec_cal_thr = recall_score(y_trade_cal, pr_trade_cal, zero_division=0)
     prec_cal_thr = precision_score(y_trade_cal, pr_trade_cal, zero_division=0)
-    thr_rule_note = f"long_thr={thr_long_cal:.2f} short_thr={thr_short_cal:.2f}"
+    thr_rule_note = (
+        f"trade_thr={thr_trade_cal:.2f} "
+        f"long_thr={thr_long_cal:.2f} short_thr={thr_short_cal:.2f}"
+    )
     print(
-        f"  Step1 cal: {thr_rule_note}  "
+        f"  Stage1 cal: trade_thr={thr_trade_cal:.2f}  "
+        f"F1={f1_trade_stage1:.4f}  recall={rec_trade_stage1:.3f}  precision={prec_trade_stage1:.4f}",
+        flush=True,
+    )
+    print(
+        f"  Step2 cal: {thr_rule_note}  "
         f"F1={f1_cal_at_thr:.4f}  recall={rec_cal_thr:.3f}  precision={prec_cal_thr:.4f}  "
         f"n_trade={n_trade_pred_cal:,}/{len(y_trade_cal):,}"
     )
 
     # Evaluate cascade
-    rp_test = work[REGIME_NOW_PROB_COLS].values.astype(np.float32)[test_mask]
-    rp_route_test = raw_regime[test_mask]
-    opp_te = _compute_opportunity_scores(X_test, rp_route_test, reg_models)
-    p_long_te = step1_long_model.predict(X_test)
-    p_short_te = step1_short_model.predict(X_test)
-    
+    rp_test = rp_test_soft
+    p_trade_te_raw = step1_trade_model.predict(X_gate_test)
+    p_dir_long_te = step2_direction_model.predict(X_gate_test)
+    p_long_te, p_short_te = _compose_two_stage_gate_probs(p_trade_te_raw, p_dir_long_te)
+
     # Apply identical range penalty to test set
     p_range_mass_test = rp_test[:, RANGE_REGIME_INDICES].sum(axis=1)
     p_long_te = p_long_te * (1.0 - 0.7 * p_range_mass_test)
     p_short_te = p_short_te * (1.0 - 0.7 * p_range_mass_test)
-    
-    tcn_transition_prob_test = work["tcn_transition_prob"].values.astype(np.float32)[test_mask] if "tcn_transition_prob" in work.columns else None
-    p_long_te, skip_cp_test = _apply_cp_skip(rp_test, p_long_te, thr_cp, tcn_transition_prob_test)
-    p_short_te, _ = _apply_cp_skip(rp_test, p_short_te, thr_cp, tcn_transition_prob_test)
+    p_trade_te = p_trade_te_raw * (1.0 - 0.7 * p_range_mass_test)
+
+    p_trade_te, skip_cp_test_trade = _apply_cp_skip(rp_test, p_trade_te, thr_cp, tcn_transition_prob_test, side="trade")
+    p_long_te, skip_cp_test = _apply_cp_skip(rp_test, p_long_te, thr_cp, tcn_transition_prob_test, side="long")
+    p_short_te, _ = _apply_cp_skip(rp_test, p_short_te, thr_cp, tcn_transition_prob_test, side="short")
     print(f"\n  CP Skip rate (Layer 2b soft-mixture test): {skip_cp_test.mean():.2%} (forced p_trade=0)")
-    
+
+    print("  [L2b diagnostics] C. Gate probs vs threshold (test, post range+CP; used before 4-class reconstruct):", flush=True)
+    _gate_prob_dist_report(p_trade_te_raw, "TRADE raw probs (test, pre-range)")
+    _gate_prob_dist_report(p_trade_te, "TRADE probs (test, post range+CP)")
+    _gate_thr_band_report(p_trade_te_raw, thr_trade_cal, "TRADE raw", "test, pre-range")
+    _gate_thr_band_report(p_trade_te, thr_trade_cal, "TRADE", "test, post range+CP")
+    _gate_thr_band_report(p_long_te, thr_long_cal, "LONG", "test, post range+CP")
+    _gate_thr_band_report(p_short_te, thr_short_cal, "SHORT", "test, post range+CP")
+
     y_pred6 = _reconstruct_quality_classes(
-        p_long_te, p_short_te, p_range_mass_test, thr_long=thr_long_cal, thr_short=thr_short_cal
+        p_long_te,
+        p_short_te,
+        p_range_mass_test,
+        thr_long=(thr_long_cal + thr_add_test),
+        thr_short=(thr_short_cal + thr_add_test),
     )
 
     print("\n  Step metrics (test):")
-    step1_pred = (p_long_te >= thr_long_cal) | (p_short_te >= thr_short_cal)
+    stage1_pred = p_trade_te >= (thr_trade_cal + thr_add_test)
+    stage1_rec = recall_score(y_trade_test, stage1_pred, zero_division=0)
+    stage1_prec = precision_score(y_trade_test, stage1_pred, zero_division=0)
+    print(
+        f"    Stage1 has-trade gate    acc={accuracy_score(y_trade_test, stage1_pred):.4f} "
+        f"f1={f1_score(y_trade_test, stage1_pred, zero_division=0):.4f}  "
+        f"recall={stage1_rec:.3f}  precision={stage1_prec:.4f}"
+    )
+    step1_pred = (p_long_te >= (thr_long_cal + thr_add_test)) | (p_short_te >= (thr_short_cal + thr_add_test))
     s1_rec = recall_score(y_trade_test, step1_pred, zero_division=0)
     s1_prec = precision_score(y_trade_test, step1_pred, zero_division=0)
     print(
-        f"    Step1 LONG/SHORT gates  acc={accuracy_score(y_trade_test, step1_pred):.4f} "
+        f"    Stage2 LONG/SHORT gates acc={accuracy_score(y_trade_test, step1_pred):.4f} "
         f"f1={f1_score(y_trade_test, step1_pred, zero_division=0):.4f}  "
         f"recall={s1_rec:.3f}  precision={s1_prec:.4f}"
     )
@@ -923,14 +1766,17 @@ def train_trade_quality_classifier(
     print(imp_df.head(25).to_string(index=False))
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    step1_long_model.save_model(os.path.join(MODEL_DIR, "trade_gate_long.txt"))
-    step1_short_model.save_model(os.path.join(MODEL_DIR, "trade_gate_short.txt"))
+    step1_trade_model.save_model(os.path.join(MODEL_DIR, "trade_gate_has_trade.txt"))
+    step2_direction_model.save_model(os.path.join(MODEL_DIR, "trade_gate_direction.txt"))
     import pickle
 
     meta = {
-        "type": "trade_quality_split_long_short_gates",
+        "l2b_schema": 2,
+        "type": "trade_quality_two_stage_gate",
+        "gate_architecture": "two_stage_trade_direction",
         "class_names": QUALITY_CLASS_NAMES,
         "feature_cols": all_bo_feats,
+        "gate_feature_cols": gate_feature_cols,
         "pa_base_feat_cols": pa_base,
         "pa_hmm_feat_cols": pa_hmm,
         "pa_garch_feat_cols": pa_garch,
@@ -939,18 +1785,25 @@ def train_trade_quality_classifier(
         "regime_prob_cols_layer3": REGIME_PROB_COLS,
         "garch_cols": garch_cols,
         "hierarchy_thresholds": {
-            "long": float(thr_long_cal), "short": float(thr_short_cal), "cp_alpha": 0.05, "thr_cp": float(thr_cp)
+            "trade": float(thr_trade_cal),
+            "long": float(thr_long_cal),
+            "short": float(thr_short_cal),
+            "cp_alpha": 0.05,
+            "thr_cp": float(thr_cp),
         },
         "step1_calibration": {
             "best_f1_cal": float(f1_cal_at_thr),
             "recall_cal": float(rec_cal_thr),
             "precision_cal": float(prec_cal_thr),
             "n_trade_pred_cal": int(n_trade_pred_cal),
+            "stage1_trade_f1_cal": float(f1_trade_stage1),
+            "stage1_trade_recall_cal": float(rec_trade_stage1),
+            "stage1_trade_precision_cal": float(prec_trade_stage1),
             "threshold_selection_rule": thr_rule_note,
         },
         "model_files": {
-            "step1_long": "trade_gate_long.txt",
-            "step1_short": "trade_gate_short.txt",
+            "step1_has_trade": "trade_gate_has_trade.txt",
+            "step2_direction": "trade_gate_direction.txt",
             },
         "position_scale_map": {
             "LONG": 1.00,
@@ -979,17 +1832,19 @@ def train_trade_quality_classifier(
         pickle.dump(meta, f)
 
     print(
-        f"\n  Models saved → trade_gate_long.txt, trade_gate_short.txt\n"
+        f"\n  Models saved → trade_gate_has_trade.txt, trade_gate_direction.txt\n"
         f"  (L3 continuous features models saved to l2b_opp_mfe/mae_<regime>.txt)",
     )
     print(f"  Meta saved  → {MODEL_DIR}/trade_quality_meta.pkl")
 
     model_bundle = {
+        "l2b_schema": int(meta["l2b_schema"]),
         "step1_regression": step1_regression_bundle,
-        "step1_long": step1_long_model,
-        "step1_short": step1_short_model,
+        "step1_has_trade": step1_trade_model,
+        "step2_direction": step2_direction_model,
         "thresholds": meta["hierarchy_thresholds"],
         "feature_cols": all_bo_feats,
+        "gate_feature_cols": gate_feature_cols,
     }
     return model_bundle, meta, imp_df
 

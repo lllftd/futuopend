@@ -96,6 +96,55 @@ def _log_tcn_feature_health(df: pd.DataFrame, tcn_cols: list[str]) -> None:
         print(f"    {c}: std={std:.6g}  min={vmin:.6g}  max={vmax:.6g}  nan={n_nan}{flag}")
 
 
+def _add_tcn_summary_features(df: pd.DataFrame, *, validate: bool) -> pd.DataFrame:
+    """Derive stable scalar TCN features used by L2b/L3 from the raw TCN barrier probabilities."""
+    required = list(TCN_REGIME_FUT_PROB_COLS)
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Missing raw TCN barrier columns for derived features: {missing}")
+
+    chop = pd.to_numeric(df["tcn_barrier_chop"], errors="coerce")
+    if validate:
+        desc = chop.describe(percentiles=[0.05, 0.50, 0.95])
+        print(
+            "  TCN barrier_chop describe: "
+            f"count={float(desc.get('count', 0.0)):.0f}  mean={float(desc.get('mean', float('nan'))):.4f}  "
+            f"std={float(desc.get('std', float('nan'))):.4f}  min={float(desc.get('min', float('nan'))):.4f}  "
+            f"p50={float(desc.get('50%', float('nan'))):.4f}  p95={float(desc.get('95%', float('nan'))):.4f}  "
+            f"max={float(desc.get('max', float('nan'))):.4f}",
+            flush=True,
+        )
+    finite_chop = chop.dropna()
+    if finite_chop.empty:
+        raise RuntimeError("tcn_barrier_chop is entirely NaN; cannot derive tcn_transition_prob.")
+    cmin = float(finite_chop.min())
+    cmax = float(finite_chop.max())
+    if cmin < -1e-4 or cmax > 1.0001:
+        raise RuntimeError(
+            f"tcn_barrier_chop looks unnormalized (min={cmin:.4f}, max={cmax:.4f}); "
+            "cannot safely derive tcn_transition_prob = 1 - tcn_barrier_chop."
+        )
+
+    df[TCN_TRANSITION_PROB_COL] = np.clip(1.0 - chop.to_numpy(dtype=np.float32, copy=False), 0.0, 1.0)
+    up = pd.to_numeric(df["tcn_barrier_hit_up"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    dn = pd.to_numeric(df["tcn_barrier_hit_dn"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    df[TCN_BARRIER_DIR_DIFF_COL] = (up - dn).astype(np.float32, copy=False)
+
+    if validate:
+        transition = pd.to_numeric(df[TCN_TRANSITION_PROB_COL], errors="coerce")
+        valid_ratio = float(transition.notna().mean())
+        std = float(transition.std(skipna=True))
+        if valid_ratio <= 0.95:
+            raise RuntimeError(
+                f"tcn_transition_prob has {(1.0 - valid_ratio):.1%} NaN values after derivation."
+            )
+        if not np.isfinite(std) or std <= 0.01:
+            raise RuntimeError(
+                f"tcn_transition_prob std={std:.4f}, looks too close to a constant column."
+            )
+    return df
+
+
 def _create_tcn_windows(feat_1m: np.ndarray, seq_len: int) -> tuple[np.ndarray, np.ndarray]:
     n = len(feat_1m)
     if n < seq_len:
@@ -528,6 +577,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             )
             for j, col in enumerate(TCN_REGIME_FUT_PROB_COLS):
                 sym_df[col] = regime_probs_arr[:, j]
+            _add_tcn_summary_features(sym_df, validate=False)
             for j in range(bottleneck_dim):
                 sym_df[f"tcn_emb_{j}"] = embeddings[:, j]
 
@@ -588,6 +638,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 )
             for j in range(bottleneck_dim):
                 oof_df[f"tcn_emb_{j}"] = oem[:, j]
+            _add_tcn_summary_features(oof_df, validate=False)
 
             # Merge OOF into 'merged' (batched so tqdm can show progress; update() is opaque).
             merged.set_index(["symbol", "time_key"], inplace=True)
@@ -620,6 +671,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             raise RuntimeError(
                 f"TCN columns still NaN after per-symbol ffill/bfill (merge alignment?): {bad[:8]}"
             )
+        _add_tcn_summary_features(merged, validate=True)
         return merged
     finally:
         _restore_torch_threads()

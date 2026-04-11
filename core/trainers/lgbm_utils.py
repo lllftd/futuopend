@@ -49,7 +49,7 @@ def _mamba_bottleneck_dim_from_meta() -> int:
 def _tcn_derived_feature_names(bottleneck_dim: int | None = None) -> list[str]:
     bd = int(bottleneck_dim) if bottleneck_dim is not None else _tcn_bottleneck_dim_from_meta()
     emb = [f"tcn_emb_{i}" for i in range(bd)]
-    return TCN_REGIME_FUT_PROB_COLS + ["tcn_regime_fut_entropy"] + emb
+    return TCN_REGIME_FUT_PROB_COLS + [TCN_TRANSITION_PROB_COL, "tcn_regime_fut_entropy", TCN_BARRIER_DIR_DIFF_COL] + emb
 
 def _mamba_derived_feature_names(bottleneck_dim: int | None = None) -> list[str]:
     bd = int(bottleneck_dim) if bottleneck_dim is not None else _mamba_bottleneck_dim_from_meta()
@@ -564,6 +564,8 @@ __all__ = [
     "_is_lgbm_string_tag_col",
     "_l2b_reg_objective_params",
     "_layer3_chunk_rows",
+    "_layer4_policy_feature_names",
+    "_layer4_policy_state_vector",
     "_apply_structure_veto_to_gates",
     "_lgb_log_eval_period",
     "_lgb_round_tqdm_enabled",
