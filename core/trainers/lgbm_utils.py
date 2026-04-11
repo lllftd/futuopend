@@ -560,6 +560,7 @@ def _layer3_chunk_rows() -> int:
 __all__ = [
     "configure_compute_threads",
     "_compute_sample_weights",
+    "_decision_edge_atr_array",
     "_is_lgbm_string_tag_col",
     "_l2b_reg_objective_params",
     "_layer3_chunk_rows",
@@ -571,8 +572,11 @@ __all__ = [
     "_lgbm_booster_feature_names",
     "_lgbm_n_jobs",
     "_mfe_mae_atr_arrays",
+    "_net_edge_atr_from_state",
     "_numeric_feature_cols_for_matrix",
     "_opp_regression_sample_weights",
+    "_optimal_exit_target_arrays",
+    "_options_target_config",
     "_optuna_search_params",
     "_regime_lgbm_feature_cols",
     "_require_lgb_matrix_matches_names",
@@ -582,6 +586,7 @@ __all__ = [
     "_mamba_bottleneck_dim_from_meta",
     "_mamba_derived_feature_names",
     "_tcn_inference_device",
+    "_theta_decay_from_bars",
     "_tq",
     "_unique_cols",
 ]
