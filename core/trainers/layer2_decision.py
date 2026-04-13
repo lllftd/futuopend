@@ -657,6 +657,12 @@ def _env_float_candidates(key: str, default: list[float], *, lo: float, hi: floa
     return clipped or [float(np.clip(default[0], lo, hi))]
 
 
+def _env_float_clipped(key: str, default: float, *, lo: float, hi: float) -> float:
+    raw = os.environ.get(key, "").strip()
+    val = default if not raw else float(raw)
+    return float(np.clip(val, lo, hi))
+
+
 def _policy_vol_quantiles(values: np.ndarray, *, fit_mask: np.ndarray | None = None, n_buckets: int = 3) -> list[float]:
     arr = np.asarray(values, dtype=np.float64).ravel()
     mask = np.isfinite(arr)
@@ -832,8 +838,17 @@ def _l2_search_policy_params(
             hi=2.0,
         )
         dir_raw = np.asarray(dir_raw, dtype=np.float64).ravel()[valid]
-    reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [0.85, 1.0, 1.15], lo=0.10, hi=3.0)
-    risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [0.85, 1.0, 1.15], lo=0.10, hi=3.0)
+    reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [1.0], lo=0.10, hi=3.0)
+    risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [1.0], lo=0.10, hi=3.0)
+    trade_rate_tol = _env_float_clipped("L2_POLICY_TRADE_RATE_TOLERANCE", 0.015, lo=0.0, hi=0.08)
+    score_corr_active_w = _env_float_clipped("L2_POLICY_SCORE_CORR_ACTIVE_W", 0.95, lo=0.0, hi=5.0)
+    score_corr_all_w = _env_float_clipped("L2_POLICY_SCORE_CORR_ALL_W", 0.55, lo=0.0, hi=5.0)
+    score_f1_w = _env_float_clipped("L2_POLICY_SCORE_F1_W", 0.70, lo=0.0, hi=5.0)
+    score_sign_acc_w = _env_float_clipped("L2_POLICY_SCORE_SIGN_ACC_W", 0.20, lo=0.0, hi=5.0)
+    score_trade_pen_w = _env_float_clipped("L2_POLICY_SCORE_TRADE_PEN_W", 1.40, lo=0.0, hi=10.0)
+    score_trade_pen_hard_w = _env_float_clipped("L2_POLICY_SCORE_TRADE_PEN_HARD_W", 4.50, lo=0.0, hi=20.0)
+    score_balance_pen_w = _env_float_clipped("L2_POLICY_SCORE_BALANCE_PEN_W", 0.55, lo=0.0, hi=10.0)
+    score_short_bias_pen_w = _env_float_clipped("L2_POLICY_SCORE_SHORT_BIAS_PEN_W", 0.35, lo=0.0, hi=10.0)
     true_active = truth != 1
     true_long_share = float(np.mean(truth[true_active] == 0)) if true_active.any() else 0.5
     best: dict[str, float] | None = None
@@ -841,7 +856,8 @@ def _l2_search_policy_params(
     print("\n  [L2] policy search on val_tune", flush=True)
     print(
         f"    target_rates={np.round(target_rates, 4).tolist()}  temps={np.round(temps, 4).tolist()}  "
-        f"reward_mults={np.round(reward_mults, 4).tolist()}  risk_mults={np.round(risk_mults, 4).tolist()}",
+        f"reward_mults={np.round(reward_mults, 4).tolist()}  risk_mults={np.round(risk_mults, 4).tolist()}  "
+        f"trade_rate_tol={trade_rate_tol:.4f}",
         flush=True,
     )
     for temp in temps:
@@ -888,15 +904,20 @@ def _l2_search_policy_params(
                         if active_pred.any()
                         else 0.0
                     )
-                    trade_pen = abs(trade_rate - target_rate)
+                    trade_gap = abs(trade_rate - target_rate)
+                    trade_pen = trade_gap
+                    trade_pen_hard = max(0.0, trade_gap - trade_rate_tol)
                     balance_pen = abs(long_share - true_long_share)
+                    short_bias_pen = max(0.0, true_long_share - long_share)
                     score = (
-                        1.20 * float(np.nan_to_num(corr_active, nan=-1.0))
-                        + 0.70 * float(np.nan_to_num(corr_all, nan=-1.0))
-                        + 0.45 * f1m
-                        + 0.20 * sign_acc
-                        - 0.35 * trade_pen
-                        - 0.20 * balance_pen
+                        score_corr_active_w * float(np.nan_to_num(corr_active, nan=-1.0))
+                        + score_corr_all_w * float(np.nan_to_num(corr_all, nan=-1.0))
+                        + score_f1_w * f1m
+                        + score_sign_acc_w * sign_acc
+                        - score_trade_pen_w * trade_pen
+                        - score_trade_pen_hard_w * trade_pen_hard
+                        - score_balance_pen_w * balance_pen
+                        - score_short_bias_pen_w * short_bias_pen
                     )
                     if score > best_score:
                         best_score = score
@@ -913,6 +934,19 @@ def _l2_search_policy_params(
                             "corr_active": float(np.nan_to_num(corr_active, nan=0.0)),
                             "f1_macro": float(f1m),
                             "sign_acc_active": float(sign_acc),
+                            "trade_rate_tol": float(trade_rate_tol),
+                            "trade_gap": float(trade_gap),
+                            "trade_pen_hard": float(trade_pen_hard),
+                            "balance_pen": float(balance_pen),
+                            "short_bias_pen": float(short_bias_pen),
+                            "score_corr_active_w": float(score_corr_active_w),
+                            "score_corr_all_w": float(score_corr_all_w),
+                            "score_f1_w": float(score_f1_w),
+                            "score_sign_acc_w": float(score_sign_acc_w),
+                            "score_trade_pen_w": float(score_trade_pen_w),
+                            "score_trade_pen_hard_w": float(score_trade_pen_hard_w),
+                            "score_balance_pen_w": float(score_balance_pen_w),
+                            "score_short_bias_pen_w": float(score_short_bias_pen_w),
                         }
     if best is None:
         best = {
@@ -928,11 +962,13 @@ def _l2_search_policy_params(
             "corr_active": float("nan"),
             "f1_macro": float("nan"),
             "sign_acc_active": float("nan"),
+            "trade_rate_tol": float(trade_rate_tol),
         }
     print(
         f"  [L2] selected policy: thr={best['trade_threshold']:.4f}  target_trade_rate={best['target_trade_rate']:.3f}  "
         f"temp={best['direction_temperature']:.3f}  reward_mult={best['expected_edge_reward_mult']:.3f}  "
         f"risk_mult={best['expected_edge_risk_mult']:.3f}  realized_trade_rate={best['trade_rate']:.3f}  "
+        f"trade_gap={best.get('trade_gap', float('nan')):.3f}  "
         f"corr_active={best['corr_active']:.4f}  F1_macro={best['f1_macro']:.4f}",
         flush=True,
     )
@@ -997,6 +1033,75 @@ def _quantile_rescale_01(
     if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-8:
         return np.zeros_like(arr, dtype=np.float32)
     return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def _l2_positive_head_target_prep(
+    y_raw: np.ndarray,
+    *,
+    head_name: str,
+    clip_max: float,
+) -> tuple[np.ndarray, dict[str, float | str]]:
+    head = str(head_name).strip().upper()
+    y = np.clip(np.asarray(y_raw, dtype=np.float32), 0.0, float(clip_max))
+    transform = (
+        os.environ.get(f"L2_{head}_TARGET_TRANSFORM", os.environ.get("L2_POSITIVE_HEAD_TARGET_TRANSFORM", "log1p"))
+        .strip()
+        .lower()
+        or "log1p"
+    )
+    if transform not in {"none", "log1p"}:
+        transform = "log1p"
+    objective = (
+        os.environ.get(f"L2_{head}_OBJECTIVE", os.environ.get("L2_POSITIVE_HEAD_OBJECTIVE", "huber"))
+        .strip()
+        .lower()
+        or "huber"
+    )
+    if objective not in {"regression", "huber", "fair"}:
+        objective = "huber"
+    metric_default = "l1" if objective in {"huber", "fair"} else "l2"
+    metric = (
+        os.environ.get(f"L2_{head}_METRIC", os.environ.get("L2_POSITIVE_HEAD_METRIC", metric_default))
+        .strip()
+        .lower()
+        or metric_default
+    )
+    y_fit = np.log1p(y).astype(np.float32) if transform == "log1p" else y.astype(np.float32, copy=False)
+    prep: dict[str, float | str] = {
+        "clip_max": float(clip_max),
+        "target_transform": str(transform),
+        "objective": str(objective),
+        "metric": str(metric),
+    }
+    if objective == "huber":
+        prep["alpha"] = _env_float_clipped(f"L2_{head}_HUBER_ALPHA", 0.90, lo=0.50, hi=0.99)
+    elif objective == "fair":
+        prep["fair_c"] = _env_float_clipped(f"L2_{head}_FAIR_C", 1.0, lo=0.10, hi=10.0)
+    return y_fit, prep
+
+
+def _l2_positive_head_lgb_params(base_params: dict[str, Any], prep: dict[str, float | str]) -> dict[str, Any]:
+    params = {
+        **base_params,
+        "objective": str(prep.get("objective", "regression")),
+        "metric": str(prep.get("metric", "l2")),
+    }
+    if params["objective"] == "huber":
+        params["alpha"] = float(prep.get("alpha", 0.90))
+    elif params["objective"] == "fair":
+        params["fair_c"] = float(prep.get("fair_c", 1.0))
+    return params
+
+
+def _l2_positive_head_predict(model: lgb.Booster, X: np.ndarray, prep: dict[str, Any] | None, *, clip_max: float) -> np.ndarray:
+    cfg = dict(prep or {})
+    transform = str(cfg.get("target_transform", "none")).strip().lower() or "none"
+    cap = float(cfg.get("clip_max", clip_max))
+    pred = model.predict(X).astype(np.float64)
+    if transform == "log1p":
+        pred = np.expm1(pred)
+    pred = np.clip(pred, 0.0, cap)
+    return pred.astype(np.float32)
 
 
 def _residual_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -1095,6 +1200,8 @@ def train_l2_trade_decision(
     y_size[y_decision == 1] = 0.0
     y_mfe = np.clip(mfe, 0.0, 5.0).astype(np.float32)
     y_mae = np.clip(mae, 0.0, 4.0).astype(np.float32)
+    y_mfe_fit, mfe_head_prep = _l2_positive_head_target_prep(y_mfe, head_name="mfe", clip_max=5.0)
+    y_mae_fit, mae_head_prep = _l2_positive_head_target_prep(y_mae, head_name="mae", clip_max=4.0)
     y_dir_margin = np.clip(edge / float(os.environ.get("L2_DIRECTION_EDGE_SCALE", "0.75")), -1.0, 1.0).astype(np.float32)
 
     log_layer_banner("[L2] Trade decision (LGBM)")
@@ -1141,6 +1248,11 @@ def train_l2_trade_decision(
     log_label_baseline("l2_size", y_size[train_mask & (y_decision != 1)], task="reg")
     log_label_baseline("l2_mfe", y_mfe[train_mask & (y_decision != 1)], task="reg")
     log_label_baseline("l2_mae", y_mae[train_mask & (y_decision != 1)], task="reg")
+    print(
+        f"  [L2] aux target prep: mfe(transform={mfe_head_prep['target_transform']}, objective={mfe_head_prep['objective']}, metric={mfe_head_prep['metric']})  "
+        f"mae(transform={mae_head_prep['target_transform']}, objective={mae_head_prep['objective']}, metric={mae_head_prep['metric']})",
+        flush=True,
+    )
 
     rounds = 250 if FAST_TRAIN_MODE else 1200
     # Gate: default 120 — not tied to FAST_TRAIN_MODE (set L2_GATE_EARLY_STOPPING_ROUNDS to override).
@@ -1226,6 +1338,8 @@ def train_l2_trade_decision(
         "seed": 43,
         "n_jobs": _lgbm_n_jobs(),
     }
+    mfe_params = _l2_positive_head_lgb_params(reg_params, mfe_head_prep)
+    mae_params = _l2_positive_head_lgb_params(reg_params, mae_head_prep)
     dtrain_gate = lgb.Dataset(
         X[train_mask],
         label=y_gate[train_mask],
@@ -1305,10 +1419,10 @@ def train_l2_trade_decision(
         cbs, cl = _lgb_train_callbacks_with_round_tqdm(mfe_es_rounds, rounds, "[L2] mfe")
         try:
             mfe_model = lgb.train(
-                reg_params,
-                lgb.Dataset(X[active_train], label=y_mfe[active_train], feature_name=feature_cols, free_raw_data=False),
+                mfe_params,
+                lgb.Dataset(X[active_train], label=y_mfe_fit[active_train], feature_name=feature_cols, free_raw_data=False),
                 num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X[active_val], label=y_mfe[active_val], feature_name=feature_cols, free_raw_data=False)],
+                valid_sets=[lgb.Dataset(X[active_val], label=y_mfe_fit[active_val], feature_name=feature_cols, free_raw_data=False)],
                 callbacks=cbs,
             )
         finally:
@@ -1320,10 +1434,10 @@ def train_l2_trade_decision(
         cbs, cl = _lgb_train_callbacks_with_round_tqdm(mae_es_rounds, rounds, "[L2] mae")
         try:
             mae_model = lgb.train(
-                reg_params,
-                lgb.Dataset(X[active_train], label=y_mae[active_train], feature_name=feature_cols, free_raw_data=False),
+                mae_params,
+                lgb.Dataset(X[active_train], label=y_mae_fit[active_train], feature_name=feature_cols, free_raw_data=False),
                 num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X[active_val], label=y_mae[active_val], feature_name=feature_cols, free_raw_data=False)],
+                valid_sets=[lgb.Dataset(X[active_val], label=y_mae_fit[active_val], feature_name=feature_cols, free_raw_data=False)],
                 callbacks=cbs,
             )
         finally:
@@ -1338,8 +1452,8 @@ def train_l2_trade_decision(
     dir_raw_all = direction_model.predict(X).astype(np.float64) if direction_model is not None else None
     gate_calibrator = _fit_binary_calibrator(y_gate[val_tune_mask], gate_raw_all[val_tune_mask])
     size_pred = np.clip(size_model.predict(X).astype(np.float32), 0.0, 1.0)
-    mfe_pred = np.clip(mfe_model.predict(X).astype(np.float32), 0.0, 5.0)
-    mae_pred = np.clip(mae_model.predict(X).astype(np.float32), 0.0, 4.0)
+    mfe_pred = _l2_positive_head_predict(mfe_model, X, mfe_head_prep, clip_max=5.0)
+    mae_pred = _l2_positive_head_predict(mae_model, X, mae_head_prep, clip_max=4.0)
     state_keys_all = _l2_policy_state_keys(frame, vol_quantiles=policy_vol_quantiles)
     policy, conditional_policy_by_state = _l2_search_conditional_policy(
         state_keys_all[val_tune_mask],
@@ -1501,7 +1615,22 @@ def train_l2_trade_decision(
         "expected_edge_reward_mult": expected_edge_reward_mult,
         "expected_edge_risk_mult": expected_edge_risk_mult,
         "expected_edge_semantics": "gate * size * signed_dir * (reward_mult * pred_mfe - risk_mult * pred_mae)",
+        "l2_aux_head_target_prep": {
+            "mfe": mfe_head_prep,
+            "mae": mae_head_prep,
+        },
         "policy_search": policy,
+        "policy_search_trade_rate_tolerance": float(policy.get("trade_rate_tol", 0.015)),
+        "policy_search_score_weights": {
+            "corr_active": float(policy.get("score_corr_active_w", 0.95)),
+            "corr_all": float(policy.get("score_corr_all_w", 0.55)),
+            "f1_macro": float(policy.get("score_f1_w", 0.70)),
+            "sign_acc_active": float(policy.get("score_sign_acc_w", 0.20)),
+            "trade_pen": float(policy.get("score_trade_pen_w", 1.40)),
+            "trade_pen_hard": float(policy.get("score_trade_pen_hard_w", 4.50)),
+            "balance_pen": float(policy.get("score_balance_pen_w", 0.55)),
+            "short_bias_pen": float(policy.get("score_short_bias_pen_w", 0.35)),
+        },
         "model_files": model_files,
         "output_cache_file": L2_OUTPUT_CACHE_FILE,
         "target_trade_rate": _l2_target_trade_rate(),
@@ -1616,8 +1745,9 @@ def infer_l2_trade_decision(
     else:
         raise RuntimeError("L2 meta missing two_stage gate or legacy decision model.")
     size_pred = np.clip(models["size"].predict(X).astype(np.float32), 0.0, 1.0)
-    mfe_pred = np.clip(models["mfe"].predict(X).astype(np.float32), 0.0, 5.0)
-    mae_pred = np.clip(models["mae"].predict(X).astype(np.float32), 0.0, 4.0)
+    aux_prep = meta.get("l2_aux_head_target_prep", {})
+    mfe_pred = _l2_positive_head_predict(models["mfe"], X, aux_prep.get("mfe"), clip_max=5.0)
+    mae_pred = _l2_positive_head_predict(models["mae"], X, aux_prep.get("mae"), clip_max=4.0)
     if mode == "two_stage":
         hard_decision_class, decision_confidence = _l2_hard_decode_outputs(
             gate_p=gate_p,

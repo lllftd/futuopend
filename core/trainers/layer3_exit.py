@@ -296,6 +296,74 @@ def _env_float_candidates(key: str, default: list[float], *, lo: float, hi: floa
     return clipped or [float(np.clip(default[0], lo, hi))]
 
 
+def _env_float_clipped(key: str, default: float, *, lo: float, hi: float) -> float:
+    raw = os.environ.get(key, "").strip()
+    val = default if not raw else float(raw)
+    return float(np.clip(val, lo, hi))
+
+
+def _l3_exit_class_weights() -> tuple[float, float]:
+    exit_pos_w = _env_float_clipped("L3_EXIT_POS_WEIGHT", 0.90, lo=0.10, hi=5.0)
+    hold_neg_w = _env_float_clipped("L3_EXIT_NEG_WEIGHT", 1.10, lo=0.10, hi=5.0)
+    return exit_pos_w, hold_neg_w
+
+
+def _l3_prepare_value_targets(y_value: np.ndarray, train_mask: np.ndarray) -> tuple[np.ndarray, dict[str, float | str | bool]]:
+    y = np.asarray(y_value, dtype=np.float32).copy()
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    finite_train = train & np.isfinite(y)
+    clip_enabled = os.environ.get("L3_VALUE_CLIP", "1").strip().lower() in {"1", "true", "yes"}
+    q_lo = _env_float_clipped("L3_VALUE_CLIP_LO_Q", 0.01, lo=0.0, hi=0.25)
+    q_hi = _env_float_clipped("L3_VALUE_CLIP_HI_Q", 0.99, lo=0.75, hi=1.0)
+    abs_cap = max(0.0, float(os.environ.get("L3_VALUE_CLIP_ABS", "0").strip() or 0.0))
+    clip_lo = float("nan")
+    clip_hi = float("nan")
+    clipped_frac = 0.0
+    if clip_enabled and finite_train.any():
+        clip_lo = float(np.quantile(y[finite_train], q_lo))
+        clip_hi = float(np.quantile(y[finite_train], q_hi))
+        if abs_cap > 0.0:
+            clip_lo = max(clip_lo, -abs_cap)
+            clip_hi = min(clip_hi, abs_cap)
+        if clip_hi < clip_lo:
+            clip_lo, clip_hi = clip_hi, clip_lo
+        below = y < clip_lo
+        above = y > clip_hi
+        clipped_frac = float(np.mean((below | above)[finite_train])) if finite_train.any() else 0.0
+        y[below] = clip_lo
+        y[above] = clip_hi
+    objective = (os.environ.get("L3_VALUE_OBJECTIVE", "huber").strip().lower() or "huber")
+    if objective not in {"huber", "fair", "regression"}:
+        objective = "huber"
+    metric_default = "l1" if objective in {"huber", "fair"} else "l2"
+    metric = (os.environ.get("L3_VALUE_METRIC", metric_default).strip().lower() or metric_default)
+    stats: dict[str, float | str | bool] = {
+        "clip_enabled": bool(clip_enabled),
+        "clip_lo_q": float(q_lo),
+        "clip_hi_q": float(q_hi),
+        "clip_abs_cap": float(abs_cap),
+        "clip_lo": float(clip_lo),
+        "clip_hi": float(clip_hi),
+        "train_clipped_frac": float(clipped_frac),
+        "objective": str(objective),
+        "metric": str(metric),
+    }
+    if objective == "huber":
+        stats["huber_alpha"] = _env_float_clipped("L3_VALUE_HUBER_ALPHA", 0.90, lo=0.50, hi=0.99)
+    elif objective == "fair":
+        stats["fair_c"] = _env_float_clipped("L3_VALUE_FAIR_C", 1.0, lo=0.10, hi=10.0)
+    return y, stats
+
+
+def _l3_value_lgb_params(exit_params: dict[str, Any], *, seed: int, prep: dict[str, float | str | bool]) -> dict[str, Any]:
+    params = {**exit_params, "objective": str(prep["objective"]), "metric": str(prep["metric"]), "seed": int(seed)}
+    if prep["objective"] == "huber":
+        params["alpha"] = float(prep.get("huber_alpha", 0.90))
+    elif prep["objective"] == "fair":
+        params["fair_c"] = float(prep.get("fair_c", 1.0))
+    return params
+
+
 def _policy_vol_quantiles(values: np.ndarray, *, fit_mask: np.ndarray | None = None, n_buckets: int = 3) -> list[float]:
     arr = np.asarray(values, dtype=np.float64).ravel()
     mask = np.isfinite(arr)
@@ -687,8 +755,8 @@ def _l3_trade_normalized_exit_weights(
         3: float(os.environ.get("L3_HOLD_BUCKET_W3", "0.90")),
     }
     hold_w = np.asarray([hold_weight_map.get(int(h), 1.0) for h in hb], dtype=np.float64)
-    exit_pos_w = float(os.environ.get("L3_EXIT_POS_WEIGHT", "1.05"))
-    cls_w = np.where(y == 1, exit_pos_w, 1.0).astype(np.float64)
+    exit_pos_w, hold_neg_w = _l3_exit_class_weights()
+    cls_w = np.where(y == 1, exit_pos_w, hold_neg_w).astype(np.float64)
     w = trade_norm * hold_w * cls_w
     w = w / max(float(np.mean(w)), 1e-8)
     return w.astype(np.float32)
@@ -697,7 +765,7 @@ def _l3_trade_normalized_exit_weights(
 def _fit_l3_static_ablation(
     X_static: np.ndarray,
     y_exit: np.ndarray,
-    y_value: np.ndarray,
+    y_value_fit: np.ndarray,
     train_mask: np.ndarray,
     val_mask: np.ndarray,
     rows_entry: np.ndarray,
@@ -705,6 +773,7 @@ def _fit_l3_static_ablation(
     *,
     rounds: int,
     es_rounds: int,
+    value_prep: dict[str, float | str | bool],
 ) -> tuple[lgb.Booster, lgb.Booster]:
     exit_params = {
         "objective": "binary",
@@ -722,7 +791,7 @@ def _fit_l3_static_ablation(
         "seed": 171,
         "n_jobs": _lgbm_n_jobs(),
     }
-    value_params = {**exit_params, "objective": "regression", "metric": "l2", "seed": 172}
+    value_params = _l3_value_lgb_params(exit_params, seed=172, prep=value_prep)
     ih = feature_cols.index("l3_hold_bars")
     w = _l3_trade_normalized_exit_weights(rows_entry[train_mask], X_static[train_mask, ih], y_exit[train_mask])
     cbs, cl = _lgb_train_callbacks_with_round_tqdm(min(es_rounds, 30), min(rounds, 120), "[L3] static-exit")
@@ -747,9 +816,9 @@ def _fit_l3_static_ablation(
     try:
         value_model = lgb.train(
             value_params,
-            lgb.Dataset(X_static[train_mask], label=y_value[train_mask], feature_name=feature_cols, free_raw_data=False),
+            lgb.Dataset(X_static[train_mask], label=y_value_fit[train_mask], feature_name=feature_cols, free_raw_data=False),
             num_boost_round=min(rounds, 120),
-            valid_sets=[lgb.Dataset(X_static[val_mask], label=y_value[val_mask], feature_name=feature_cols, free_raw_data=False)],
+            valid_sets=[lgb.Dataset(X_static[val_mask], label=y_value_fit[val_mask], feature_name=feature_cols, free_raw_data=False)],
             callbacks=cbs,
         )
     finally:
@@ -1374,6 +1443,19 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     print(f"  [L3] will write: {artifact_path(L3_EXIT_FILE)} | {artifact_path(L3_VALUE_FILE)} | {artifact_path(L3_META_FILE)}", flush=True)
     log_label_baseline("l3_exit", y_exit[train_mask], task="cls")
     log_label_baseline("l3_value", y_value[train_mask], task="reg")
+    y_value_fit, value_prep = _l3_prepare_value_targets(y_value, train_mask)
+    print(
+        f"  [L3] value target prep: objective={value_prep['objective']} metric={value_prep['metric']}  "
+        f"clip={bool(value_prep['clip_enabled'])} q=[{float(value_prep['clip_lo_q']):.2f}, {float(value_prep['clip_hi_q']):.2f}]  "
+        f"train_clip=[{float(value_prep['clip_lo']):.4f}, {float(value_prep['clip_hi']):.4f}]  "
+        f"train_clipped_frac={float(value_prep['train_clipped_frac']):.3f}",
+        flush=True,
+    )
+    exit_pos_w, hold_neg_w = _l3_exit_class_weights()
+    print(
+        f"  [L3] exit class weights: hold={hold_neg_w:.3f}  exit={exit_pos_w:.3f}",
+        flush=True,
+    )
 
     use_hybrid = want_traj
     use_hybrid = (
@@ -1390,11 +1472,11 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             traj_seq[train_mask],
             traj_len[train_mask],
             y_exit[train_mask].astype(np.float32),
-            y_value[train_mask].astype(np.float32),
+            y_value_fit[train_mask].astype(np.float32),
             traj_seq[val_mask],
             traj_len[val_mask],
             y_exit[val_mask].astype(np.float32),
-            y_value[val_mask].astype(np.float32),
+            y_value_fit[val_mask].astype(np.float32),
             cfg=traj_cfg,
             device=TORCH_DEVICE,
         )
@@ -1438,7 +1520,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "seed": 71,
         "n_jobs": _lgbm_n_jobs(),
     }
-    value_params = {**exit_params, "objective": "regression", "metric": "l2", "seed": 72}
+    value_params = _l3_value_lgb_params(exit_params, seed=72, prep=value_prep)
     static_exit_model = None
     static_value_model = None
     l3_outer = tqdm(
@@ -1478,9 +1560,9 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         try:
             value_model = lgb.train(
                 value_params,
-                lgb.Dataset(X_lgb[train_mask], label=y_value[train_mask], feature_name=feature_cols, free_raw_data=False),
+                lgb.Dataset(X_lgb[train_mask], label=y_value_fit[train_mask], feature_name=feature_cols, free_raw_data=False),
                 num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_value[val_mask], feature_name=feature_cols, free_raw_data=False)],
+                valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_value_fit[val_mask], feature_name=feature_cols, free_raw_data=False)],
                 callbacks=cbs,
             )
         finally:
@@ -1516,13 +1598,14 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         static_exit_model, static_value_model = _fit_l3_static_ablation(
             X,
             y_exit,
-            y_value,
+            y_value_fit,
             train_mask,
             val_mask,
             rows_entry,
             static_cols,
             rounds=rounds,
             es_rounds=es_rounds,
+            value_prep=value_prep,
         )
         p_static = _apply_l3_exit_calibrator(
             static_exit_model.predict(X[val_report_mask]).astype(np.float64),
@@ -1600,6 +1683,11 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_exit_policy_search": exit_policy,
         "l3_exit_policy_by_state": exit_policy_by_state,
         "l3_target_semantics": "continuation_value_to_fixed_deadline",
+        "l3_exit_class_weights": {
+            "hold": float(hold_neg_w),
+            "exit": float(exit_pos_w),
+        },
+        "l3_value_training": value_prep,
     }
     if use_hybrid:
         import torch
