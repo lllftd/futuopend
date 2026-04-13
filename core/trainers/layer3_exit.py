@@ -306,9 +306,20 @@ def _env_float_clipped(key: str, default: float, *, lo: float, hi: float) -> flo
     return float(np.clip(val, lo, hi))
 
 
-def _l3_exit_class_weights() -> tuple[float, float]:
-    exit_pos_w = _env_float_clipped("L3_EXIT_POS_WEIGHT", 0.90, lo=0.10, hi=5.0)
-    hold_neg_w = _env_float_clipped("L3_EXIT_NEG_WEIGHT", 1.10, lo=0.10, hi=5.0)
+def _env_int_clipped(key: str, default: int, *, lo: int, hi: int) -> int:
+    raw = os.environ.get(key, "").strip()
+    val = default if not raw else int(raw)
+    return int(np.clip(val, lo, hi))
+
+
+def _l3_exit_class_weights(y_exit: np.ndarray) -> tuple[float, float]:
+    y = np.asarray(y_exit, dtype=np.int32).ravel()
+    if y.size == 0:
+        return 1.0, 1.0
+    n_exit = max(int(np.sum(y == 1)), 1)
+    n_hold = max(int(np.sum(y == 0)), 1)
+    exit_pos_w = float(np.clip(np.sqrt(n_hold / n_exit), 0.5, 3.0))
+    hold_neg_w = float(np.clip(np.sqrt(n_exit / n_hold), 0.5, 3.0))
     return exit_pos_w, hold_neg_w
 
 
@@ -601,6 +612,7 @@ def _l3_search_exit_policy(
     value_pred: np.ndarray,
     y_exit: np.ndarray,
     *,
+    y_value_true: np.ndarray | None = None,
     value_policy_mode: str | None = None,
     value_tie_margin: float | None = None,
 ) -> dict[str, float]:
@@ -608,8 +620,8 @@ def _l3_search_exit_policy(
     value = np.asarray(value_pred, dtype=np.float64).ravel()
     y = np.asarray(y_exit, dtype=np.int32).ravel()
     valid = np.isfinite(prob) & np.isfinite(value)
-    mode = str(value_policy_mode or os.environ.get("L3_VALUE_POLICY_MODE", "prob_only")).strip().lower() or "prob_only"
-    tie_margin = float(max(0.0, float(value_tie_margin if value_tie_margin is not None else os.environ.get("L3_VALUE_TIE_MARGIN", "0.03"))))
+    mode = str(value_policy_mode or "prob_only").strip().lower() or "prob_only"
+    tie_margin = float(max(0.0, float(value_tie_margin if value_tie_margin is not None else 0.03)))
     if not valid.any():
         return {
             "exit_prob_threshold": 0.55,
@@ -621,89 +633,54 @@ def _l3_search_exit_policy(
     prob = prob[valid]
     value = value[valid]
     y = y[valid]
-    prob_default = np.quantile(prob, max(0.05, 1.0 - float(np.mean(y)))) if len(prob) else 0.55
-    prob_candidates = _env_float_candidates(
-        "L3_EXIT_PROB_THRESHOLD_GRID",
-        [0.50, float(prob_default), 0.65, 0.75, 0.85, 0.90],
-        lo=0.05,
-        hi=0.95,
-    )
-    value_candidates = _env_float_candidates(
-        "L3_VALUE_LEFT_THRESHOLD_GRID",
-        [float(np.quantile(value, q)) for q in (0.25, 0.40, 0.55)] + [0.0, 0.02],
-        lo=-2.0,
-        hi=2.0,
-    )
-    target_exit_rate = float(np.mean(y))
-    target_exit_rate = float(np.clip(target_exit_rate, 0.55, 0.88))
-    max_exit_rate = _env_float_clipped("L3_EXIT_POLICY_MAX_EXIT_RATE", 0.90, lo=0.50, hi=0.99)
-    min_hold_recall = _env_float_clipped("L3_EXIT_POLICY_MIN_HOLD_RECALL", 0.20, lo=0.0, hi=0.95)
-    best: dict[str, float] | None = None
-    best_score = -1e18
-    print("\n  [L3] exit policy search on val_tune", flush=True)
-    print(
-        f"    prob_thresholds={np.round(prob_candidates, 4).tolist()}  "
-        f"value_thresholds={np.round(value_candidates, 4).tolist()}",
-        flush=True,
-    )
-    for prob_thr in prob_candidates:
-        for value_thr in value_candidates:
-            if mode == "hard_gate":
-                pred = ((prob >= prob_thr) & (value <= value_thr)).astype(np.int32)
-            elif mode == "tie_break":
-                pred = (
-                    (prob >= prob_thr)
-                    | (((prob >= max(0.0, prob_thr - tie_margin)) & (prob < prob_thr)) & (value <= value_thr))
-                ).astype(np.int32)
-            else:
-                pred = (prob >= prob_thr).astype(np.int32)
-            f1 = float(f1_score(y, pred, zero_division=0))
-            acc = float(accuracy_score(y, pred))
-            exit_rate = float(np.mean(pred))
-            rate_pen = abs(exit_rate - target_exit_rate)
-            hold_mask = y == 0
-            pred_hold = pred == 0
-            hold_recall = float(np.mean(pred[hold_mask] == 0)) if hold_mask.any() else 0.0
-            hold_precision = float(np.mean(y[pred_hold] == 0)) if pred_hold.any() else 0.0
-            exit_recall = float(np.mean(pred[y == 1] == 1)) if np.any(y == 1) else 0.0
-            exit_rate_high_pen = max(0.0, exit_rate - max_exit_rate)
-            hold_recall_pen = max(0.0, min_hold_recall - hold_recall)
-            score = (
-                0.70 * f1
-                + 0.20 * acc
-                + 0.75 * hold_recall
-                + 0.25 * hold_precision
-                + 0.10 * exit_recall
-                - 0.30 * rate_pen
-                - 1.50 * exit_rate_high_pen
-                - 1.25 * hold_recall_pen
-            )
-            if score > best_score:
-                best_score = score
-                best = {
-                    "exit_prob_threshold": float(prob_thr),
-                    "value_left_threshold": float(value_thr),
-                    "score": float(score),
-                    "f1": float(f1),
-                    "acc": float(acc),
-                    "exit_rate": float(exit_rate),
-                    "target_exit_rate": float(target_exit_rate),
-                    "max_exit_rate": float(max_exit_rate),
-                    "min_hold_recall": float(min_hold_recall),
-                    "hold_recall": float(hold_recall),
-                    "hold_precision": float(hold_precision),
-                    "exit_recall": float(exit_recall),
-                    "value_policy_mode": mode,
-                    "value_tie_margin": tie_margin,
-                }
-    if best is None:
-        best = {
-            "exit_prob_threshold": 0.55,
-            "value_left_threshold": 0.02,
-            "value_policy_mode": mode,
-            "value_tie_margin": tie_margin,
-            "score": float("nan"),
-        }
+    value_true = None if y_value_true is None else np.asarray(y_value_true, dtype=np.float64).ravel()[valid]
+    target_exit_rate = float(np.clip(np.mean(y), 0.55, 0.88))
+    hold_rate = float(np.mean(y == 0))
+    min_hold_recall = float(np.clip(np.sqrt(max(hold_rate, 1e-6)) * 0.5, 0.20, 0.60))
+    max_exit_rate = float(np.clip(target_exit_rate + 0.08, 0.60, 0.95))
+    prob_thr_rate = float(np.quantile(prob, 1.0 - target_exit_rate))
+    prob_thr_hold = float(np.quantile(prob[y == 0], min_hold_recall)) if np.any(y == 0) else prob_thr_rate
+    prob_thr = float(np.clip(max(prob_thr_rate, prob_thr_hold), 0.05, 0.95))
+    if value_true is not None and value_true.size:
+        bias = float(np.median(value_true - value))
+        value_adj = value + bias
+    else:
+        value_adj = value
+    value_thr = float(np.median(value_adj[y == 1])) if np.any(y == 1) else float(np.median(value_adj))
+    if mode == "hard_gate":
+        pred = ((prob >= prob_thr) & (value_adj <= value_thr)).astype(np.int32)
+    elif mode == "tie_break":
+        pred = (
+            (prob >= prob_thr)
+            | (((prob >= max(0.0, prob_thr - tie_margin)) & (prob < prob_thr)) & (value_adj <= value_thr))
+        ).astype(np.int32)
+    else:
+        pred = (prob >= prob_thr).astype(np.int32)
+    f1 = float(f1_score(y, pred, zero_division=0))
+    acc = float(accuracy_score(y, pred))
+    exit_rate = float(np.mean(pred))
+    hold_mask = y == 0
+    pred_hold = pred == 0
+    hold_recall = float(np.mean(pred[hold_mask] == 0)) if hold_mask.any() else 0.0
+    hold_precision = float(np.mean(y[pred_hold] == 0)) if pred_hold.any() else 0.0
+    exit_recall = float(np.mean(pred[y == 1] == 1)) if np.any(y == 1) else 0.0
+    best = {
+        "exit_prob_threshold": float(prob_thr),
+        "value_left_threshold": float(value_thr),
+        "score": float(0.70 * f1 + 0.20 * hold_recall + 0.10 * hold_precision),
+        "f1": float(f1),
+        "acc": float(acc),
+        "exit_rate": float(exit_rate),
+        "target_exit_rate": float(target_exit_rate),
+        "max_exit_rate": float(max_exit_rate),
+        "min_hold_recall": float(min_hold_recall),
+        "hold_recall": float(hold_recall),
+        "hold_precision": float(hold_precision),
+        "exit_recall": float(exit_recall),
+        "value_policy_mode": mode,
+        "value_tie_margin": tie_margin,
+    }
+    print("\n  [L3] exit policy derivation on val_tune", flush=True)
     print(
         f"  [L3] selected exit policy: mode={best['value_policy_mode']}  p_exit>={best['exit_prob_threshold']:.4f}  "
         f"value_left<={best['value_left_threshold']:.4f}  F1={best.get('f1', float('nan')):.4f}  acc={best.get('acc', float('nan')):.4f}  "
@@ -720,6 +697,7 @@ def _l3_search_conditional_exit_policy(
     value_pred: np.ndarray,
     y_exit: np.ndarray,
     *,
+    y_value_true: np.ndarray | None = None,
     value_policy_mode: str | None = None,
     value_tie_margin: float | None = None,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
@@ -727,6 +705,7 @@ def _l3_search_conditional_exit_policy(
         exit_prob,
         value_pred,
         y_exit,
+        y_value_true=y_value_true,
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
     )
@@ -743,6 +722,7 @@ def _l3_search_conditional_exit_policy(
             np.asarray(exit_prob, dtype=np.float64).ravel()[valid][m],
             np.asarray(value_pred, dtype=np.float64).ravel()[valid][m],
             np.asarray(y_exit, dtype=np.int32).ravel()[valid][m],
+            y_value_true=None if y_value_true is None else np.asarray(y_value_true, dtype=np.float64).ravel()[valid][m],
             value_policy_mode=value_policy_mode,
             value_tie_margin=value_tie_margin,
         )
@@ -778,6 +758,16 @@ def _choose_l3_value_policy_mode(
     return mode
 
 
+def _derive_l3_value_tie_margin(y_true: np.ndarray, pred: np.ndarray) -> float:
+    yt = np.asarray(y_true, dtype=np.float64).ravel()
+    yp = np.asarray(pred, dtype=np.float64).ravel()
+    valid = np.isfinite(yt) & np.isfinite(yp)
+    if not valid.any():
+        return 0.03
+    resid = np.abs(yt[valid] - yp[valid])
+    return float(np.clip(np.median(resid), 0.0, 0.25))
+
+
 def _l3_trade_normalized_exit_weights(
     rows_entry: np.ndarray,
     hold_bars: np.ndarray,
@@ -792,18 +782,38 @@ def _l3_trade_normalized_exit_weights(
     del uniq
     trade_norm = 1.0 / np.maximum(counts[inv].astype(np.float64), 1.0)
     hb = _hold_bucket_ids(hold)
-    hold_weight_map = {
-        0: float(os.environ.get("L3_HOLD_BUCKET_W0", "1.10")),
-        1: float(os.environ.get("L3_HOLD_BUCKET_W1", "1.00")),
-        2: float(os.environ.get("L3_HOLD_BUCKET_W2", "0.95")),
-        3: float(os.environ.get("L3_HOLD_BUCKET_W3", "0.90")),
-    }
-    hold_w = np.asarray([hold_weight_map.get(int(h), 1.0) for h in hb], dtype=np.float64)
-    exit_pos_w, hold_neg_w = _l3_exit_class_weights()
+    hb_counts = np.bincount(hb.astype(np.int32), minlength=4).astype(np.float64)
+    hb_counts = np.maximum(hb_counts, 1.0)
+    hold_w = np.asarray([float(np.clip(np.sqrt(np.mean(hb_counts) / hb_counts[int(h)]), 0.75, 1.5)) for h in hb], dtype=np.float64)
+    exit_pos_w, hold_neg_w = _l3_exit_class_weights(y)
     cls_w = np.where(y == 1, exit_pos_w, hold_neg_w).astype(np.float64)
     w = trade_norm * hold_w * cls_w
     w = w / max(float(np.mean(w)), 1e-8)
     return w.astype(np.float32)
+
+
+def _l3_boost_rounds() -> int:
+    return _env_int_clipped("L3_BOOST_ROUNDS", 250, lo=50, hi=5000)
+
+
+def _l3_early_stopping_rounds() -> int:
+    return _env_int_clipped("L3_EARLY_STOPPING_ROUNDS", 40, lo=5, hi=1000)
+
+
+def _l3_lgb_params(prefix: str, *, seed_default: int) -> dict[str, Any]:
+    del prefix
+    return {
+        "learning_rate": 0.03,
+        "num_leaves": 48,
+        "max_depth": 6,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "min_child_samples": 80,
+        "lambda_l1": 0.1,
+        "lambda_l2": 1.0,
+        "seed": int(seed_default),
+    }
 
 
 def _fit_l3_static_ablation(
@@ -819,26 +829,30 @@ def _fit_l3_static_ablation(
     es_rounds: int,
     value_prep: dict[str, float | str | bool],
 ) -> tuple[lgb.Booster, lgb.Booster]:
+    exit_cfg = _l3_lgb_params("L3_STATIC_EXIT", seed_default=171)
+    value_cfg = _l3_lgb_params("L3_STATIC_VALUE", seed_default=172)
     exit_params = {
         "objective": "binary",
         "metric": "binary_logloss",
-        "learning_rate": 0.03,
-        "num_leaves": 48,
-        "max_depth": 6,
-        "feature_fraction": 0.85,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "min_child_samples": 80,
-        "lambda_l1": 0.1,
-        "lambda_l2": 1.0,
+        "learning_rate": exit_cfg["learning_rate"],
+        "num_leaves": exit_cfg["num_leaves"],
+        "max_depth": exit_cfg["max_depth"],
+        "feature_fraction": exit_cfg["feature_fraction"],
+        "bagging_fraction": exit_cfg["bagging_fraction"],
+        "bagging_freq": exit_cfg["bagging_freq"],
+        "min_child_samples": exit_cfg["min_child_samples"],
+        "lambda_l1": exit_cfg["lambda_l1"],
+        "lambda_l2": exit_cfg["lambda_l2"],
         "verbosity": -1,
-        "seed": 171,
+        "seed": exit_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
     }
-    value_params = _l3_value_lgb_params(exit_params, seed=172, prep=value_prep)
+    value_params = _l3_value_lgb_params({**exit_params, **value_cfg}, seed=value_cfg["seed"], prep=value_prep)
     ih = feature_cols.index("l3_hold_bars")
     w = _l3_trade_normalized_exit_weights(rows_entry[train_mask], X_static[train_mask, ih], y_exit[train_mask])
-    cbs, cl = _lgb_train_callbacks_with_round_tqdm(min(es_rounds, 30), min(rounds, 120), "[L3] static-exit")
+    static_es_rounds = min(es_rounds, _env_int_clipped("L3_STATIC_EARLY_STOPPING_ROUNDS_CAP", 30, lo=1, hi=1000))
+    static_rounds = min(rounds, _env_int_clipped("L3_STATIC_BOOST_ROUNDS_CAP", 120, lo=10, hi=5000))
+    cbs, cl = _lgb_train_callbacks_with_round_tqdm(static_es_rounds, static_rounds, "[L3] static-exit")
     try:
         exit_model = lgb.train(
             exit_params,
@@ -849,19 +863,19 @@ def _fit_l3_static_ablation(
                 feature_name=feature_cols,
                 free_raw_data=False,
             ),
-            num_boost_round=min(rounds, 120),
+            num_boost_round=static_rounds,
             valid_sets=[lgb.Dataset(X_static[val_mask], label=y_exit[val_mask], feature_name=feature_cols, free_raw_data=False)],
             callbacks=cbs,
         )
     finally:
         for fn in cl:
             fn()
-    cbs, cl = _lgb_train_callbacks_with_round_tqdm(min(es_rounds, 30), min(rounds, 120), "[L3] static-value")
+    cbs, cl = _lgb_train_callbacks_with_round_tqdm(static_es_rounds, static_rounds, "[L3] static-value")
     try:
         value_model = lgb.train(
             value_params,
             lgb.Dataset(X_static[train_mask], label=y_value_fit[train_mask], feature_name=feature_cols, free_raw_data=False),
-            num_boost_round=min(rounds, 120),
+            num_boost_round=static_rounds,
             valid_sets=[lgb.Dataset(X_static[val_mask], label=y_value_fit[val_mask], feature_name=feature_cols, free_raw_data=False)],
             callbacks=cbs,
         )
@@ -1146,7 +1160,10 @@ def _build_l3_policy_dataset(
         future_gain_left = (terminal_unreal - unreal_seg).astype(np.float32, copy=False)
         continuation_score = _l3_continuation_score(future_gain_left, live_edge_seg)
         last_step = np.arange(n_steps) == (n_steps - 1)
-        late_hold_start = max(2, int(np.ceil(target_horizon * 0.75)))
+        late_hold_start = max(
+            _env_int_clipped("L3_LATE_HOLD_MIN_BARS", 2, lo=1, hi=max_hold),
+            int(np.ceil(target_horizon * _env_float_clipped("L3_LATE_HOLD_FRAC", 0.75, lo=0.1, hi=1.0))),
+        )
         weak_continuation = continuation_score <= exit_epsilon_atr
         clearly_spent = future_gain_left <= -_l3_exit_loss_buffer_atr()
         live_edge_faded = live_edge_seg <= _l3_exit_live_edge_floor()
@@ -1509,17 +1526,19 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         f"train_clipped_frac={float(value_prep['train_clipped_frac']):.3f}",
         flush=True,
     )
-    exit_pos_w, hold_neg_w = _l3_exit_class_weights()
+    exit_pos_w, hold_neg_w = _l3_exit_class_weights(y_exit[train_mask])
     print(
         f"  [L3] exit class weights: hold={hold_neg_w:.3f}  exit={exit_pos_w:.3f}",
         flush=True,
     )
 
     use_hybrid = want_traj
+    gru_min_train_rows = _env_int_clipped("L3_GRU_MIN_TRAIN_ROWS", 300, lo=1, hi=1_000_000)
+    gru_min_val_rows = _env_int_clipped("L3_GRU_MIN_VAL_ROWS", 30, lo=1, hi=1_000_000)
     use_hybrid = (
         use_hybrid
-        and int(train_mask.sum()) >= 300
-        and int(val_mask.sum()) >= 30
+        and int(train_mask.sum()) >= gru_min_train_rows
+        and int(val_mask.sum()) >= gru_min_val_rows
         and traj_seq.shape[0] == len(X)
     )
     static_cols = list(feature_cols)
@@ -1552,7 +1571,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             print("  [L3] hybrid disabled (L3_TRAJ_GRU=0); LightGBM on static features only.", flush=True)
         else:
             print(
-                f"  [L3] hybrid skipped (need train>=300 & val>=30); "
+                f"  [L3] hybrid skipped (need train>={gru_min_train_rows} & val>={gru_min_val_rows}); "
                 f"got train={int(train_mask.sum())} val={int(val_mask.sum())}.",
                 flush=True,
             )
@@ -1560,25 +1579,34 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         X_lgb = X
         feature_cols = static_cols
 
-    rounds = 250
-    es_rounds = 40
+    rounds = _l3_boost_rounds()
+    es_rounds = _l3_early_stopping_rounds()
+    exit_cfg = _l3_lgb_params("L3_EXIT", seed_default=71)
+    value_cfg = _l3_lgb_params("L3_VALUE", seed_default=72)
     exit_params = {
         "objective": "binary",
         "metric": "binary_logloss",
-        "learning_rate": 0.03,
-        "num_leaves": 48,
-        "max_depth": 6,
-        "feature_fraction": 0.85,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "min_child_samples": 80,
-        "lambda_l1": 0.1,
-        "lambda_l2": 1.0,
+        "learning_rate": exit_cfg["learning_rate"],
+        "num_leaves": exit_cfg["num_leaves"],
+        "max_depth": exit_cfg["max_depth"],
+        "feature_fraction": exit_cfg["feature_fraction"],
+        "bagging_fraction": exit_cfg["bagging_fraction"],
+        "bagging_freq": exit_cfg["bagging_freq"],
+        "min_child_samples": exit_cfg["min_child_samples"],
+        "lambda_l1": exit_cfg["lambda_l1"],
+        "lambda_l2": exit_cfg["lambda_l2"],
         "verbosity": -1,
-        "seed": 71,
+        "seed": exit_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
     }
-    value_params = _l3_value_lgb_params(exit_params, seed=72, prep=value_prep)
+    value_params = _l3_value_lgb_params(
+        {
+            **exit_params,
+            **value_cfg,
+        },
+        seed=value_cfg["seed"],
+        prep=value_prep,
+    )
     static_exit_model = None
     static_value_model = None
     l3_outer = tqdm(
@@ -1590,11 +1618,11 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         disable=not _lgb_round_tqdm_enabled(),
     )
     try:
+        ih_tr = feature_cols.index("l3_hold_bars")
+        hold_tr = X_lgb[train_mask, ih_tr].astype(np.float64)
+        w_exit = _l3_trade_normalized_exit_weights(rows_entry[train_mask], hold_tr, y_exit[train_mask])
         cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds, "[L3] exit")
         try:
-            ih_tr = feature_cols.index("l3_hold_bars")
-            hold_tr = X_lgb[train_mask, ih_tr].astype(np.float64)
-            w_exit = _l3_trade_normalized_exit_weights(rows_entry[train_mask], hold_tr, y_exit[train_mask])
             exit_model = lgb.train(
                 exit_params,
                 lgb.Dataset(
@@ -1637,7 +1665,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     exit_prob_tune = _apply_l3_exit_calibrator(exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64), exit_calibrator)
     value_pred_tune = value_model.predict(X_lgb[val_tune_mask]).astype(np.float64)
     value_policy_mode = _choose_l3_value_policy_mode(y_value[val_tune_mask], value_pred_tune)
-    value_tie_margin = float(max(0.0, float(os.environ.get("L3_VALUE_TIE_MARGIN", "0.03"))))
+    value_tie_margin = _derive_l3_value_tie_margin(y_value[val_tune_mask], value_pred_tune)
     exit_state_keys = _l3_exit_policy_row_state_keys(
         X[val_tune_mask],
         static_cols,
@@ -1648,6 +1676,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         exit_prob_tune,
         value_pred_tune,
         y_exit[val_tune_mask],
+        y_value_true=y_value[val_tune_mask],
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
     )
@@ -1749,6 +1778,14 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             "exit": float(exit_pos_w),
         },
         "l3_value_training": value_prep,
+        "l3_boost_rounds": int(rounds),
+        "l3_early_stopping_rounds": int(es_rounds),
+        "l3_exit_lgb_config": exit_cfg,
+        "l3_value_lgb_config": value_cfg,
+        "l3_gru_min_rows": {
+            "train": int(gru_min_train_rows),
+            "val": int(gru_min_val_rows),
+        },
     }
     if use_hybrid:
         import torch

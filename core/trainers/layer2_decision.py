@@ -804,6 +804,76 @@ def _env_float_clipped(key: str, default: float, *, lo: float, hi: float) -> flo
     return float(np.clip(val, lo, hi))
 
 
+def _env_int_clipped(key: str, default: int, *, lo: int, hi: int) -> int:
+    raw = os.environ.get(key, "").strip()
+    val = default if not raw else int(raw)
+    return int(np.clip(val, lo, hi))
+
+
+def _l2_boost_rounds() -> int:
+    default = 250 if FAST_TRAIN_MODE else 1200
+    return _env_int_clipped("L2_BOOST_ROUNDS", default, lo=50, hi=5000)
+
+
+def _l2_model_lgb_params(kind: str) -> dict[str, Any]:
+    k = str(kind).strip().lower()
+    prefix = {
+        "gate": "L2_GATE",
+        "direction": "L2_DIRECTION",
+        "reg": "L2_REG",
+    }[k]
+    defaults: dict[str, Any] = {
+        "gate": {
+            "learning_rate": 0.01,
+            "num_leaves": 15,
+            "max_depth": 5,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.7,
+            "bagging_freq": 1,
+            "min_child_samples": 80,
+            "lambda_l1": 0.1,
+            "lambda_l2": 1.0,
+            "seed": 42,
+        },
+        "direction": {
+            "learning_rate": 0.03,
+            "num_leaves": 31,
+            "max_depth": 6,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 5,
+            "min_child_samples": 30,
+            "lambda_l1": 0.1,
+            "lambda_l2": 1.0,
+            "seed": 44,
+        },
+        "reg": {
+            "learning_rate": 0.03,
+            "num_leaves": 63,
+            "max_depth": 7,
+            "feature_fraction": 0.85,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 5,
+            "min_child_samples": 60,
+            "lambda_l1": 0.05,
+            "lambda_l2": 1.0,
+            "seed": 43,
+        },
+    }[k]
+    return {
+        "learning_rate": _env_float_clipped(f"{prefix}_LEARNING_RATE", defaults["learning_rate"], lo=1e-4, hi=1.0),
+        "num_leaves": _env_int_clipped(f"{prefix}_NUM_LEAVES", defaults["num_leaves"], lo=2, hi=1024),
+        "max_depth": _env_int_clipped(f"{prefix}_MAX_DEPTH", defaults["max_depth"], lo=-1, hi=64),
+        "feature_fraction": _env_float_clipped(f"{prefix}_FEATURE_FRACTION", defaults["feature_fraction"], lo=0.1, hi=1.0),
+        "bagging_fraction": _env_float_clipped(f"{prefix}_BAGGING_FRACTION", defaults["bagging_fraction"], lo=0.1, hi=1.0),
+        "bagging_freq": _env_int_clipped(f"{prefix}_BAGGING_FREQ", defaults["bagging_freq"], lo=0, hi=64),
+        "min_child_samples": _env_int_clipped(f"{prefix}_MIN_CHILD_SAMPLES", defaults["min_child_samples"], lo=1, hi=10000),
+        "lambda_l1": _env_float_clipped(f"{prefix}_LAMBDA_L1", defaults["lambda_l1"], lo=0.0, hi=100.0),
+        "lambda_l2": _env_float_clipped(f"{prefix}_LAMBDA_L2", defaults["lambda_l2"], lo=0.0, hi=100.0),
+        "seed": _env_int_clipped(f"{prefix}_SEED", defaults["seed"], lo=0, hi=2_147_483_647),
+    }
+
+
 def _policy_vol_quantiles(values: np.ndarray, *, fit_mask: np.ndarray | None = None, n_buckets: int = 3) -> list[float]:
     arr = np.asarray(values, dtype=np.float64).ravel()
     mask = np.isfinite(arr)
@@ -879,14 +949,20 @@ def _conditional_tau_from_state(
 ) -> tuple[float, list[float], dict[str, float], np.ndarray]:
     base_tau = _l2_decision_edge_tau()
     target_trade = _l2_target_trade_rate()
-    tau_quantile = float(np.clip(1.0 - 2.0 * target_trade, 0.50, 0.88))
+    tau_quantile = float(
+        np.clip(
+            1.0 - _env_float_clipped("L2_TAU_TARGET_TRADE_MULT", 2.0, lo=0.5, hi=4.0) * target_trade,
+            _env_float_clipped("L2_TAU_QUANTILE_MIN", 0.50, lo=0.0, hi=0.99),
+            _env_float_clipped("L2_TAU_QUANTILE_MAX", 0.88, lo=0.0, hi=0.99),
+        )
+    )
     vol_quantiles = _policy_vol_quantiles(frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False), fit_mask=train_mask)
     state_keys = _l2_policy_state_keys(frame, vol_quantiles=vol_quantiles)
     edge_abs = np.abs(np.asarray(edge, dtype=np.float64).ravel())
     train = np.asarray(train_mask, dtype=bool)
     finite_train = train & np.isfinite(edge_abs)
     global_tau = float(np.quantile(edge_abs[finite_train], tau_quantile)) if finite_train.any() else base_tau
-    global_tau = float(max(base_tau * 0.5, global_tau))
+    global_tau = float(max(base_tau * _env_float_clipped("L2_TAU_BASE_FLOOR_MULT", 0.5, lo=0.0, hi=5.0), global_tau))
     state_map: dict[str, float] = {}
     min_rows = max(80, int(os.environ.get("L2_CONDITIONAL_TAU_MIN_ROWS", "120")))
     for key in np.unique(state_keys[train]):
@@ -894,7 +970,16 @@ def _conditional_tau_from_state(
         if int(np.sum(m)) < min_rows:
             continue
         state_tau = float(np.quantile(edge_abs[m], tau_quantile))
-        state_map[str(key)] = float(np.clip(state_tau, base_tau * 0.5, max(base_tau * 3.0, global_tau * 2.0)))
+        state_map[str(key)] = float(
+            np.clip(
+                state_tau,
+                base_tau * _env_float_clipped("L2_STATE_TAU_MIN_MULT", 0.5, lo=0.0, hi=5.0),
+                max(
+                    base_tau * _env_float_clipped("L2_STATE_TAU_MAX_BASE_MULT", 3.0, lo=0.1, hi=20.0),
+                    global_tau * _env_float_clipped("L2_STATE_TAU_MAX_GLOBAL_MULT", 2.0, lo=0.1, hi=20.0),
+                ),
+            )
+        )
     tau_row = np.full(len(frame), global_tau, dtype=np.float32)
     for key, val in state_map.items():
         tau_row[state_keys == key] = float(val)
@@ -949,6 +1034,8 @@ def _l2_search_policy_params(
     dir_raw: np.ndarray | None,
     y_decision: np.ndarray,
     true_edge: np.ndarray,
+    true_mfe: np.ndarray,
+    true_mae: np.ndarray,
     size_pred: np.ndarray,
     mfe_pred: np.ndarray,
     mae_pred: np.ndarray,
@@ -956,191 +1043,110 @@ def _l2_search_policy_params(
     gate = np.asarray(gate_p, dtype=np.float64).ravel()
     truth = np.asarray(y_decision, dtype=np.int64).ravel()
     edge = np.asarray(true_edge, dtype=np.float64).ravel()
+    true_mfe_arr = np.asarray(true_mfe, dtype=np.float64).ravel()
+    true_mae_arr = np.asarray(true_mae, dtype=np.float64).ravel()
     size = np.asarray(size_pred, dtype=np.float64).ravel()
     mfe = np.asarray(mfe_pred, dtype=np.float64).ravel()
     mae = np.asarray(mae_pred, dtype=np.float64).ravel()
-    valid = np.isfinite(gate) & np.isfinite(edge) & np.isfinite(size) & np.isfinite(mfe) & np.isfinite(mae)
+    valid = (
+        np.isfinite(gate)
+        & np.isfinite(edge)
+        & np.isfinite(true_mfe_arr)
+        & np.isfinite(true_mae_arr)
+        & np.isfinite(size)
+        & np.isfinite(mfe)
+        & np.isfinite(mae)
+    )
     if not valid.any():
         return {
             "trade_threshold": 0.35,
             "target_trade_rate": _l2_target_trade_rate(),
             "direction_temperature": 0.35,
+            "direction_center": 0.5,
             "expected_edge_reward_mult": 1.0,
             "expected_edge_risk_mult": 1.0,
         }
     gate = gate[valid]
     truth = truth[valid]
     edge = edge[valid]
+    true_mfe_arr = true_mfe_arr[valid]
+    true_mae_arr = true_mae_arr[valid]
     size = size[valid]
     mfe = mfe[valid]
     mae = mae[valid]
-    base_temp = float(os.environ.get("L2_DIRECTION_TEMPERATURE", "0.35"))
-    target = _l2_target_trade_rate()
-    target_rates = _env_float_candidates(
-        "L2_TARGET_TRADE_RATE_GRID",
-        [max(0.06, target - 0.02), target, min(0.18, target + 0.02)],
-        lo=0.04,
-        hi=0.20,
-    )
-    temps = [base_temp]
-    if dir_raw is not None:
-        temps = _env_float_candidates(
-            "L2_DIRECTION_TEMPERATURE_GRID",
-            [max(0.10, base_temp * 0.7), base_temp, min(1.25, base_temp * 1.5)],
-            lo=0.05,
-            hi=2.0,
-        )
-        dir_raw = np.asarray(dir_raw, dtype=np.float64).ravel()[valid]
-    reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [1.0], lo=0.10, hi=3.0)
-    risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [1.0], lo=0.10, hi=3.0)
-    if reward_mults == [1.0]:
-        reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [0.85, 1.0, 1.15], lo=0.10, hi=3.0)
-    if risk_mults == [1.0]:
-        risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [0.90, 1.0, 1.20], lo=0.10, hi=3.0)
-    trade_rate_tol = _env_float_clipped("L2_POLICY_TRADE_RATE_TOLERANCE", 0.015, lo=0.0, hi=0.08)
-    score_corr_active_w = _env_float_clipped("L2_POLICY_SCORE_CORR_ACTIVE_W", 0.95, lo=0.0, hi=5.0)
-    score_corr_all_w = _env_float_clipped("L2_POLICY_SCORE_CORR_ALL_W", 0.55, lo=0.0, hi=5.0)
-    score_f1_w = _env_float_clipped("L2_POLICY_SCORE_F1_W", 0.70, lo=0.0, hi=5.0)
-    score_sign_acc_w = _env_float_clipped("L2_POLICY_SCORE_SIGN_ACC_W", 0.20, lo=0.0, hi=5.0)
-    score_trade_pen_w = _env_float_clipped("L2_POLICY_SCORE_TRADE_PEN_W", 1.40, lo=0.0, hi=10.0)
-    score_trade_pen_hard_w = _env_float_clipped("L2_POLICY_SCORE_TRADE_PEN_HARD_W", 4.50, lo=0.0, hi=20.0)
-    score_balance_pen_w = _env_float_clipped("L2_POLICY_SCORE_BALANCE_PEN_W", 0.55, lo=0.0, hi=10.0)
-    score_short_bias_pen_w = _env_float_clipped("L2_POLICY_SCORE_SHORT_BIAS_PEN_W", 0.35, lo=0.0, hi=10.0)
-    score_long_recall_w = _env_float_clipped("L2_POLICY_SCORE_LONG_RECALL_W", 0.45, lo=0.0, hi=10.0)
-    score_short_recall_w = _env_float_clipped("L2_POLICY_SCORE_SHORT_RECALL_W", 0.10, lo=0.0, hi=10.0)
     true_active = truth != 1
+    target_rate = float(np.clip(np.mean(true_active) if true_active.any() else _l2_target_trade_rate(), 0.04, 0.20))
+    thr = float(np.quantile(gate, 1.0 - target_rate))
     true_long_share = float(np.mean(truth[true_active] == 0)) if true_active.any() else 0.5
-    direction_centers = [0.5]
+    direction_center = float(np.clip(true_long_share, 0.20, 0.80))
+    direction_temperature = 0.35
+    dir_p = np.full(len(gate), 0.5, dtype=np.float64)
     if dir_raw is not None:
-        direction_centers = _env_float_candidates(
-            "L2_DIRECTION_CENTER_GRID",
-            [max(0.30, true_long_share - 0.10), true_long_share, min(0.70, true_long_share + 0.10)],
-            lo=0.20,
-            hi=0.80,
+        dir_raw = np.asarray(dir_raw, dtype=np.float64).ravel()[valid]
+        active_raw = np.abs(dir_raw[true_active]) if true_active.any() else np.abs(dir_raw)
+        raw_scale = float(np.median(active_raw)) if active_raw.size else 0.35
+        direction_temperature = float(np.clip(max(raw_scale, 1e-3), 0.05, 2.0))
+        dir_p = _l2_recenter_direction_prob(
+            _l2_direction_margin_to_prob(dir_raw, temperature=direction_temperature),
+            center=direction_center,
         )
-    best: dict[str, float] | None = None
-    best_score = -1e18
-    print("\n  [L2] policy search on val_tune", flush=True)
-    print(
-        f"    target_rates={np.round(target_rates, 4).tolist()}  temps={np.round(temps, 4).tolist()}  "
-        f"direction_centers={np.round(direction_centers, 4).tolist()}  "
-        f"reward_mults={np.round(reward_mults, 4).tolist()}  risk_mults={np.round(risk_mults, 4).tolist()}  "
-        f"trade_rate_tol={trade_rate_tol:.4f}",
-        flush=True,
+    active_truth = true_active & np.isfinite(true_mfe_arr) & np.isfinite(true_mae_arr)
+    reward_mult = 1.0
+    risk_mult = 1.0
+    if active_truth.any():
+        pred_mfe_med = float(np.median(np.clip(mfe[active_truth], 1e-4, None)))
+        pred_mae_med = float(np.median(np.clip(mae[active_truth], 1e-4, None)))
+        true_mfe_med = float(np.median(np.clip(true_mfe_arr[active_truth], 1e-4, None)))
+        true_mae_med = float(np.median(np.clip(true_mae_arr[active_truth], 1e-4, None)))
+        reward_mult = float(np.clip(true_mfe_med / pred_mfe_med, 0.25, 4.0))
+        risk_mult = float(np.clip(true_mae_med / pred_mae_med, 0.25, 4.0))
+    decision_probs = _l2_compose_probs_from_gate_dir(gate, dir_p)
+    pred, _ = _l2_hard_decode_outputs(
+        gate_p=gate.astype(np.float32),
+        dir_p=dir_p.astype(np.float32),
+        decision_probs=decision_probs,
+        trade_threshold=thr,
     )
-    for temp in temps:
-        dir_p_base = np.full(len(gate), 0.5, dtype=np.float64)
-        if dir_raw is not None:
-            dir_p_base = _l2_direction_margin_to_prob(dir_raw, temperature=temp)
-        for direction_center in direction_centers:
-            dir_p = _l2_recenter_direction_prob(dir_p_base, center=direction_center)
-            for target_rate in target_rates:
-                thr = float(np.quantile(gate, 1.0 - target_rate))
-                decision_probs = _l2_compose_probs_from_gate_dir(gate, dir_p)
-                pred, _ = _l2_hard_decode_outputs(
-                    gate_p=gate.astype(np.float32),
-                    dir_p=dir_p.astype(np.float32),
-                    decision_probs=decision_probs,
-                    trade_threshold=thr,
-                )
-                trade_rate = float(np.mean(pred != 1))
-                f1m = float(f1_score(truth, pred, average="macro", zero_division=0))
-                active_pred = pred != 1
-                long_share = float(np.mean(pred[active_pred] == 0)) if active_pred.any() else true_long_share
-                long_recall = float(np.mean(pred[truth == 0] == 0)) if np.any(truth == 0) else 0.0
-                short_recall = float(np.mean(pred[truth == 2] == 2)) if np.any(truth == 2) else 0.0
-                for reward_mult in reward_mults:
-                    for risk_mult in risk_mults:
-                        exp_edge = _l2_expected_edge_proxy(
-                            gate,
-                            dir_p,
-                            size,
-                            mfe,
-                            mae,
-                            reward_mult=reward_mult,
-                            risk_mult=risk_mult,
-                            active_floor=thr,
-                        )
-                        corr_all = pearson_corr(exp_edge, edge)
-                        corr_active = pearson_corr(exp_edge[active_pred], edge[active_pred]) if active_pred.any() else float("nan")
-                        sign_acc = (
-                            float(np.mean(np.sign(exp_edge[active_pred]) == np.sign(edge[active_pred])))
-                            if active_pred.any()
-                            else 0.0
-                        )
-                        trade_gap = abs(trade_rate - target_rate)
-                        trade_pen = trade_gap
-                        trade_pen_hard = max(0.0, trade_gap - trade_rate_tol)
-                        balance_pen = abs(long_share - true_long_share)
-                        short_bias_pen = max(0.0, true_long_share - long_share)
-                        score = (
-                            score_corr_active_w * float(np.nan_to_num(corr_active, nan=-1.0))
-                            + score_corr_all_w * float(np.nan_to_num(corr_all, nan=-1.0))
-                            + score_f1_w * f1m
-                            + score_sign_acc_w * sign_acc
-                            + score_long_recall_w * long_recall
-                            + score_short_recall_w * short_recall
-                            - score_trade_pen_w * trade_pen
-                            - score_trade_pen_hard_w * trade_pen_hard
-                            - score_balance_pen_w * balance_pen
-                            - score_short_bias_pen_w * short_bias_pen
-                        )
-                        if score > best_score:
-                            best_score = score
-                            best = {
-                                "trade_threshold": thr,
-                                "target_trade_rate": float(target_rate),
-                                "direction_temperature": float(temp),
-                                "direction_center": float(direction_center),
-                                "expected_edge_reward_mult": float(reward_mult),
-                                "expected_edge_risk_mult": float(risk_mult),
-                                "score": float(score),
-                                "trade_rate": float(trade_rate),
-                                "long_share_active": float(long_share),
-                                "long_recall": float(long_recall),
-                                "short_recall": float(short_recall),
-                                "corr_all": float(np.nan_to_num(corr_all, nan=0.0)),
-                                "corr_active": float(np.nan_to_num(corr_active, nan=0.0)),
-                                "f1_macro": float(f1m),
-                                "sign_acc_active": float(sign_acc),
-                                "trade_rate_tol": float(trade_rate_tol),
-                                "trade_gap": float(trade_gap),
-                                "trade_pen_hard": float(trade_pen_hard),
-                                "balance_pen": float(balance_pen),
-                                "short_bias_pen": float(short_bias_pen),
-                                "score_corr_active_w": float(score_corr_active_w),
-                                "score_corr_all_w": float(score_corr_all_w),
-                                "score_f1_w": float(score_f1_w),
-                                "score_sign_acc_w": float(score_sign_acc_w),
-                                "score_trade_pen_w": float(score_trade_pen_w),
-                                "score_trade_pen_hard_w": float(score_trade_pen_hard_w),
-                                "score_balance_pen_w": float(score_balance_pen_w),
-                                "score_short_bias_pen_w": float(score_short_bias_pen_w),
-                                "score_long_recall_w": float(score_long_recall_w),
-                                "score_short_recall_w": float(score_short_recall_w),
-                            }
-    if best is None:
-        best = {
-            "trade_threshold": 0.35,
-            "target_trade_rate": target,
-            "direction_temperature": base_temp,
-            "direction_center": 0.5,
-            "expected_edge_reward_mult": 1.0,
-            "expected_edge_risk_mult": 1.0,
-            "score": float("nan"),
-            "trade_rate": float("nan"),
-            "long_share_active": float("nan"),
-            "corr_all": float("nan"),
-            "corr_active": float("nan"),
-            "f1_macro": float("nan"),
-            "sign_acc_active": float("nan"),
-            "trade_rate_tol": float(trade_rate_tol),
-        }
+    trade_rate = float(np.mean(pred != 1))
+    f1m = float(f1_score(truth, pred, average="macro", zero_division=0))
+    active_pred = pred != 1
+    long_share = float(np.mean(pred[active_pred] == 0)) if active_pred.any() else true_long_share
+    long_recall = float(np.mean(pred[truth == 0] == 0)) if np.any(truth == 0) else 0.0
+    short_recall = float(np.mean(pred[truth == 2] == 2)) if np.any(truth == 2) else 0.0
+    exp_edge = _l2_expected_edge_proxy(
+        gate,
+        dir_p,
+        size,
+        mfe,
+        mae,
+        reward_mult=reward_mult,
+        risk_mult=risk_mult,
+        active_floor=thr,
+    )
+    corr_all = pearson_corr(exp_edge, edge)
+    corr_active = pearson_corr(exp_edge[active_pred], edge[active_pred]) if active_pred.any() else float("nan")
+    sign_acc = float(np.mean(np.sign(exp_edge[active_pred]) == np.sign(edge[active_pred]))) if active_pred.any() else 0.0
+    best = {
+        "trade_threshold": float(thr),
+        "target_trade_rate": float(target_rate),
+        "direction_temperature": float(direction_temperature),
+        "direction_center": float(direction_center),
+        "expected_edge_reward_mult": float(reward_mult),
+        "expected_edge_risk_mult": float(risk_mult),
+        "trade_rate": float(trade_rate),
+        "long_share_active": float(long_share),
+        "long_recall": float(long_recall),
+        "short_recall": float(short_recall),
+        "corr_all": float(np.nan_to_num(corr_all, nan=0.0)),
+        "corr_active": float(np.nan_to_num(corr_active, nan=0.0)),
+        "f1_macro": float(f1m),
+        "sign_acc_active": float(sign_acc),
+    }
+    print("\n  [L2] policy derivation on val_tune", flush=True)
     print(
         f"  [L2] selected policy: thr={best['trade_threshold']:.4f}  target_trade_rate={best['target_trade_rate']:.3f}  "
         f"temp={best['direction_temperature']:.3f}  center={best['direction_center']:.3f}  reward_mult={best['expected_edge_reward_mult']:.3f}  "
         f"risk_mult={best['expected_edge_risk_mult']:.3f}  realized_trade_rate={best['trade_rate']:.3f}  "
-        f"trade_gap={best.get('trade_gap', float('nan')):.3f}  "
         f"corr_active={best['corr_active']:.4f}  F1_macro={best['f1_macro']:.4f}  "
         f"long_recall={best.get('long_recall', float('nan')):.4f}",
         flush=True,
@@ -1154,11 +1160,23 @@ def _l2_search_conditional_policy(
     dir_raw: np.ndarray | None,
     y_decision: np.ndarray,
     true_edge: np.ndarray,
+    true_mfe: np.ndarray,
+    true_mae: np.ndarray,
     size_pred: np.ndarray,
     mfe_pred: np.ndarray,
     mae_pred: np.ndarray,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
-    global_policy = _l2_search_policy_params(gate_p, dir_raw, y_decision, true_edge, size_pred, mfe_pred, mae_pred)
+    global_policy = _l2_search_policy_params(
+        gate_p,
+        dir_raw,
+        y_decision,
+        true_edge,
+        true_mfe,
+        true_mae,
+        size_pred,
+        mfe_pred,
+        mae_pred,
+    )
     keys = np.asarray(state_keys, dtype=object).ravel()
     valid = np.isfinite(np.asarray(gate_p, dtype=np.float64).ravel())
     keys = keys[valid]
@@ -1176,6 +1194,8 @@ def _l2_search_conditional_policy(
             None if dir_raw is None else np.asarray(dir_raw, dtype=np.float64).ravel()[valid][m],
             np.asarray(y_decision, dtype=np.int64).ravel()[valid][m],
             np.asarray(true_edge, dtype=np.float64).ravel()[valid][m],
+            np.asarray(true_mfe, dtype=np.float64).ravel()[valid][m],
+            np.asarray(true_mae, dtype=np.float64).ravel()[valid][m],
             np.asarray(size_pred, dtype=np.float64).ravel()[valid][m],
             np.asarray(mfe_pred, dtype=np.float64).ravel()[valid][m],
             np.asarray(mae_pred, dtype=np.float64).ravel()[valid][m],
@@ -1365,8 +1385,15 @@ def train_l2_trade_decision(
     y_decision = np.full(len(df), 1, dtype=np.int64)
     y_decision[edge > tau_row] = 0
     y_decision[edge < -tau_row] = 2
-    rr = np.clip(mfe / np.maximum(mae, 0.10), 0.0, 4.0)
-    size_raw = np.clip(np.abs(edge), 0.0, 1.5) * (rr / (1.0 + rr)) * np.exp(-0.35 * np.clip(mae, 0.0, 4.0))
+    size_mae_floor = _env_float_clipped("L2_SIZE_MAE_FLOOR", 0.10, lo=1e-4, hi=10.0)
+    size_rr_cap = _env_float_clipped("L2_SIZE_RR_CAP", 4.0, lo=0.1, hi=20.0)
+    size_edge_cap = _env_float_clipped("L2_SIZE_EDGE_CAP", 1.5, lo=0.1, hi=20.0)
+    size_mae_decay = _env_float_clipped("L2_SIZE_MAE_DECAY", 0.35, lo=0.0, hi=5.0)
+    size_mae_clip = _env_float_clipped("L2_SIZE_MAE_CLIP", 4.0, lo=0.1, hi=20.0)
+    rr = np.clip(mfe / np.maximum(mae, size_mae_floor), 0.0, size_rr_cap)
+    size_raw = np.clip(np.abs(edge), 0.0, size_edge_cap) * (rr / (1.0 + rr)) * np.exp(
+        -size_mae_decay * np.clip(mae, 0.0, size_mae_clip)
+    )
     active_train = train_mask & (y_decision != 1)
     active_val = val_mask & (y_decision != 1)
     y_size = _quantile_rescale_01(size_raw, fit_mask=active_train)
@@ -1427,7 +1454,7 @@ def train_l2_trade_decision(
         flush=True,
     )
 
-    rounds = 250 if FAST_TRAIN_MODE else 1200
+    rounds = _l2_boost_rounds()
     # Gate: default 120 — not tied to FAST_TRAIN_MODE (set L2_GATE_EARLY_STOPPING_ROUNDS to override).
     gate_es_rounds = _l2_early_stopping_rounds_from_env("L2_GATE_EARLY_STOPPING_ROUNDS", 120)
     aux_es_fallback = 40 if FAST_TRAIN_MODE else 120
@@ -1442,34 +1469,31 @@ def train_l2_trade_decision(
     if mdir.any():
         log_label_baseline("l2_direction_margin", y_dir_margin[train_mask][mdir], task="reg")
     pr_trade = float(np.mean(y_gate[train_mask]))
-    gate_lr = float(os.environ.get("L2_GATE_LEARNING_RATE", "0.01"))
-    gate_leaves = int(os.environ.get("L2_GATE_NUM_LEAVES", "15"))
-    gate_depth = int(os.environ.get("L2_GATE_MAX_DEPTH", "5"))
-    gate_mcs = int(os.environ.get("L2_GATE_MIN_CHILD_SAMPLES", "80"))
-    gate_bag = float(os.environ.get("L2_GATE_BAGGING_FRACTION", "0.7"))
-    gate_bag_freq = int(os.environ.get("L2_GATE_BAGGING_FREQ", "1"))
+    gate_cfg = _l2_model_lgb_params("gate")
+    direction_cfg = _l2_model_lgb_params("direction")
+    reg_cfg = _l2_model_lgb_params("reg")
     gate_params = {
         "objective": "binary",
         # AUC first so early_stopping (first_metric_only) tracks ranking, not logloss under imbalance.
         "metric": ["auc", "binary_logloss"],
-        "learning_rate": gate_lr,
-        "num_leaves": gate_leaves,
-        "max_depth": gate_depth,
-        "feature_fraction": float(os.environ.get("L2_GATE_FEATURE_FRACTION", "0.8")),
-        "bagging_fraction": gate_bag,
-        "bagging_freq": gate_bag_freq,
-        "min_child_samples": gate_mcs,
-        "lambda_l1": 0.1,
-        "lambda_l2": 1.0,
+        "learning_rate": gate_cfg["learning_rate"],
+        "num_leaves": gate_cfg["num_leaves"],
+        "max_depth": gate_cfg["max_depth"],
+        "feature_fraction": gate_cfg["feature_fraction"],
+        "bagging_fraction": gate_cfg["bagging_fraction"],
+        "bagging_freq": gate_cfg["bagging_freq"],
+        "min_child_samples": gate_cfg["min_child_samples"],
+        "lambda_l1": gate_cfg["lambda_l1"],
+        "lambda_l2": gate_cfg["lambda_l2"],
         "verbosity": -1,
-        "seed": 42,
+        "seed": gate_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
         "is_unbalance": True,
     }
     print(
-        f"  [L2] gate: pos_rate={pr_trade:.3f}  is_unbalance=True  lr={gate_lr}  "
-        f"num_leaves={gate_leaves}  max_depth={gate_depth}  min_child_samples={gate_mcs}  "
-        f"bagging={gate_bag}/{gate_bag_freq}  early_stopping_rounds={gate_es_rounds}  "
+        f"  [L2] gate: pos_rate={pr_trade:.3f}  is_unbalance=True  lr={gate_cfg['learning_rate']}  "
+        f"num_leaves={gate_cfg['num_leaves']}  max_depth={gate_cfg['max_depth']}  min_child_samples={gate_cfg['min_child_samples']}  "
+        f"bagging={gate_cfg['bagging_fraction']}/{gate_cfg['bagging_freq']}  early_stopping_rounds={gate_es_rounds}  "
         f"early_stop_metric=auc (first)",
         flush=True,
     )
@@ -1482,33 +1506,33 @@ def train_l2_trade_decision(
     direction_params = {
         "objective": "regression",
         "metric": "l2",
-        "learning_rate": 0.03,
-        "num_leaves": 31,
-        "max_depth": 6,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "min_child_samples": 30,
-        "lambda_l1": 0.1,
-        "lambda_l2": 1.0,
+        "learning_rate": direction_cfg["learning_rate"],
+        "num_leaves": direction_cfg["num_leaves"],
+        "max_depth": direction_cfg["max_depth"],
+        "feature_fraction": direction_cfg["feature_fraction"],
+        "bagging_fraction": direction_cfg["bagging_fraction"],
+        "bagging_freq": direction_cfg["bagging_freq"],
+        "min_child_samples": direction_cfg["min_child_samples"],
+        "lambda_l1": direction_cfg["lambda_l1"],
+        "lambda_l2": direction_cfg["lambda_l2"],
         "verbosity": -1,
-        "seed": 44,
+        "seed": direction_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
     }
     reg_params = {
         "objective": "regression",
         "metric": "l2",
-        "learning_rate": 0.03,
-        "num_leaves": 63,
-        "max_depth": 7,
-        "feature_fraction": 0.85,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "min_child_samples": 60,
-        "lambda_l1": 0.05,
-        "lambda_l2": 1.0,
+        "learning_rate": reg_cfg["learning_rate"],
+        "num_leaves": reg_cfg["num_leaves"],
+        "max_depth": reg_cfg["max_depth"],
+        "feature_fraction": reg_cfg["feature_fraction"],
+        "bagging_fraction": reg_cfg["bagging_fraction"],
+        "bagging_freq": reg_cfg["bagging_freq"],
+        "min_child_samples": reg_cfg["min_child_samples"],
+        "lambda_l1": reg_cfg["lambda_l1"],
+        "lambda_l2": reg_cfg["lambda_l2"],
         "verbosity": -1,
-        "seed": 43,
+        "seed": reg_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
     }
     mfe_params = _l2_positive_head_lgb_params(reg_params, mfe_head_prep)
@@ -1535,9 +1559,7 @@ def train_l2_trade_decision(
     )
     direction_model: lgb.Booster | None = None
     try:
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(
-            gate_es_rounds, rounds, "[L2] gate", first_metric_only=True
-        )
+        cbs, cl = _lgb_train_callbacks_with_round_tqdm(gate_es_rounds, rounds, "[L2] gate", first_metric_only=True)
         try:
             gate_model = lgb.train(gate_params, dtrain_gate, num_boost_round=rounds, valid_sets=[dval_gate], callbacks=cbs)
         finally:
@@ -1641,6 +1663,8 @@ def train_l2_trade_decision(
         None if dir_raw_all is None else dir_raw_all[val_tune_mask],
         y_decision[val_tune_mask],
         edge[val_tune_mask],
+        mfe[val_tune_mask],
+        mae[val_tune_mask],
         size_pred[val_tune_mask],
         mfe_pred[val_tune_mask],
         mae_pred[val_tune_mask],
@@ -1841,16 +1865,25 @@ def train_l2_trade_decision(
             "mae": int(mae_es_rounds),
         },
         "l2_gate_config": {
-            "learning_rate": float(gate_lr),
-            "num_leaves": int(gate_leaves),
-            "max_depth": int(gate_depth),
-            "min_child_samples": int(gate_mcs),
-            "bagging_fraction": float(gate_bag),
-            "bagging_freq": int(gate_bag_freq),
+            "learning_rate": float(gate_params["learning_rate"]),
+            "num_leaves": int(gate_params["num_leaves"]),
+            "max_depth": int(gate_params["max_depth"]),
+            "min_child_samples": int(gate_params["min_child_samples"]),
+            "bagging_fraction": float(gate_params["bagging_fraction"]),
+            "bagging_freq": int(gate_params["bagging_freq"]),
             "is_unbalance": True,
             "metric_eval_order": ["auc", "binary_logloss"],
             "early_stopping_on": "first_metric (auc)",
             "early_stopping_rounds": int(gate_es_rounds),
+        },
+        "l2_direction_config": direction_params,
+        "l2_regression_config": reg_params,
+        "l2_size_target_config": {
+            "mae_floor": float(size_mae_floor),
+            "rr_cap": float(size_rr_cap),
+            "edge_cap": float(size_edge_cap),
+            "mae_decay": float(size_mae_decay),
+            "mae_clip": float(size_mae_clip),
         },
     }
     if direction_model is None:
