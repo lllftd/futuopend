@@ -550,17 +550,18 @@ def _log_l2_l1b_ablation(
     direction_temperature: float,
     gate_calibrator: IsotonicRegression | None,
 ) -> None:
-    semantic_head_cols = (
-        "l1b_pullback_setup",
-        "l1b_failure_risk",
-        "l1b_shock_risk",
-    )
     l1b_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_")]
     if not l1b_idx:
         print("\n  [L2] l1b ablation: skip (no l1b_* columns after selection)", flush=True)
         return
-    semantic_idx = [i for i, c in enumerate(feature_cols) if c in semantic_head_cols]
-    latent_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_latent_") or c == "l1b_novelty_score"]
+    cluster_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_cluster_prob_")]
+    latent_idx = [
+        i
+        for i, c in enumerate(feature_cols)
+        if c.startswith("l1b_latent_") or c in {"l1b_novelty_score", "l1b_regime_change_score"}
+    ]
+    unsup_idx = sorted(set(cluster_idx + latent_idx))
+    deterministic_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_") and i not in unsup_idx]
     vm = np.asarray(val_mask, dtype=bool)
     if not vm.any():
         return
@@ -604,24 +605,26 @@ def _log_l2_l1b_ablation(
         return _eval_probs(gate_p, dir_p, probs)
 
     base_ll, base_f1, base_trade, base_long, base_short = _eval_variant(X)
-    semantic_ll = semantic_f1 = semantic_trade = semantic_long = semantic_short = float("nan")
-    if semantic_idx:
-        X_no_semantic = np.array(X, copy=True)
-        X_no_semantic[:, semantic_idx] = 0.0
-        semantic_ll, semantic_f1, semantic_trade, semantic_long, semantic_short = _eval_variant(X_no_semantic)
+    cluster_ll = cluster_f1 = cluster_trade = cluster_long = cluster_short = float("nan")
+    if cluster_idx:
+        X_no_cluster = np.array(X, copy=True)
+        X_no_cluster[:, cluster_idx] = 0.0
+        cluster_ll, cluster_f1, cluster_trade, cluster_long, cluster_short = _eval_variant(X_no_cluster)
     latent_ll = latent_f1 = latent_trade = latent_long = latent_short = float("nan")
     if latent_idx:
         X_no_latent = np.array(X, copy=True)
         X_no_latent[:, latent_idx] = 0.0
         latent_ll, latent_f1, latent_trade, latent_long, latent_short = _eval_variant(X_no_latent)
-    direct_only_ll = direct_only_f1 = direct_only_trade = direct_only_long = direct_only_short = float("nan")
-    if semantic_idx or latent_idx:
-        X_direct_only = np.array(X, copy=True)
-        if semantic_idx:
-            X_direct_only[:, semantic_idx] = 0.0
-        if latent_idx:
-            X_direct_only[:, latent_idx] = 0.0
-        direct_only_ll, direct_only_f1, direct_only_trade, direct_only_long, direct_only_short = _eval_variant(X_direct_only)
+    deterministic_only_ll = deterministic_only_f1 = deterministic_only_trade = deterministic_only_long = deterministic_only_short = float("nan")
+    if unsup_idx:
+        X_deterministic_only = np.array(X, copy=True)
+        X_deterministic_only[:, unsup_idx] = 0.0
+        deterministic_only_ll, deterministic_only_f1, deterministic_only_trade, deterministic_only_long, deterministic_only_short = _eval_variant(X_deterministic_only)
+    unsupervised_only_ll = unsupervised_only_f1 = unsupervised_only_trade = unsupervised_only_long = unsupervised_only_short = float("nan")
+    if deterministic_idx:
+        X_unsupervised_only = np.array(X, copy=True)
+        X_unsupervised_only[:, deterministic_idx] = 0.0
+        unsupervised_only_ll, unsupervised_only_f1, unsupervised_only_trade, unsupervised_only_long, unsupervised_only_short = _eval_variant(X_unsupervised_only)
     X_no_l1b = np.array(X, copy=True)
     X_no_l1b[:, l1b_idx] = 0.0
     abl_ll, abl_f1, abl_trade, abl_long, abl_short = _eval_variant(X_no_l1b)
@@ -631,16 +634,16 @@ def _log_l2_l1b_ablation(
         f"long_rate={base_long:.3f}  short_rate={base_short:.3f}",
         flush=True,
     )
-    if semantic_idx:
+    if cluster_idx:
         print(
-            f"    no_semantic:   log_loss={semantic_ll:.4f}  F1_macro={semantic_f1:.4f}  trade_rate={semantic_trade:.3f}  "
-            f"long_rate={semantic_long:.3f}  short_rate={semantic_short:.3f}",
+            f"    no_cluster:    log_loss={cluster_ll:.4f}  F1_macro={cluster_f1:.4f}  trade_rate={cluster_trade:.3f}  "
+            f"long_rate={cluster_long:.3f}  short_rate={cluster_short:.3f}",
             flush=True,
         )
         print(
-            f"    delta(no_sem-base):   log_loss={semantic_ll - base_ll:+.4f}  F1_macro={semantic_f1 - base_f1:+.4f}  "
-            f"trade_rate={semantic_trade - base_trade:+.3f}  long_rate={semantic_long - base_long:+.3f}  "
-            f"short_rate={semantic_short - base_short:+.3f}",
+            f"    delta(no_cluster-base): log_loss={cluster_ll - base_ll:+.4f}  F1_macro={cluster_f1 - base_f1:+.4f}  "
+            f"trade_rate={cluster_trade - base_trade:+.3f}  long_rate={cluster_long - base_long:+.3f}  "
+            f"short_rate={cluster_short - base_short:+.3f}",
             flush=True,
         )
     if latent_idx:
@@ -655,16 +658,28 @@ def _log_l2_l1b_ablation(
             f"short_rate={latent_short - base_short:+.3f}",
             flush=True,
         )
-    if semantic_idx or latent_idx:
+    if unsup_idx:
         print(
-            f"    direct_only:   log_loss={direct_only_ll:.4f}  F1_macro={direct_only_f1:.4f}  trade_rate={direct_only_trade:.3f}  "
-            f"long_rate={direct_only_long:.3f}  short_rate={direct_only_short:.3f}",
+            f"    deterministic_only: log_loss={deterministic_only_ll:.4f}  F1_macro={deterministic_only_f1:.4f}  trade_rate={deterministic_only_trade:.3f}  "
+            f"long_rate={deterministic_only_long:.3f}  short_rate={deterministic_only_short:.3f}",
             flush=True,
         )
         print(
-            f"    delta(dir-base):      log_loss={direct_only_ll - base_ll:+.4f}  F1_macro={direct_only_f1 - base_f1:+.4f}  "
-            f"trade_rate={direct_only_trade - base_trade:+.3f}  long_rate={direct_only_long - base_long:+.3f}  "
-            f"short_rate={direct_only_short - base_short:+.3f}",
+            f"    delta(det-base):      log_loss={deterministic_only_ll - base_ll:+.4f}  F1_macro={deterministic_only_f1 - base_f1:+.4f}  "
+            f"trade_rate={deterministic_only_trade - base_trade:+.3f}  long_rate={deterministic_only_long - base_long:+.3f}  "
+            f"short_rate={deterministic_only_short - base_short:+.3f}",
+            flush=True,
+        )
+    if deterministic_idx:
+        print(
+            f"    unsupervised_only: log_loss={unsupervised_only_ll:.4f}  F1_macro={unsupervised_only_f1:.4f}  trade_rate={unsupervised_only_trade:.3f}  "
+            f"long_rate={unsupervised_only_long:.3f}  short_rate={unsupervised_only_short:.3f}",
+            flush=True,
+        )
+        print(
+            f"    delta(unsup-base):    log_loss={unsupervised_only_ll - base_ll:+.4f}  F1_macro={unsupervised_only_f1 - base_f1:+.4f}  "
+            f"trade_rate={unsupervised_only_trade - base_trade:+.3f}  long_rate={unsupervised_only_long - base_long:+.3f}  "
+            f"short_rate={unsupervised_only_short - base_short:+.3f}",
             flush=True,
         )
     print(

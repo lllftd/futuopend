@@ -52,17 +52,23 @@ from core.trainers.stack_v2_common import (
 )
 
 
-L1B_MODEL_HEADS = [
-    "l1b_pullback_setup",
-    "l1b_failure_risk",
-    "l1b_shock_risk",
+L1B_CLUSTER_COLS = [
+    "l1b_cluster_prob_0",
+    "l1b_cluster_prob_1",
+    "l1b_cluster_prob_2",
+    "l1b_cluster_prob_3",
+    "l1b_cluster_prob_4",
 ]
 L1B_LATENT_HEADS = [
     "l1b_latent_0",
     "l1b_latent_1",
     "l1b_latent_2",
+    "l1b_latent_3",
     "l1b_novelty_score",
+    "l1b_regime_change_score",
 ]
+L1B_LATENT_EMBED_COLS = [col for col in L1B_LATENT_HEADS if col.startswith("l1b_latent_")]
+L1B_MODEL_HEADS: list[str] = []
 L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_breakout_quality",
     "l1b_mean_reversion_setup",
@@ -73,13 +79,14 @@ L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_follow_through_score",
     "l1b_liquidity_score",
 ]
-L1B_BINARY_HEADS: tuple[str, ...] = tuple(L1B_MODEL_HEADS)
+L1B_UNSUPERVISED_COLS = list(L1B_CLUSTER_COLS) + list(L1B_LATENT_HEADS)
+L1B_BINARY_HEADS: tuple[str, ...] = ()
 L1B_DIRECT_CONTEXT_COLS = [
     "l1b_sector_relative_strength",
     "l1b_correlation_regime",
     "l1b_market_breadth",
 ]
-L1B_OUTPUT_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_MODEL_HEADS) + list(L1B_LATENT_HEADS) + list(L1B_DIRECT_CONTEXT_COLS)
+L1B_OUTPUT_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_UNSUPERVISED_COLS) + list(L1B_DIRECT_CONTEXT_COLS)
 
 
 @dataclass
@@ -413,7 +420,7 @@ def _fit_l1b_latent_block(
     order = np.argsort(eigvals)[::-1]
     eigvals = np.clip(eigvals[order], 0.0, None)
     eigvecs = eigvecs[:, order]
-    n_comp = min(3, eigvecs.shape[1])
+    n_comp = min(len(L1B_LATENT_EMBED_COLS), eigvecs.shape[1])
     comps = eigvecs[:, :n_comp].astype(np.float32)
     emb = Xz @ comps
     recon = emb @ comps.T
@@ -424,9 +431,9 @@ def _fit_l1b_latent_block(
     explained = (eigvals[:n_comp] / max(total_var, 1e-8)).astype(np.float32)
     out = pd.DataFrame(index=df.index)
     for i in range(n_comp):
-        out[f"l1b_latent_{i}"] = emb[:, i].astype(np.float32, copy=False)
-    for i in range(n_comp, len(L1B_LATENT_HEADS) - 1):
-        out[f"l1b_latent_{i}"] = np.zeros(len(df), dtype=np.float32)
+        out[L1B_LATENT_EMBED_COLS[i]] = emb[:, i].astype(np.float32, copy=False)
+    for i in range(n_comp, len(L1B_LATENT_EMBED_COLS)):
+        out[L1B_LATENT_EMBED_COLS[i]] = np.zeros(len(df), dtype=np.float32)
     out["l1b_novelty_score"] = novelty.astype(np.float32, copy=False)
     meta = {
         "feature_cols": latent_cols,
@@ -459,10 +466,190 @@ def _apply_l1b_latent_block(df: pd.DataFrame, latent_meta: dict[str, Any]) -> pd
     novelty = np.clip((resid - novelty_lo) / max(novelty_hi - novelty_lo, 1e-6), 0.0, 1.0).astype(np.float32)
     out = pd.DataFrame(index=work.index)
     for i in range(comps.shape[1]):
-        out[f"l1b_latent_{i}"] = emb[:, i].astype(np.float32, copy=False)
-    for i in range(comps.shape[1], len(L1B_LATENT_HEADS) - 1):
-        out[f"l1b_latent_{i}"] = np.zeros(len(work), dtype=np.float32)
+        out[L1B_LATENT_EMBED_COLS[i]] = emb[:, i].astype(np.float32, copy=False)
+    for i in range(comps.shape[1], len(L1B_LATENT_EMBED_COLS)):
+        out[L1B_LATENT_EMBED_COLS[i]] = np.zeros(len(work), dtype=np.float32)
     out["l1b_novelty_score"] = novelty.astype(np.float32, copy=False)
+    return out
+
+
+def _softmax_rows(x: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32)
+    shifted = arr - np.max(arr, axis=1, keepdims=True)
+    expv = np.exp(shifted)
+    denom = np.sum(expv, axis=1, keepdims=True)
+    return (expv / np.maximum(denom, 1e-8)).astype(np.float32)
+
+
+def _fit_l1b_kmeans(latent_train: np.ndarray, *, n_clusters: int, n_iter: int = 25) -> np.ndarray:
+    X = np.asarray(latent_train, dtype=np.float32)
+    if X.ndim != 2 or X.shape[0] == 0:
+        return np.zeros((n_clusters, max(X.shape[1] if X.ndim == 2 else 1, 1)), dtype=np.float32)
+    n_clusters = int(np.clip(n_clusters, 1, X.shape[0]))
+    order = np.argsort(X[:, 0], kind="mergesort")
+    seeds = np.linspace(0, len(order) - 1, num=n_clusters, dtype=int)
+    centroids = X[order[seeds]].astype(np.float32, copy=True)
+    for _ in range(int(max(n_iter, 1))):
+        diff = X[:, None, :] - centroids[None, :, :]
+        dist2 = np.sum(diff * diff, axis=2)
+        assign = np.argmin(dist2, axis=1)
+        new_centroids = np.array(centroids, copy=True)
+        for k in range(n_clusters):
+            members = X[assign == k]
+            if members.size:
+                new_centroids[k] = np.mean(members, axis=0).astype(np.float32)
+        if np.allclose(new_centroids, centroids, atol=1e-4):
+            centroids = new_centroids
+            break
+        centroids = new_centroids
+    return centroids.astype(np.float32)
+
+
+def _cluster_probs_from_latent(latent: np.ndarray, centroids: np.ndarray, *, temperature: float) -> tuple[np.ndarray, np.ndarray]:
+    diff = latent[:, None, :] - centroids[None, :, :]
+    dist2 = np.sum(diff * diff, axis=2).astype(np.float32)
+    logits = -dist2 / max(float(temperature) ** 2, 1e-6)
+    probs = _softmax_rows(logits)
+    return probs.astype(np.float32), dist2.astype(np.float32)
+
+
+def _symbol_time_order(df: pd.DataFrame) -> np.ndarray:
+    symbols = pd.Series(df["symbol"]).astype(str).to_numpy()
+    times = pd.to_datetime(df["time_key"]).astype("int64").to_numpy()
+    return np.lexsort((times, symbols))
+
+
+def _cluster_regime_change_score(df: pd.DataFrame, probs: np.ndarray) -> np.ndarray:
+    out = np.zeros(len(df), dtype=np.float32)
+    symbols = pd.Series(df["symbol"]).astype(str).to_numpy()
+    order = _symbol_time_order(df)
+    prev_idx = -1
+    prev_sym = None
+    for idx in order:
+        sym = symbols[idx]
+        if prev_sym == sym and prev_idx >= 0:
+            out[idx] = 0.5 * float(np.sum(np.abs(probs[idx] - probs[prev_idx])))
+        else:
+            out[idx] = 0.0
+        prev_idx = int(idx)
+        prev_sym = sym
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _cluster_entropy(probs: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(probs, dtype=np.float32), 1e-7, 1.0)
+    ent = -np.sum(p * np.log(p), axis=1)
+    return ent.astype(np.float32)
+
+
+def _log_l1b_unsupervised_diagnostics(
+    outputs: pd.DataFrame,
+    *,
+    train_mask: np.ndarray,
+    val_mask: np.ndarray,
+    cluster_cols: list[str],
+    latent_cols: list[str],
+) -> None:
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    val = np.asarray(val_mask, dtype=bool).ravel()
+    cluster_train = outputs.loc[train, cluster_cols].to_numpy(dtype=np.float32, copy=False)
+    cluster_val = outputs.loc[val, cluster_cols].to_numpy(dtype=np.float32, copy=False)
+    if cluster_train.size:
+        train_share = np.mean(cluster_train, axis=0)
+        val_share = np.mean(cluster_val, axis=0) if cluster_val.size else np.zeros_like(train_share)
+        drift = float(np.mean(np.abs(train_share - val_share)))
+        train_ent = float(np.mean(_cluster_entropy(cluster_train)))
+        val_ent = float(np.mean(_cluster_entropy(cluster_val))) if cluster_val.size else float("nan")
+        print("  [L1b] unsupervised diagnostic — clusters", flush=True)
+        print(
+            f"    train_share={np.round(train_share, 4).tolist()}  val_share={np.round(val_share, 4).tolist()}  "
+            f"train_entropy={train_ent:.4f}  val_entropy={val_ent:.4f}  train_val_drift={drift:.4f}",
+            flush=True,
+        )
+    if latent_cols:
+        latent_train = outputs.loc[train, latent_cols].to_numpy(dtype=np.float32, copy=False)
+        latent_std = np.std(latent_train, axis=0) if latent_train.size else np.zeros(len(latent_cols), dtype=np.float32)
+        print(
+            f"  [L1b] unsupervised diagnostic — latent train_std={np.round(latent_std, 4).tolist()}",
+            flush=True,
+        )
+    for extra_col in ["l1b_novelty_score", "l1b_regime_change_score"]:
+        if extra_col in outputs.columns:
+            train_vals = outputs.loc[train, extra_col].to_numpy(dtype=np.float32, copy=False)
+            val_vals = outputs.loc[val, extra_col].to_numpy(dtype=np.float32, copy=False)
+            train_pcts = np.percentile(train_vals, [5, 25, 50, 75, 95]).tolist() if train_vals.size else [0.0] * 5
+            val_pcts = np.percentile(val_vals, [5, 25, 50, 75, 95]).tolist() if val_vals.size else [0.0] * 5
+            print(
+                f"  [L1b] unsupervised diagnostic — {extra_col}: "
+                f"train_pcts={np.round(train_pcts, 4).tolist()}  val_pcts={np.round(val_pcts, 4).tolist()}",
+                flush=True,
+            )
+
+
+def _fit_l1b_unsupervised_block(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    train_mask: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    latent_dim = min(4, max(2, len(feature_cols)))
+    n_clusters = 5
+    latent_outputs, latent_meta = _fit_l1b_latent_block(df, feature_cols, train_mask=train_mask)
+    latent_cols = [f"l1b_latent_{i}" for i in range(latent_dim)]
+    latent_train = latent_outputs.loc[np.asarray(train_mask, dtype=bool), latent_cols].to_numpy(dtype=np.float32, copy=False)
+    centroids = _fit_l1b_kmeans(latent_train, n_clusters=n_clusters)
+    train_probs, train_dist2 = _cluster_probs_from_latent(latent_train, centroids, temperature=1.0)
+    nearest_train = np.sqrt(np.min(train_dist2, axis=1)) if train_dist2.size else np.array([1.0], dtype=np.float32)
+    cluster_temperature = float(max(np.median(nearest_train), 0.35))
+    all_latent = latent_outputs[latent_cols].to_numpy(dtype=np.float32, copy=False)
+    cluster_probs, _ = _cluster_probs_from_latent(all_latent, centroids, temperature=cluster_temperature)
+    novelty = latent_outputs["l1b_novelty_score"].to_numpy(dtype=np.float32, copy=False)
+    regime_change_raw = _cluster_regime_change_score(df, cluster_probs)
+    rc_lo, rc_hi = _fit_train_quantile_range(regime_change_raw, train_mask, q_low=0.05, q_high=0.95)
+    regime_change = np.clip((regime_change_raw - rc_lo) / max(rc_hi - rc_lo, 1e-6), 0.0, 1.0).astype(np.float32)
+
+    out = pd.DataFrame(index=df.index)
+    for idx, col in enumerate(L1B_CLUSTER_COLS):
+        out[col] = cluster_probs[:, idx].astype(np.float32, copy=False)
+    for col in latent_cols:
+        out[col] = latent_outputs[col].to_numpy(dtype=np.float32, copy=False)
+    out["l1b_novelty_score"] = novelty.astype(np.float32, copy=False)
+    out["l1b_regime_change_score"] = regime_change.astype(np.float32, copy=False)
+
+    meta = {
+        "feature_cols": list(feature_cols),
+        "latent_dim": latent_dim,
+        "cluster_cols": list(L1B_CLUSTER_COLS),
+        "latent_cols": latent_cols,
+        "cluster_centroids": centroids.astype(np.float32),
+        "cluster_temperature": cluster_temperature,
+        "latent_head_meta": latent_meta,
+        "regime_change_lo": float(rc_lo),
+        "regime_change_hi": float(rc_hi),
+    }
+    return out, meta
+
+
+def _apply_l1b_unsupervised_block(df: pd.DataFrame, unsup_meta: dict[str, Any]) -> pd.DataFrame:
+    latent_meta = dict(unsup_meta.get("latent_head_meta") or {})
+    latent_outputs = _apply_l1b_latent_block(df, latent_meta)
+    latent_cols = list(unsup_meta.get("latent_cols") or [])
+    centroids = np.asarray(unsup_meta.get("cluster_centroids"), dtype=np.float32)
+    cluster_temperature = float(unsup_meta.get("cluster_temperature", 1.0))
+    all_latent = latent_outputs[latent_cols].to_numpy(dtype=np.float32, copy=False)
+    cluster_probs, _ = _cluster_probs_from_latent(all_latent, centroids, temperature=cluster_temperature)
+    regime_change_raw = _cluster_regime_change_score(df, cluster_probs)
+    rc_lo = float(unsup_meta.get("regime_change_lo", 0.0))
+    rc_hi = float(unsup_meta.get("regime_change_hi", 1.0))
+    regime_change = np.clip((regime_change_raw - rc_lo) / max(rc_hi - rc_lo, 1e-6), 0.0, 1.0).astype(np.float32)
+
+    out = pd.DataFrame(index=df.index)
+    for idx, col in enumerate(L1B_CLUSTER_COLS):
+        out[col] = cluster_probs[:, idx].astype(np.float32, copy=False)
+    for col in latent_cols:
+        out[col] = latent_outputs[col].to_numpy(dtype=np.float32, copy=False)
+    out["l1b_novelty_score"] = latent_outputs["l1b_novelty_score"].to_numpy(dtype=np.float32, copy=False)
+    out["l1b_regime_change_score"] = regime_change.astype(np.float32, copy=False)
     return out
 
 
@@ -938,8 +1125,16 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     splits = build_stack_time_splits(work["time_key"])
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
-    cal_mask = splits.cal_mask
-    raw_targets, targets, candidate_scores, candidate_masks, target_meta, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
+    direct_outputs = _build_l1b_direct_semantic_outputs(work)
+    cross = compute_cross_asset_context(work)
+    cross.index = work.index
+    cross = cross.rename(
+        columns={
+            "sector_relative_strength": "l1b_sector_relative_strength",
+            "correlation_regime": "l1b_correlation_regime",
+            "market_breadth": "l1b_market_breadth",
+        }
+    )
     cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")
@@ -964,11 +1159,6 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "  [L1b] note: L1b heads use in-memory X from this run (not OOF row-by-row unless you change data prep).",
         flush=True,
     )
-
-    rounds = 300 if FAST_TRAIN_MODE else 1000
-    es_rounds = 50 if FAST_TRAIN_MODE else 120
-    model_map: dict[str, lgb.Booster] = {}
-    constant_output_values: dict[str, float] = {}
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     outputs = pd.concat(
         [
@@ -981,15 +1171,16 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         ],
         axis=1,
     )
-    latent_outputs, latent_meta = _fit_l1b_latent_block(work, feature_cols, train_mask=train_mask)
-    outputs = pd.concat([outputs, latent_outputs.reset_index(drop=True)], axis=1)
-    print(f"  [L1b] model heads: {L1B_MODEL_HEADS}", flush=True)
+    unsup_outputs, unsup_meta = _fit_l1b_unsupervised_block(work, feature_cols, train_mask=train_mask)
+    outputs = pd.concat([outputs, unsup_outputs.reset_index(drop=True)], axis=1)
+    print(f"  [L1b] cluster heads: {L1B_CLUSTER_COLS}", flush=True)
     print(f"  [L1b] latent heads: {L1B_LATENT_HEADS}", flush=True)
     print(f"  [L1b] direct semantic heads: {L1B_DIRECT_SEMANTIC_COLS}", flush=True)
     print(f"  [L1b] direct context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
     print(
-        f"  [L1b] latent explained_variance_ratio={np.round(np.asarray(latent_meta['explained_variance_ratio'], dtype=np.float32), 4).tolist()}  "
-        f"novelty_mean={float(np.mean(latent_outputs['l1b_novelty_score'])):.4f}",
+        f"  [L1b] latent explained_variance_ratio="
+        f"{np.round(np.asarray(unsup_meta['latent_head_meta']['explained_variance_ratio'], dtype=np.float32), 4).tolist()}  "
+        f"cluster_temperature={float(unsup_meta['cluster_temperature']):.4f}",
         flush=True,
     )
     if not cross_context_reliable:
@@ -997,136 +1188,42 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "  [L1b] cross-asset context deemed unreliable (need at least 2 aligned symbols/200 rows); direct context heads will be zeroed.",
             flush=True,
         )
-
-    for name, y in tqdm(
-        [(head_name, targets[head_name]) for head_name in L1B_MODEL_HEADS],
-        desc="[L1b] heads",
-        unit="head",
-        leave=True,
-        file=TQDM_FILE,
-        disable=not _lgb_round_tqdm_enabled(),
-    ):
-        binary = name in L1B_BINARY_HEADS
-        cand_mask = np.asarray(candidate_masks[name], dtype=bool)
-        train_rows = train_mask & cand_mask
-        val_rows = val_mask & cand_mask
-        cal_rows = cal_mask & cand_mask
-        log_label_baseline(name, y[train_rows], task="cls" if binary else "reg")
-        _log_l1b_target_diagnostics(name, raw_targets[name], y, train_mask=train_mask)
-        _log_l1b_candidate_diagnostics(name, candidate_scores[name], cand_mask, y, train_mask=train_mask)
-        head_feature_cols, used_fallback = _l1b_head_feature_cols(name, feature_cols)
-        X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
-        print(f"  [L1b] {name}: input_dim={len(head_feature_cols)}", flush=True)
-        if used_fallback:
-            print(
-                f"  [L1b] {name}: head-specific feature subset was sparse; augmented with safe fallback features.",
-                flush=True,
-            )
-        if (
-            int(train_rows.sum()) < 200
-            or int(val_rows.sum()) < 50
-            or len(np.unique(y[train_rows])) < 2
-            or len(np.unique(y[val_rows])) < 2
-        ):
-            const = float(np.mean(y[train_rows])) if int(train_rows.sum()) else 0.0
-            print(
-                f"  [L1b] {name}: skip model (train_rows={int(train_rows.sum())}, val_rows={int(val_rows.sum())}, "
-                f"train_classes={len(np.unique(y[train_rows]))}, val_classes={len(np.unique(y[val_rows]))}) -> constant prior={const:.4f}",
-                flush=True,
-            )
-            outputs[name] = cand_mask.astype(np.float32) * const
-            constant_output_values[name] = const
-            continue
-        params = {
-            "objective": "binary" if binary else "regression",
-            "metric": "binary_logloss" if binary else "l2",
-            "learning_rate": 0.03,
-            "num_leaves": 48,
-            "max_depth": 6,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
-            "min_child_samples": 80,
-            "lambda_l1": 0.1,
-            "lambda_l2": 1.0,
-            "verbosity": -1,
-            "seed": 42,
-            "n_jobs": _lgbm_n_jobs(),
-            "is_unbalance": bool(binary),
-        }
-        rounds_head = int(rounds)
-        es_rounds_head = int(es_rounds)
-        train_weight = (0.5 + np.asarray(candidate_scores[name], dtype=np.float32))[train_rows]
-        if name == "l1b_shock_risk":
-            params.update(
-                {
-                    "learning_rate": 0.012,
-                    "num_leaves": 63,
-                    "max_depth": 7,
-                    "min_child_samples": 40,
-                    "feature_fraction": 0.9,
-                    "bagging_fraction": 0.85,
-                }
-            )
-            rounds_head = 500 if FAST_TRAIN_MODE else 2500
-            es_rounds_head = 80 if FAST_TRAIN_MODE else 180
-            pos_boost = np.where(y[train_rows] > 0.5, 1.75, 1.0).astype(np.float32)
-            train_weight = train_weight.astype(np.float32, copy=False) * pos_boost
-        dtrain = lgb.Dataset(
-            X_head[train_rows],
-            label=y[train_rows],
-            weight=None if train_weight is None else train_weight.astype(np.float32, copy=False),
-            feature_name=head_feature_cols,
-            free_raw_data=False,
-        )
-        dval = lgb.Dataset(X_head[val_rows], label=y[val_rows], feature_name=head_feature_cols, free_raw_data=False)
-        callbacks, cleanups = _lgb_train_callbacks_with_round_tqdm(es_rounds_head, rounds_head, f"[L1b] {name}")
-        try:
-            model = lgb.train(params, dtrain, num_boost_round=rounds_head, valid_sets=[dval], callbacks=callbacks)
-        finally:
-            for fn in cleanups:
-                fn()
-        model_map[name] = model
-        pred_model = model.predict(X_head).astype(np.float32)
-        pred_full = cand_mask.astype(np.float32) * pred_model
-        _l1b_val_report(name, y[val_rows], pred_model[val_rows], binary=binary)
-        if cal_rows.sum() != val_rows.sum():
-            _l1b_val_report(f"{name} [cal_full]", y[cal_rows], pred_model[cal_rows], binary=binary)
-        outputs[name] = pred_full
-
-    if model_map:
-        diagnose_l1b_leakage(model_map, {name: _l1b_head_feature_cols(name, feature_cols)[0] for name in model_map})
+    _log_l1b_unsupervised_diagnostics(
+        outputs,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        cluster_cols=list(L1B_CLUSTER_COLS),
+        latent_cols=list(L1B_LATENT_EMBED_COLS),
+    )
     for col in L1B_OUTPUT_COLS:
         if col not in outputs.columns:
             outputs[col] = 0.0
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    model_files: dict[str, str] = {}
-    for name, model in model_map.items():
-        fname = f"{name}.txt"
-        model.save_model(os.path.join(MODEL_DIR, fname))
-        model_files[name] = fname
-
     meta = {
         "schema_version": L1B_SCHEMA_VERSION,
         "feature_cols": feature_cols,
         "output_cols": L1B_OUTPUT_COLS,
-        "model_output_cols": sorted(model_map),
+        "model_output_cols": [],
+        "cluster_output_cols": list(L1B_CLUSTER_COLS),
         "latent_output_cols": list(L1B_LATENT_HEADS),
+        "unsupervised_output_cols": list(L1B_UNSUPERVISED_COLS),
         "direct_output_cols": sorted(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deterministic_output_cols": list(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
-        "deprecated_output_cols": [],
-        "constant_output_values": constant_output_values,
-        "model_files": model_files,
-        "head_feature_cols": {name: _l1b_head_feature_cols(name, feature_cols)[0] for name in model_map},
-        "semantic_candidate_meta": target_meta,
+        "deprecated_output_cols": ["l1b_pullback_setup", "l1b_failure_risk", "l1b_shock_risk"],
+        "constant_output_values": {},
+        "model_files": {},
+        "head_feature_cols": {},
         "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": (
-            "hybrid contract: deterministic semantic descriptors from current-bar context, "
-            "candidate-aware semantic classification heads, and train-only latent context heads"
+            "retired: supervised semantic heads removed in favor of unsupervised cluster and latent features"
         ),
-        "target_shaping": "candidate-aware binary labels from strict within-candidate ranking; semantic outputs are masked conditional probabilities",
-        "latent_head_meta": latent_meta,
+        "unsupervised_semantics": (
+            "deterministic direct descriptors plus train-only PCA embeddings, soft cluster posteriors, "
+            "novelty from reconstruction error, and regime-change from cluster posterior turnover"
+        ),
+        "latent_head_meta": unsup_meta["latent_head_meta"],
+        "unsupervised_block_meta": unsup_meta,
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
     with open(os.path.join(MODEL_DIR, L1B_META_FILE), "wb") as f:
@@ -1134,7 +1231,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     cache_path = save_output_cache(outputs, L1B_OUTPUT_CACHE_FILE)
     print(f"  [L1b] meta saved  -> {os.path.join(MODEL_DIR, L1B_META_FILE)}", flush=True)
     print(f"  [L1b] cache saved -> {cache_path}", flush=True)
-    return L1BTrainingBundle(models=model_map, meta=meta, outputs=outputs)
+    return L1BTrainingBundle(models={}, meta=meta, outputs=outputs)
 
 
 def load_l1b_market_descriptor() -> tuple[dict[str, lgb.Booster], dict[str, Any]]:
@@ -1160,7 +1257,6 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
             work[col] = 0.0
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     direct_outputs = _build_l1b_direct_semantic_outputs(work)
-    candidate_scores = _build_l1b_candidate_scores(work, direct_outputs)
     cross = compute_cross_asset_context(work)
     cross.index = work.index
     cross = cross.rename(
@@ -1181,23 +1277,9 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
         ],
         axis=1,
     )
-    latent_meta = meta.get("latent_head_meta") or {}
-    if latent_meta:
-        outputs = pd.concat([outputs, _apply_l1b_latent_block(work, latent_meta).reset_index(drop=True)], axis=1)
-    candidate_meta = meta.get("semantic_candidate_meta") or {}
-    for name, value in (meta.get("constant_output_values") or {}).items():
-        cand_mask = _candidate_mask_from_scores(name, candidate_scores, candidate_meta)
-        outputs[name] = cand_mask.astype(np.float32) * float(value)
-    head_feature_cols_map = meta.get("head_feature_cols") or {}
-    for name, model in models.items():
-        head_feature_cols = list(head_feature_cols_map.get(name) or feature_cols)
-        for col in head_feature_cols:
-            if col not in work.columns:
-                work[col] = 0.0
-        X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
-        pred = model.predict(X_head).astype(np.float32)
-        cand_mask = _candidate_mask_from_scores(name, candidate_scores, candidate_meta)
-        outputs[name] = cand_mask.astype(np.float32) * pred
+    unsup_meta = meta.get("unsupervised_block_meta") or {}
+    if unsup_meta:
+        outputs = pd.concat([outputs, _apply_l1b_unsupervised_block(work, unsup_meta).reset_index(drop=True)], axis=1)
     for col in meta.get("output_cols", L1B_OUTPUT_COLS):
         if col not in outputs.columns:
             outputs[col] = 0.0
