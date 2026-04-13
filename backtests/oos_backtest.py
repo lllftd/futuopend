@@ -28,8 +28,9 @@ from core.trainers.data_prep import ensure_breakout_features, ensure_structure_c
 from core.trainers.layer1a_market import infer_l1a_market_encoder, load_l1a_market_encoder
 from core.trainers.layer1b_descriptor import infer_l1b_market_descriptor, load_l1b_market_descriptor
 from core.trainers.layer2_decision import infer_l2_trade_decision, load_l2_trade_decision
-from core.trainers.layer3_exit import load_l3_exit_manager, load_l3_trajectory_encoder_for_infer
+from core.trainers.layer3_exit import l3_entry_side_from_l2, load_l3_exit_manager, load_l3_trajectory_encoder_for_infer
 from core.trainers.l3_trajectory_hybrid import L3TrajRollingState, l3_single_trajectory_embedding
+from core.trainers.lgbm_utils import _live_trade_state_from_bar, _net_edge_atr_from_state
 from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 
 DATA_DIR = _REPO_ROOT / "data"
@@ -72,15 +73,15 @@ def _build_l3_feature_vector(
     l1a_out: pd.DataFrame,
     l2_out: pd.DataFrame,
 ) -> np.ndarray:
-    if in_pos == 1:
-        live_mfe = max(0.0, (df["high"].iloc[idx] - entry_price) / entry_atr)
-        live_mae = max(0.0, (entry_price - df["low"].iloc[idx]) / entry_atr)
-        unreal = (df["close"].iloc[idx] - entry_price) / entry_atr
-    else:
-        live_mfe = max(0.0, (entry_price - df["low"].iloc[idx]) / entry_atr)
-        live_mae = max(0.0, (df["high"].iloc[idx] - entry_price) / entry_atr)
-        unreal = (entry_price - df["close"].iloc[idx]) / entry_atr
-    live_edge = float(live_mfe - live_mae)
+    live_mfe, live_mae, unreal = _live_trade_state_from_bar(
+        side=float(in_pos),
+        entry_price=entry_price,
+        atr=entry_atr,
+        high_price=float(df["high"].iloc[idx]),
+        low_price=float(df["low"].iloc[idx]),
+        close_price=float(df["close"].iloc[idx]),
+    )
+    live_edge = float(_net_edge_atr_from_state(live_mfe, live_mae, hold))
     entry_regime = l2_out.loc[entry_idx, [f"l2_entry_regime_{i}" for i in range(6)]].to_numpy(dtype=np.float32)
     current_regime = l1a_out.loc[idx, L1A_REGIME_COLS].to_numpy(dtype=np.float32)
     p = np.clip(entry_regime, 1e-6, 1.0)
@@ -163,6 +164,7 @@ def run_single_symbol(
     _sidx = {c: i for i, c in enumerate(static_l3_names)}
     exit_model = l3_models["exit"]
     value_model = l3_models["value"]
+    exit_calibrator = l3_models.get("exit_calibrator")
     dev = torch_device if torch_device is not None else TORCH_DEVICE
     hybrid = l3_traj_enc is not None and l3_traj_cfg is not None
     traj_buf: L3TrajRollingState | None = None
@@ -175,14 +177,23 @@ def run_single_symbol(
     entry_atr = 1e-3
     entry_time = None
     hold = 0
+    entry_min_conf = float(l3_meta.get("l3_entry_min_confidence", 0.0))
+    entry_min_size = float(l3_meta.get("l3_entry_min_size", 0.05))
 
     for i in range(len(df) - 1):
         if in_pos == 0:
             cls = int(l2_out.loc[i, "l2_decision_class"])
             conf = float(l2_out.loc[i, "l2_decision_confidence"])
             size = float(l2_out.loc[i, "l2_size"])
-            if cls in {0, 2} and conf >= 0.55 and size >= 0.12:
-                in_pos = 1 if cls == 0 else -1
+            side = l3_entry_side_from_l2(
+                cls,
+                conf,
+                size,
+                min_confidence=entry_min_conf,
+                min_size=entry_min_size,
+            )
+            if side != 0.0:
+                in_pos = int(side)
                 entry_idx = i
                 entry_price = float(df["open"].iloc[i + 1])
                 entry_atr = max(float(df["lbl_atr"].iloc[i]), 1e-3)
@@ -222,7 +233,11 @@ def run_single_symbol(
                 feat_vec = static.reshape(1, -1)
             if feat_vec.shape[1] != len(feature_cols):
                 raise RuntimeError(f"L3 feature width mismatch: {feat_vec.shape[1]} vs {len(feature_cols)}")
-            exit_prob = float(exit_model.predict(feat_vec)[0])
+            exit_raw = float(exit_model.predict(feat_vec)[0])
+            if exit_calibrator is not None:
+                exit_prob = float(np.clip(exit_calibrator.predict(np.asarray([exit_raw], dtype=np.float64))[0], 0.0, 1.0))
+            else:
+                exit_prob = float(np.clip(exit_raw, 0.0, 1.0))
             value_left = float(value_model.predict(feat_vec)[0])
             flip = int(l2_out.loc[i, "l2_decision_class"])
             flip_against = (in_pos == 1 and flip == 2) or (in_pos == -1 and flip == 0)

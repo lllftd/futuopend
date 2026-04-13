@@ -1,5 +1,6 @@
 import argparse
 import os
+import pickle
 import sys
 
 import torch
@@ -8,6 +9,8 @@ from core.trainers.constants import (
     L1A_OUTPUT_CACHE_FILE,
     L1B_OUTPUT_CACHE_FILE,
     L2_OUTPUT_CACHE_FILE,
+    MODEL_DIR,
+    PREPARED_DATASET_CACHE_FILE,
 )
 from core.trainers.data_prep import prepare_dataset as prepare_lgbm_data
 from core.trainers.layer1a_market import train_l1a_market_encoder
@@ -68,6 +71,40 @@ def setup_logger(layer_key: str):
     return Logger(log_file)
 
 
+def _prepared_dataset_cache_path() -> str:
+    return os.path.join(MODEL_DIR, PREPARED_DATASET_CACHE_FILE)
+
+
+def _save_prepared_dataset_cache(df, feat_cols) -> str:
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    path = _prepared_dataset_cache_path()
+    with open(path, "wb") as f:
+        pickle.dump({"df": df, "feat_cols": list(feat_cols)}, f)
+    return path
+
+
+def _load_prepared_dataset_cache():
+    path = _prepared_dataset_cache_path()
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    if not isinstance(obj, dict) or "df" not in obj or "feat_cols" not in obj:
+        raise TypeError(f"Prepared dataset cache {path} is malformed.")
+    return obj["df"], list(obj["feat_cols"])
+
+
+def _prepare_or_load_lgbm_dataset(symbols: list[str], *, prefer_cache: bool):
+    cache_path = _prepared_dataset_cache_path()
+    force_rebuild = os.environ.get("PREPARED_DATASET_CACHE_REBUILD", "").strip().lower() in {"1", "true", "yes"}
+    if prefer_cache and not force_rebuild and os.path.exists(cache_path):
+        print(f"\n[*] Loading prepared dataset cache from {cache_path} ...")
+        return _load_prepared_dataset_cache()
+    print(f"\n[*] Preparing LGBM dataset...")
+    df, feat_cols = prepare_lgbm_data(symbols)
+    saved = _save_prepared_dataset_cache(df, feat_cols)
+    print(f"[*] Prepared dataset cache saved -> {saved}")
+    return df, feat_cols
+
+
 def run_lgbm_layers(start_from: str = "layer1"):
     configure_compute_threads()
     n_th = torch.get_num_threads()
@@ -81,8 +118,7 @@ def run_lgbm_layers(start_from: str = "layer1"):
     if sf == "layer1":
         sf = "layer1a"
 
-    print(f"\n[*] Preparing LGBM dataset...")
-    df, feat_cols = prepare_lgbm_data(["QQQ", "SPY"])
+    df, feat_cols = _prepare_or_load_lgbm_dataset(["QQQ", "SPY"], prefer_cache=(sf != "layer1a"))
 
     if sf == "layer3":
         print("\n[*] start-from=layer3: load L1a + L2 output caches, train L3 only.")

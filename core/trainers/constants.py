@@ -67,10 +67,10 @@ PA_CTX_FEATURES = [
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 
 # New dual-view stack schema versions
-L1A_SCHEMA_VERSION = "1.1.0"
-L1B_SCHEMA_VERSION = "1.2.1"
-L2_SCHEMA_VERSION = "1.2.1"
-L3_SCHEMA_VERSION = "1.2.0"
+L1A_SCHEMA_VERSION = "1.2.0"
+L1B_SCHEMA_VERSION = "1.2.2"
+L2_SCHEMA_VERSION = "1.3.0"
+L3_SCHEMA_VERSION = "1.3.0"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"
@@ -93,6 +93,7 @@ L3_EXIT_FILE = "l3_exit.txt"
 L3_VALUE_FILE = "l3_value.txt"
 L3_META_FILE = "l3_exit_meta.pkl"
 L3_TRAJECTORY_ENCODER_FILE = "l3_trajectory_encoder.pt"
+PREPARED_DATASET_CACHE_FILE = "prepared_lgbm_dataset.pkl"
 
 # New stack feature / contract names
 L1A_REGIME_COLS = [f"l1a_regime_prob_{name}" for name in REGIME_NOW_PROB_COLS]

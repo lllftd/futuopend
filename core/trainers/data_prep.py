@@ -42,9 +42,8 @@ def _load_labels(symbol: str) -> pd.DataFrame:
         "optimal_tp_atr", "optimal_sl_atr", "optimal_exit_bar", "optimal_net_edge_atr",
     ]
     path = os.path.join(DATA_DIR, f"{symbol}{LABELED_SUFFIX}.csv")
-    available_cols = pd.read_csv(path, nrows=0).columns.tolist()
-    cols = [c for c in required_cols + optional_cols if c in available_cols]
-    lbl = pd.read_csv(path, usecols=cols)
+    keep_cols = set(required_cols + optional_cols)
+    lbl = pd.read_csv(path, usecols=lambda c: c in keep_cols)
     lbl["time_key"] = pd.to_datetime(lbl["time_key"])
     lbl.rename(columns={"atr": "lbl_atr"}, inplace=True)
     return lbl
@@ -774,7 +773,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
         feat_std = np.asarray(meta["std"], dtype=np.float32)
         feat_std = np.where(feat_std < 1e-8, 1.0, feat_std)
     
-        work = df.copy()
+        work = df.copy(deep=False)
     
         sym_outputs: list[pd.DataFrame] = []
     
@@ -864,14 +863,11 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
         merged = work.merge(mamba_1m, on=["symbol", "time_key"], how="left")
         merged = merged.sort_values(["symbol", "time_key"])
         mamba_cols = [c for c in mamba_derived_list if c in merged.columns]
-        for c in _tq(
-            mamba_cols,
-            desc="  Mamba post-merge ffill",
-            unit="col",
-            leave=False,
-        ):
-            merged[c] = merged.groupby("symbol", group_keys=False)[c].transform(
-                lambda s: s.ffill()
+        if mamba_cols:
+            merged[mamba_cols] = (
+                merged.groupby("symbol", sort=False)[mamba_cols]
+                .ffill()
+                .astype(np.float32, copy=False)
             )
 
         # --- INJECT OOF CACHE TO PREVENT DATA LEAKAGE ---

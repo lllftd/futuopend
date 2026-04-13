@@ -8,6 +8,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -149,7 +150,7 @@ L2_OUTPUT_COLS = [
 
 @dataclass
 class L2TrainingBundle:
-    models: dict[str, lgb.Booster]
+    models: dict[str, Any]
     meta: dict[str, Any]
     outputs: pd.DataFrame
 
@@ -180,6 +181,49 @@ def _l2_direction_margin_to_prob(direction_margin: np.ndarray, *, temperature: f
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float64)
 
 
+def _split_mask_for_tuning_and_report(
+    time_key: pd.Series | np.ndarray,
+    base_mask: np.ndarray,
+    *,
+    tune_frac: float,
+    min_rows_each: int = 50,
+) -> tuple[np.ndarray, np.ndarray]:
+    base = np.asarray(base_mask, dtype=bool)
+    idx = np.flatnonzero(base)
+    tune_mask = np.zeros_like(base, dtype=bool)
+    report_mask = np.zeros_like(base, dtype=bool)
+    if idx.size == 0:
+        return tune_mask, report_mask
+    ts = np.asarray(pd.to_datetime(time_key))
+    idx = idx[np.argsort(ts[idx])]
+    if idx.size < 2 * min_rows_each:
+        tune_mask[idx] = True
+        report_mask[idx] = True
+        return tune_mask, report_mask
+    split = int(round(idx.size * float(np.clip(tune_frac, 0.2, 0.8))))
+    split = max(min_rows_each, min(idx.size - min_rows_each, split))
+    tune_mask[idx[:split]] = True
+    report_mask[idx[split:]] = True
+    return tune_mask, report_mask
+
+
+def _fit_binary_calibrator(y_true: np.ndarray, raw_p: np.ndarray) -> IsotonicRegression | None:
+    y = np.asarray(y_true, dtype=np.int32).ravel()
+    p = np.clip(np.asarray(raw_p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
+    if y.size < 100 or len(np.unique(y)) < 2:
+        return None
+    calib = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    calib.fit(p, y.astype(np.float64))
+    return calib
+
+
+def _apply_binary_calibrator(p: np.ndarray, calibrator: IsotonicRegression | None) -> np.ndarray:
+    arr = np.clip(np.asarray(p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
+    if calibrator is None:
+        return arr
+    return np.clip(np.asarray(calibrator.predict(arr), dtype=np.float64).ravel(), 0.0, 1.0)
+
+
 def _l2_hard_decision_from_gate_dir(gate_p: np.ndarray, dir_p: np.ndarray, thr: float) -> np.ndarray:
     gate_p = np.asarray(gate_p, dtype=np.float64).ravel()
     dir_p = np.asarray(dir_p, dtype=np.float64).ravel()
@@ -198,8 +242,11 @@ def _l2_predict_gate_dir_probs(
     trade_threshold: float,
     direction_head_type: str = "probability",
     direction_temperature: float = 0.35,
+    gate_calibrator: IsotonicRegression | None = None,
+    gate_raw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    gate_p = gate_model.predict(X).astype(np.float64)
+    gate_scores = gate_model.predict(X).astype(np.float64) if gate_raw is None else np.asarray(gate_raw, dtype=np.float64).ravel()
+    gate_p = _apply_binary_calibrator(gate_scores, gate_calibrator)
     dir_p = np.full(len(X), 0.5, dtype=np.float64)
     if direction_model is not None:
         m = gate_p >= trade_threshold
@@ -268,19 +315,30 @@ def _log_l2_two_stage_val_diagnostics(
         if recall_trade < 0.15:
             print(f"    WARNING: trade recall={recall_trade:.3f} < 0.15 — consider lowering threshold", flush=True)
     act = y_dir >= 0
-    if act.sum() >= 20:
-        print("\n  [L2] val — direction (true active bars only)", flush=True)
-        yda = y_dir[act].astype(np.int32)
-        dpa = dir_p[act]
+    gated = act & (gate_p >= trade_threshold)
+    if gated.sum() >= 20:
+        print("\n  [L2] val — direction (deploy path: gated active bars)", flush=True)
+        yda = y_dir[gated].astype(np.int32)
+        dpa = dir_p[gated]
         try:
             auc_d = float(roc_auc_score(yda, dpa))
         except ValueError:
             auc_d = float("nan")
         pred_d = (dpa >= 0.5).astype(np.int32)
-        print(f"    direction AUC={auc_d:.4f}  n_active={int(act.sum()):,}", flush=True)
+        print(
+            f"    direction AUC={auc_d:.4f}  n_gated_active={int(gated.sum()):,}  "
+            f"coverage_of_true_active={float(np.mean(gate_p[act] >= trade_threshold)) if act.any() else 0.0:.3f}",
+            flush=True,
+        )
         print(
             "    direction classification_report:\n"
             + classification_report(yda, pred_d, target_names=["short", "long"], digits=4, zero_division=0),
+            flush=True,
+        )
+    elif act.sum() >= 20:
+        print(
+            f"\n  [L2] val — direction: gated subset too small for deploy-path diagnostics "
+            f"(gated_active={int(gated.sum())}, true_active={int(act.sum())})",
             flush=True,
         )
     pred_hard = _l2_hard_decision_from_gate_dir(gate_p, dir_p, trade_threshold)
@@ -419,6 +477,79 @@ def _log_l2_extended_val_metrics(
         )
 
 
+def _log_l2_l1b_ablation(
+    X: np.ndarray,
+    feature_cols: list[str],
+    val_mask: np.ndarray,
+    y_decision: np.ndarray,
+    gate_model: lgb.Booster,
+    direction_model: lgb.Booster | None,
+    *,
+    trade_threshold: float,
+    direction_head_type: str,
+    direction_temperature: float,
+    gate_calibrator: IsotonicRegression | None,
+) -> None:
+    l1b_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_")]
+    if not l1b_idx:
+        print("\n  [L2] l1b ablation: skip (no l1b_* columns after selection)", flush=True)
+        return
+    vm = np.asarray(val_mask, dtype=bool)
+    if not vm.any():
+        return
+
+    def _eval_probs(prob_mat: np.ndarray) -> tuple[float, float, float]:
+        Pv = np.asarray(prob_mat[vm], dtype=np.float64)
+        Pv = np.clip(Pv, 1e-15, 1.0)
+        Pv = Pv / Pv.sum(axis=1, keepdims=True)
+        yv = np.asarray(y_decision[vm], dtype=np.int64)
+        try:
+            ll = float(log_loss(yv, Pv, labels=[0, 1, 2]))
+        except ValueError:
+            ll = float("nan")
+        pred = np.argmax(Pv, axis=1)
+        f1m = float(f1_score(yv, pred, average="macro", zero_division=0))
+        trade_rate = float(np.mean(pred != 1))
+        return ll, f1m, trade_rate
+
+    _, _, base_probs = _l2_predict_gate_dir_probs(
+        gate_model,
+        direction_model,
+        X,
+        trade_threshold=trade_threshold,
+        direction_head_type=direction_head_type,
+        direction_temperature=direction_temperature,
+        gate_calibrator=gate_calibrator,
+    )
+    X_no_l1b = np.array(X, copy=True)
+    X_no_l1b[:, l1b_idx] = 0.0
+    _, _, ablated_probs = _l2_predict_gate_dir_probs(
+        gate_model,
+        direction_model,
+        X_no_l1b,
+        trade_threshold=trade_threshold,
+        direction_head_type=direction_head_type,
+        direction_temperature=direction_temperature,
+        gate_calibrator=gate_calibrator,
+    )
+    base_ll, base_f1, base_trade = _eval_probs(base_probs)
+    abl_ll, abl_f1, abl_trade = _eval_probs(ablated_probs)
+    print("\n  [L2] l1b val ablation (zero l1b_* at inference)", flush=True)
+    print(
+        f"    baseline:      log_loss={base_ll:.4f}  F1_macro={base_f1:.4f}  trade_rate={base_trade:.3f}",
+        flush=True,
+    )
+    print(
+        f"    without_l1b:   log_loss={abl_ll:.4f}  F1_macro={abl_f1:.4f}  trade_rate={abl_trade:.3f}",
+        flush=True,
+    )
+    print(
+        f"    delta(no_l1b-base):  log_loss={abl_ll - base_ll:+.4f}  F1_macro={abl_f1 - base_f1:+.4f}  "
+        f"trade_rate={abl_trade - base_trade:+.3f}",
+        flush=True,
+    )
+
+
 def _session_context(df: pd.DataFrame) -> pd.DataFrame:
     ts = pd.to_datetime(df["time_key"])
     out = pd.DataFrame(index=df.index)
@@ -501,6 +632,12 @@ def train_l2_trade_decision(
     test_mask = splits.test_mask
     if not train_mask.any() or not val_mask.any():
         raise RuntimeError("L2: calibration split is empty for train/val.")
+    tune_frac = float(os.environ.get("L2_TUNE_FRAC_WITHIN_VAL", "0.5"))
+    val_tune_mask, val_report_mask = _split_mask_for_tuning_and_report(
+        df["time_key"], val_mask, tune_frac=tune_frac, min_rows_each=50
+    )
+    if not val_tune_mask.any() or not val_report_mask.any():
+        raise RuntimeError("L2: failed to create non-empty tuning/report masks inside l2_val.")
 
     min_std = float(os.environ.get("L2_MIN_FEATURE_STD", "1e-4"))
     skip_hard = os.environ.get("L2_SKIP_FEATURE_HARD_DROP", "").strip().lower() in {"1", "true", "yes"}
@@ -558,6 +695,15 @@ def train_l2_trade_decision(
             f"Strict time split inside cal window: train in [{TRAIN_END}, {str(l2_val_start)}), "
             f"val in [{str(l2_val_start)}, {CAL_END})."
         ),
+    )
+    log_time_key_split(
+        "L2(threshold/calibration)",
+        df["time_key"],
+        val_tune_mask,
+        val_report_mask,
+        train_label="val_tune (threshold/calibration)",
+        val_label="val_report (metrics)",
+        extra_note="L2 thresholds and probability calibration are fit on val_tune; headline validation metrics are reported on val_report.",
     )
     log_numpy_x_stats("L2", X[train_mask], label="X[l2_train]")
     l1a_cols = [c for c in feature_cols if c.startswith("l1a_")]
@@ -774,13 +920,11 @@ def train_l2_trade_decision(
     finally:
         l2_outer.close()
 
-    gate_p_val = gate_model.predict(X[val_mask]).astype(np.float64)
-    dir_p_val = np.full(int(val_mask.sum()), 0.5, dtype=np.float64)
-    if direction_model is not None:
-        dir_raw_val = direction_model.predict(X[val_mask]).astype(np.float64)
-        dir_p_val = _l2_direction_margin_to_prob(dir_raw_val, temperature=0.35)
+    gate_raw_all = gate_model.predict(X).astype(np.float64)
+    gate_calibrator = _fit_binary_calibrator(y_gate[val_tune_mask], gate_raw_all[val_tune_mask])
+    gate_p_tune = _apply_binary_calibrator(gate_raw_all[val_tune_mask], gate_calibrator)
     trade_threshold = _search_l2_trade_threshold(
-        gate_p_val,
+        gate_p_tune,
         target_trade_rate=_l2_target_trade_rate(),
     )
     gate_thr_after_search = float(trade_threshold)
@@ -793,12 +937,21 @@ def train_l2_trade_decision(
             f"(bump={bump:.2f}, cap={cap:.2f}); composed long/short split is degenerate at d=0.5",
             flush=True,
         )
+    gate_p_report, dir_p_report, _ = _l2_predict_gate_dir_probs(
+        gate_model,
+        direction_model,
+        X[val_report_mask],
+        trade_threshold=trade_threshold,
+        direction_head_type="signed_edge_regression",
+        direction_temperature=0.35,
+        gate_calibrator=gate_calibrator,
+    )
     _log_l2_two_stage_val_diagnostics(
-        gate_p_val,
-        dir_p_val,
-        y_gate[val_mask],
-        y_dir[val_mask],
-        y_decision[val_mask],
+        gate_p_report,
+        dir_p_report,
+        y_gate[val_report_mask],
+        y_dir[val_report_mask],
+        y_decision[val_report_mask],
         trade_threshold,
     )
     _, _, decision_probs = _l2_predict_gate_dir_probs(
@@ -808,13 +961,15 @@ def train_l2_trade_decision(
         trade_threshold=trade_threshold,
         direction_head_type="signed_edge_regression",
         direction_temperature=0.35,
+        gate_calibrator=gate_calibrator,
+        gate_raw=gate_raw_all,
     )
     size_pred = np.clip(size_model.predict(X).astype(np.float32), 0.0, 1.0)
     mfe_pred = np.clip(mfe_model.predict(X).astype(np.float32), 0.0, 5.0)
     mae_pred = np.clip(mae_model.predict(X).astype(np.float32), 0.0, 4.0)
     _log_l2_extended_val_metrics(
         frame,
-        val_mask,
+        val_report_mask,
         y_decision,
         decision_probs,
         y_size,
@@ -823,6 +978,18 @@ def train_l2_trade_decision(
         mfe_pred,
         y_mae,
         mae_pred,
+    )
+    _log_l2_l1b_ablation(
+        X,
+        feature_cols,
+        val_report_mask,
+        y_decision,
+        gate_model,
+        direction_model,
+        trade_threshold=trade_threshold,
+        direction_head_type="signed_edge_regression",
+        direction_temperature=0.35,
+        gate_calibrator=gate_calibrator,
     )
     outputs = df[["symbol", "time_key"]].copy()
     outputs["l2_decision_class"] = np.argmax(decision_probs, axis=1).astype(np.int64)
@@ -855,6 +1022,11 @@ def train_l2_trade_decision(
     }
     if direction_model is not None:
         model_files["direction"] = L2_DIRECTION_FILE
+    if gate_calibrator is not None:
+        gate_calib_file = "l2_gate_calibrator.pkl"
+        with open(os.path.join(MODEL_DIR, gate_calib_file), "wb") as f:
+            pickle.dump(gate_calibrator, f)
+        model_files["gate_calibrator"] = gate_calib_file
     meta = {
         "schema_version": L2_SCHEMA_VERSION,
         "feature_cols": feature_cols,
@@ -871,6 +1043,7 @@ def train_l2_trade_decision(
         "model_files": model_files,
         "output_cache_file": L2_OUTPUT_CACHE_FILE,
         "target_trade_rate": _l2_target_trade_rate(),
+        "l2_val_tune_frac": tune_frac,
         "l2_min_feature_std": min_std,
         "l2_feature_hard_drop_skipped": skip_hard,
         "l2_feature_selection_dropped": l2_dropped_features,
@@ -910,7 +1083,7 @@ def train_l2_trade_decision(
         print(f"  [L2] test corr(expected_edge, decision_edge_atr)={corr:.4f}", flush=True)
     print(f"  [L2] meta saved  -> {os.path.join(MODEL_DIR, L2_META_FILE)}", flush=True)
     print(f"  [L2] cache saved -> {cache_path}", flush=True)
-    bundle_models: dict[str, lgb.Booster] = {
+    bundle_models: dict[str, Any] = {
         "gate": gate_model,
         "size": size_model,
         "mfe": mfe_model,
@@ -918,10 +1091,12 @@ def train_l2_trade_decision(
     }
     if direction_model is not None:
         bundle_models["direction"] = direction_model
+    if gate_calibrator is not None:
+        bundle_models["gate_calibrator"] = gate_calibrator
     return L2TrainingBundle(models=bundle_models, meta=meta, outputs=outputs)
 
 
-def load_l2_trade_decision() -> tuple[dict[str, lgb.Booster], dict[str, Any]]:
+def load_l2_trade_decision() -> tuple[dict[str, Any], dict[str, Any]]:
     with open(os.path.join(MODEL_DIR, L2_META_FILE), "rb") as f:
         meta = pickle.load(f)
     if meta.get("schema_version") != L2_SCHEMA_VERSION:
@@ -930,15 +1105,20 @@ def load_l2_trade_decision() -> tuple[dict[str, lgb.Booster], dict[str, Any]]:
             f"Retrain L2 so artifacts match schema {L2_SCHEMA_VERSION}."
         )
     model_files = meta.get("model_files", {})
-    models = {
+    models: dict[str, Any] = {
         name: lgb.Booster(model_file=os.path.join(MODEL_DIR, fname))
         for name, fname in model_files.items()
+        if name != "gate_calibrator"
     }
+    gate_calib_file = model_files.get("gate_calibrator")
+    if gate_calib_file:
+        with open(os.path.join(MODEL_DIR, gate_calib_file), "rb") as f:
+            models["gate_calibrator"] = pickle.load(f)
     return models, meta
 
 
 def infer_l2_trade_decision(
-    models: dict[str, lgb.Booster],
+    models: dict[str, Any],
     meta: dict[str, Any],
     df: pd.DataFrame,
     l1a_outputs: pd.DataFrame,
@@ -955,6 +1135,7 @@ def infer_l2_trade_decision(
         thr = float(meta.get("trade_threshold", 0.35))
         gate_m = models["gate"]
         dir_m = models.get("direction")
+        gate_calibrator = models.get("gate_calibrator")
         # thr applies to gate_p >= thr (not argmax on composed 3-way probs); see meta trade_threshold_applies_to
         _, _, decision_probs = _l2_predict_gate_dir_probs(
             gate_m,
@@ -963,6 +1144,7 @@ def infer_l2_trade_decision(
             trade_threshold=thr,
             direction_head_type=str(meta.get("direction_head_type", "probability")),
             direction_temperature=float(meta.get("direction_temperature", 0.35)),
+            gate_calibrator=gate_calibrator,
         )
     elif "decision" in models:
         decision_probs = models["decision"].predict(X).astype(np.float32)

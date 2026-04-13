@@ -49,23 +49,6 @@ from core.trainers.stack_v2_common import (
 )
 
 
-L1B_OUTPUT_COLS = [
-    "l1b_breakout_quality",
-    "l1b_mean_reversion_setup",
-    "l1b_trend_strength",
-    "l1b_pullback_setup",
-    "l1b_range_reversal_setup",
-    "l1b_failed_breakout_setup",
-    "l1b_setup_alignment",
-    "l1b_follow_through_score",
-    "l1b_failure_risk",
-    "l1b_shock_risk",
-    "l1b_liquidity_score",
-    "l1b_sector_relative_strength",
-    "l1b_correlation_regime",
-    "l1b_market_breadth",
-]
-
 L1B_MODEL_HEADS = [
     "l1b_breakout_quality",
     "l1b_mean_reversion_setup",
@@ -85,6 +68,7 @@ L1B_DIRECT_CONTEXT_COLS = [
     "l1b_correlation_regime",
     "l1b_market_breadth",
 ]
+L1B_OUTPUT_COLS = list(L1B_MODEL_HEADS) + list(L1B_DIRECT_CONTEXT_COLS)
 
 
 @dataclass
@@ -165,6 +149,12 @@ def _select_l1b_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str
     return _numeric_feature_cols_for_matrix(df, keep)
 
 
+def _l1b_cross_context_reliable(df: pd.DataFrame) -> bool:
+    n_symbols = int(pd.Series(df["symbol"]).nunique(dropna=True))
+    n_rows = len(df)
+    return n_symbols >= 3 and n_rows >= 200
+
+
 def _col_f32(df: pd.DataFrame, name: str) -> np.ndarray:
     """Read a numeric column as float32; missing column -> zeros (``df.get(..., 0.0)`` is a scalar and breaks ``fillna``)."""
     if name not in df.columns:
@@ -196,7 +186,7 @@ def _stretch_score(
     return ((clipped - lo) / (hi - lo)).astype(np.float32, copy=False)
 
 
-def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
+def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
     preferred = {
         "l1b_breakout_quality": [
             "bo_body_atr",
@@ -211,13 +201,11 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "bo_atr_zscore",
             "pa_ctx_follow_through_long",
             "pa_ctx_follow_through_short",
-            "pa_ctx_setup_long",
-            "pa_ctx_setup_short",
             "pa_vol_rvol",
+            "pa_hsmm_switch_hazard",
+            "pa_egarch_std_residual",
         ],
         "l1b_mean_reversion_setup": [
-            "pa_ctx_setup_range_long",
-            "pa_ctx_setup_range_short",
             "pa_ctx_range_pressure",
             "bo_inside_prior",
             "bo_bb_width",
@@ -228,8 +216,6 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "pa_hsmm_switch_hazard",
         ],
         "l1b_trend_strength": [
-            "pa_ctx_setup_trend_long",
-            "pa_ctx_setup_trend_short",
             "pa_ctx_follow_through_long",
             "pa_ctx_follow_through_short",
             "bo_consec_dir",
@@ -241,8 +227,6 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "pa_hsmm_switch_hazard",
         ],
         "l1b_pullback_setup": [
-            "pa_ctx_setup_pullback_long",
-            "pa_ctx_setup_pullback_short",
             "pa_ctx_setup_trend_long",
             "pa_ctx_setup_trend_short",
             "pa_ctx_follow_through_long",
@@ -251,10 +235,10 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "bo_inside_prior",
             "pa_struct_swing_range_atr",
             "pa_hsmm_remaining_duration",
+            "pa_ctx_range_pressure",
+            "bo_bb_width",
         ],
         "l1b_range_reversal_setup": [
-            "pa_ctx_setup_range_long",
-            "pa_ctx_setup_range_short",
             "pa_ctx_range_pressure",
             "bo_inside_prior",
             "bo_bb_width",
@@ -265,8 +249,6 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "pa_hsmm_duration_percentile",
         ],
         "l1b_failed_breakout_setup": [
-            "pa_ctx_setup_failed_breakout_long",
-            "pa_ctx_setup_failed_breakout_short",
             "bo_wick_imbalance",
             "bo_close_extremity",
             "bo_gap_signal",
@@ -275,6 +257,7 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "pa_garch_shock",
             "pa_egarch_vol_asymmetry",
             "pa_hmm_transition_pressure",
+            "pa_ctx_structure_veto",
         ],
         "l1b_setup_alignment": [
             "pa_ctx_setup_long",
@@ -289,8 +272,6 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "pa_egarch_std_residual",
         ],
         "l1b_follow_through_score": [
-            "pa_ctx_follow_through_long",
-            "pa_ctx_follow_through_short",
             "bo_consec_dir",
             "bo_body_growth",
             "bo_close_extremity",
@@ -299,10 +280,10 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
             "pa_lead_macd_hist_slope",
             "pa_hsmm_switch_hazard",
             "pa_egarch_std_residual",
+            "bo_gap_signal",
+            "bo_body_atr",
         ],
         "l1b_failure_risk": [
-            "pa_ctx_setup_failed_breakout_long",
-            "pa_ctx_setup_failed_breakout_short",
             "pa_ctx_premise_break_long",
             "pa_ctx_premise_break_short",
             "pa_ctx_structure_veto",
@@ -340,9 +321,32 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> list[str]:
         ],
     }.get(head)
     if preferred is None:
-        return list(feature_cols)
+        return list(feature_cols), False
     chosen = [c for c in preferred if c in feature_cols]
-    return chosen or list(feature_cols)
+    min_features = min(8, max(5, len(preferred) // 2))
+    if len(chosen) >= min_features:
+        return chosen, False
+    safe_fallback = [
+        c
+        for c in feature_cols
+        if c
+        not in {
+            "pa_ctx_setup_long",
+            "pa_ctx_setup_short",
+            "pa_ctx_setup_trend_long",
+            "pa_ctx_setup_trend_short",
+            "pa_ctx_setup_pullback_long",
+            "pa_ctx_setup_pullback_short",
+            "pa_ctx_setup_range_long",
+            "pa_ctx_setup_range_short",
+            "pa_ctx_setup_failed_breakout_long",
+            "pa_ctx_setup_failed_breakout_short",
+            "pa_ctx_follow_through_long",
+            "pa_ctx_follow_through_short",
+        }
+    ]
+    augmented = list(dict.fromkeys(chosen + safe_fallback[: max(0, min_features - len(chosen) + 4)]))
+    return augmented, True
 
 
 def _build_l1b_parule_semantic_heads(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) -> dict[str, np.ndarray]:
@@ -466,10 +470,18 @@ def _build_l1b_targets(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) 
     return targets, cross
 
 
-def _compute_l1b_deterministic_outputs(df: pd.DataFrame, cross: pd.DataFrame) -> pd.DataFrame:
+def _compute_l1b_deterministic_outputs(
+    df: pd.DataFrame,
+    cross: pd.DataFrame,
+    *,
+    cross_context_reliable: bool,
+) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     for col in L1B_DIRECT_CONTEXT_COLS:
-        out[col] = pd.to_numeric(cross[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        values = pd.to_numeric(cross[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        if not cross_context_reliable:
+            values = np.zeros(len(df), dtype=np.float32)
+        out[col] = values
     return out
 
 
@@ -522,13 +534,15 @@ def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray) -> None:
     print(f"    MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}  corr(y,pred)={cor:.4f}", flush=True)
 
 def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTrainingBundle:
-    work = df.copy(deep=False)
+    work = df.copy()
     feature_cols = _select_l1b_feature_cols(work, feat_cols)
     X = work[feature_cols].to_numpy(dtype=np.float32, copy=False)
     splits = build_stack_time_splits(work["time_key"])
     train_mask = splits.train_mask
-    val_mask = splits.cal_mask
+    val_mask = splits.l2_val_mask
+    cal_mask = splits.cal_mask
     targets, cross = _build_l1b_targets(work, fit_mask=train_mask)
+    cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")
     log_time_key_split(
@@ -537,8 +551,11 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         train_mask,
         val_mask,
         train_label="train (t < TRAIN_END)",
-        val_label="val (cal)",
-        extra_note=f"Expected train t in (-inf, {TRAIN_END}), val in [{TRAIN_END}, {CAL_END}).",
+        val_label="val (l2_val)",
+        extra_note=(
+            f"Primary L1b early stopping/reporting uses l2_val end-bars inside [{TRAIN_END}, {CAL_END}); "
+            f"full cal remains a secondary diagnostic."
+        ),
     )
     log_numpy_x_stats("L1b", X[train_mask], label="X[train]")
     print(f"  [L1b] target/output schema L1B_OUTPUT_COLS count={len(L1B_OUTPUT_COLS)}: {L1B_OUTPUT_COLS}", flush=True)
@@ -555,9 +572,17 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     model_map: dict[str, lgb.Booster] = {}
     constant_output_values: dict[str, float] = {}
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
-    outputs = pd.concat([outputs, _compute_l1b_deterministic_outputs(work, cross)], axis=1)
+    outputs = pd.concat(
+        [outputs, _compute_l1b_deterministic_outputs(work, cross, cross_context_reliable=cross_context_reliable)],
+        axis=1,
+    )
     print(f"  [L1b] model heads: {L1B_MODEL_HEADS}", flush=True)
     print(f"  [L1b] direct context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
+    if not cross_context_reliable:
+        print(
+            "  [L1b] cross-asset context deemed unreliable (too few symbols/rows); direct context heads will be zeroed.",
+            flush=True,
+        )
 
     for name, y in tqdm(
         [(head_name, targets[head_name]) for head_name in L1B_MODEL_HEADS],
@@ -569,9 +594,14 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     ):
         binary = name in L1B_BINARY_HEADS
         log_label_baseline(name, y[train_mask], task="cls" if binary else "reg")
-        head_feature_cols = _l1b_head_feature_cols(name, feature_cols)
+        head_feature_cols, used_fallback = _l1b_head_feature_cols(name, feature_cols)
         X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
         print(f"  [L1b] {name}: input_dim={len(head_feature_cols)}", flush=True)
+        if used_fallback:
+            print(
+                f"  [L1b] {name}: head-specific feature subset was sparse; augmented with safe fallback features.",
+                flush=True,
+            )
         params = {
             "objective": "binary" if binary else "regression",
             "metric": "binary_logloss" if binary else "l2",
@@ -609,10 +639,12 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         model_map[name] = model
         pred_full = model.predict(X_head).astype(np.float32)
         _l1b_val_report(name, y[val_mask], pred_full[val_mask])
+        if cal_mask.sum() != val_mask.sum():
+            _l1b_val_report(f"{name} [cal_full]", y[cal_mask], pred_full[cal_mask])
         outputs[name] = pred_full
 
     if model_map:
-        diagnose_l1b_leakage(model_map, feature_cols)
+        diagnose_l1b_leakage(model_map, {name: _l1b_head_feature_cols(name, feature_cols)[0] for name in model_map})
     for col in L1B_OUTPUT_COLS:
         if col not in outputs.columns:
             outputs[col] = 0.0
@@ -634,7 +666,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "deprecated_output_cols": [],
         "constant_output_values": constant_output_values,
         "model_files": model_files,
-        "head_feature_cols": {name: _l1b_head_feature_cols(name, feature_cols) for name in model_map},
+        "head_feature_cols": {name: _l1b_head_feature_cols(name, feature_cols)[0] for name in model_map},
+        "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": "current-bar and historical-context only; no future-price targets in L1b labels",
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
@@ -662,7 +695,7 @@ def load_l1b_market_descriptor() -> tuple[dict[str, lgb.Booster], dict[str, Any]
 
 
 def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy(deep=False)
+    work = df.copy()
     feature_cols = list(meta["feature_cols"])
     for col in feature_cols:
         if col not in work.columns:
@@ -677,7 +710,17 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
             "market_breadth": "l1b_market_breadth",
         }
     )
-    outputs = pd.concat([outputs, _compute_l1b_deterministic_outputs(work, cross)], axis=1)
+    outputs = pd.concat(
+        [
+            outputs,
+            _compute_l1b_deterministic_outputs(
+                work,
+                cross,
+                cross_context_reliable=bool(meta.get("cross_context_reliable", True)),
+            ),
+        ],
+        axis=1,
+    )
     for name, value in (meta.get("constant_output_values") or {}).items():
         outputs[name] = np.full(len(work), float(value), dtype=np.float32)
     head_feature_cols_map = meta.get("head_feature_cols") or {}

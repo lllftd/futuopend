@@ -8,6 +8,7 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -38,6 +39,7 @@ from core.trainers.lgbm_utils import (
     _decision_edge_atr_array,
     _lgb_round_tqdm_enabled,
     _lgb_train_callbacks_with_round_tqdm,
+    _live_trade_state_from_bar,
     _lgbm_n_jobs,
     _net_edge_atr_from_state,
     _optimal_exit_target_arrays,
@@ -64,7 +66,7 @@ from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 
 @dataclass
 class L3TrainingBundle:
-    models: dict[str, lgb.Booster]
+    models: dict[str, Any]
     meta: dict[str, Any]
 
 
@@ -140,6 +142,65 @@ def _kl_divergence(p: np.ndarray, q: np.ndarray) -> np.ndarray:
     return np.sum(p * (np.log(p) - np.log(q)), axis=1).astype(np.float32)
 
 
+def _split_l3_val_for_calibration(
+    t_state: pd.Series | np.ndarray,
+    val_mask: np.ndarray,
+    *,
+    tune_frac: float,
+    min_rows_each: int = 40,
+) -> tuple[np.ndarray, np.ndarray]:
+    base = np.asarray(val_mask, dtype=bool)
+    idx = np.flatnonzero(base)
+    tune_mask = np.zeros_like(base, dtype=bool)
+    report_mask = np.zeros_like(base, dtype=bool)
+    if idx.size == 0:
+        return tune_mask, report_mask
+    ts = np.asarray(pd.to_datetime(t_state))
+    idx = idx[np.argsort(ts[idx])]
+    if idx.size < 2 * min_rows_each:
+        tune_mask[idx] = True
+        report_mask[idx] = True
+        return tune_mask, report_mask
+    split = int(round(idx.size * float(np.clip(tune_frac, 0.2, 0.8))))
+    split = max(min_rows_each, min(idx.size - min_rows_each, split))
+    tune_mask[idx[:split]] = True
+    report_mask[idx[split:]] = True
+    return tune_mask, report_mask
+
+
+def _fit_l3_exit_calibrator(y_true: np.ndarray, raw_p: np.ndarray) -> IsotonicRegression | None:
+    y = np.asarray(y_true, dtype=np.int32).ravel()
+    p = np.clip(np.asarray(raw_p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
+    if y.size < 100 or len(np.unique(y)) < 2:
+        return None
+    calib = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    calib.fit(p, y.astype(np.float64))
+    return calib
+
+
+def _apply_l3_exit_calibrator(p: np.ndarray, calibrator: IsotonicRegression | None) -> np.ndarray:
+    arr = np.clip(np.asarray(p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
+    if calibrator is None:
+        return arr
+    return np.clip(np.asarray(calibrator.predict(arr), dtype=np.float64).ravel(), 0.0, 1.0)
+
+
+def _l3_entry_policy_config() -> tuple[float, float]:
+    min_conf = float(np.clip(float(os.environ.get("L3_ENTRY_MIN_CONFIDENCE", "0.0")), 0.0, 1.0))
+    min_size = float(max(0.0, float(os.environ.get("L3_ENTRY_MIN_SIZE", "0.05"))))
+    return min_conf, min_size
+
+
+def l3_entry_side_from_l2(decision_class: int, decision_confidence: float, size: float, *, min_confidence: float, min_size: float) -> float:
+    if float(size) < float(min_size) or float(decision_confidence) < float(min_confidence):
+        return 0.0
+    if int(decision_class) == 0:
+        return 1.0
+    if int(decision_class) == 2:
+        return -1.0
+    return 0.0
+
+
 def _build_l3_policy_dataset(
     df: pd.DataFrame,
     l1a_outputs: pd.DataFrame,
@@ -148,7 +209,7 @@ def _build_l3_policy_dataset(
     max_hold: int = 30,
     exit_epsilon_atr: float = 0.03,
     traj_cfg: L3TrajectoryConfig | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     merged = (
         df.reset_index(drop=True)
         .merge(l1a_outputs, on=["symbol", "time_key"], how="left")
@@ -174,10 +235,11 @@ def _build_l3_policy_dataset(
     tau_edge = 0.05  # same as L2 y_decision threshold
     pred_mfe = merged["l2_pred_mfe"].to_numpy(dtype=np.float32, copy=False)
     pred_mae = merged["l2_pred_mae"].to_numpy(dtype=np.float32, copy=False)
-    opt_exit = _optimal_exit_target_arrays(merged)[2].astype(np.int32)
+    opt_tp, opt_sl, opt_exit_bars = _optimal_exit_target_arrays(merged)
+    opt_exit = opt_exit_bars.astype(np.int32)
     opt_value = merged.get("optimal_net_edge_atr")
     if opt_value is None:
-        opt_value = _net_edge_atr_from_state(*_optimal_exit_target_arrays(merged))
+        opt_value = _net_edge_atr_from_state(opt_tp, opt_sl, opt_exit_bars)
     else:
         opt_value = pd.to_numeric(opt_value, errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
 
@@ -190,10 +252,12 @@ def _build_l3_policy_dataset(
     rows_value: list[float] = []
     rows_time: list[np.datetime64] = []
     rows_entry: list[int] = []
+    rows_from_model: list[int] = []
     rows_traj: list[np.ndarray] = []
     rows_traj_len: list[int] = []
     n_policy_signals_model = 0
     n_policy_signals_truth = 0
+    allow_truth_fallback = os.environ.get("L3_ALLOW_TRUTH_FALLBACK", "0").strip().lower() in {"1", "true", "yes"}
     _hold_bin_edges = np.array([3, 8, 15, 30, 999], dtype=np.int64)
     feature_cols = [
         "l2_decision_confidence",
@@ -216,6 +280,7 @@ def _build_l3_policy_dataset(
         "l3_hold_bars_sq",
         "l3_hold_bucket",
     ]
+    min_confidence, min_size = _l3_entry_policy_config()
 
     row_it = range(len(merged))
     if _lgb_round_tqdm_enabled():
@@ -231,7 +296,14 @@ def _build_l3_policy_dataset(
         if i + 1 >= len(merged) or symbols[i + 1] != symbols[i]:
             continue
         sz = float(size[i])
-        model_active = (int(decision_class[i]) != 1) and (sz > 0.05)
+        model_side = l3_entry_side_from_l2(
+            int(decision_class[i]),
+            float(decision_conf[i]),
+            sz,
+            min_confidence=min_confidence,
+            min_size=min_size,
+        )
+        model_active = model_side != 0.0
         ed = float(edge_atr[i])
         truth_dir = 1
         if ed > tau_edge:
@@ -240,12 +312,14 @@ def _build_l3_policy_dataset(
             truth_dir = 2
         truth_active = truth_dir != 1
         if model_active:
-            side = 1.0 if int(decision_class[i]) == 0 else -1.0
+            side = float(model_side)
             n_policy_signals_model += 1
-        elif truth_active:
-            # L2 probs can be almost always neutral (low gate) while labels still have edge — train exits on label paths.
+            from_model = 1
+        elif truth_active and allow_truth_fallback:
+            # Optional legacy fallback when L2 is too sparse; disabled by default to match deployment.
             side = 1.0 if truth_dir == 0 else -1.0
             n_policy_signals_truth += 1
+            from_model = 0
         else:
             continue
         entry_price = float(open_px[i + 1])
@@ -262,14 +336,14 @@ def _build_l3_policy_dataset(
             if symbols[j] != symbols[i]:
                 break
             hold = j - i
-            if side > 0:
-                fav = max(0.0, (high_px[j] - entry_price) / atr)
-                adv = max(0.0, (entry_price - low_px[j]) / atr)
-                unreal = (close_px[j] - entry_price) / atr
-            else:
-                fav = max(0.0, (entry_price - low_px[j]) / atr)
-                adv = max(0.0, (high_px[j] - entry_price) / atr)
-                unreal = (entry_price - close_px[j]) / atr
+            fav, adv, unreal = _live_trade_state_from_bar(
+                side=side,
+                entry_price=entry_price,
+                atr=atr,
+                high_price=float(high_px[j]),
+                low_price=float(low_px[j]),
+                close_price=float(close_px[j]),
+            )
             live_mfe = max(live_mfe, fav)
             live_mae = max(live_mae, adv)
             live_edge = float(_net_edge_atr_from_state(live_mfe, live_mae, hold))
@@ -337,6 +411,7 @@ def _build_l3_policy_dataset(
             rows_value.append(future_gain_left)
             rows_time.append(times[j])
             rows_entry.append(int(i))
+            rows_from_model.append(from_model)
             if hold >= opt_bar:
                 break
     if not rows_x:
@@ -354,10 +429,12 @@ def _build_l3_policy_dataset(
             np.empty(0, dtype=np.int64),
             np.empty((0, _t_max, _t_cfg.seq_feat_dim), dtype=np.float32),
             np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
         )
     print(
         f"  [L3] policy dataset: entry signals model={n_policy_signals_model:,} "
-        f"truth_edge_fallback={n_policy_signals_truth:,}  policy_rows={len(rows_x):,}",
+        f"truth_edge_fallback={n_policy_signals_truth:,}  policy_rows={len(rows_x):,}  "
+        f"allow_truth_fallback={allow_truth_fallback}  entry_min_conf={min_confidence:.2f}  entry_min_size={min_size:.2f}",
         flush=True,
     )
     if n_policy_signals_truth and not n_policy_signals_model:
@@ -375,6 +452,7 @@ def _build_l3_policy_dataset(
         np.asarray(rows_entry, dtype=np.int64),
         np.stack(rows_traj, axis=0).astype(np.float32, copy=False),
         np.asarray(rows_traj_len, dtype=np.int32),
+        np.asarray(rows_from_model, dtype=np.int32),
     )
 
 
@@ -402,11 +480,13 @@ def _log_l3_val_extended(
     test_mask: np.ndarray,
     exit_model: lgb.Booster,
     value_model: lgb.Booster,
+    *,
+    exit_calibrator: IsotonicRegression | None = None,
 ) -> None:
     vm = np.asarray(val_mask, dtype=bool)
     if int(vm.sum()) < 5:
         return
-    p_exit = np.clip(exit_model.predict(X[vm]).astype(np.float64), 1e-9, 1.0 - 1e-9)
+    p_exit = _apply_l3_exit_calibrator(exit_model.predict(X[vm]).astype(np.float64), exit_calibrator)
     yv = y_exit[vm].astype(np.int32)
     try:
         ll = float(log_loss(yv, p_exit))
@@ -521,7 +601,7 @@ def _log_l3_val_extended(
 
     tm = np.asarray(test_mask, dtype=bool)
     if int(tm.sum()) >= 5:
-        p_t = np.clip(exit_model.predict(X[tm]).astype(np.float64), 1e-9, 1.0 - 1e-9)
+        p_t = _apply_l3_exit_calibrator(exit_model.predict(X[tm]).astype(np.float64), exit_calibrator)
         yt = y_exit[tm].astype(np.int32)
         try:
             auc_t = float(roc_auc_score(yt, p_t))
@@ -532,7 +612,7 @@ def _log_l3_val_extended(
 
 def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_outputs: pd.DataFrame) -> L3TrainingBundle:
     traj_cfg = L3TrajectoryConfig()
-    X, y_exit, y_value, t_state, feature_cols, rows_entry, traj_seq, traj_len = _build_l3_policy_dataset(
+    X, y_exit, y_value, t_state, feature_cols, rows_entry, traj_seq, traj_len, rows_from_model = _build_l3_policy_dataset(
         df, l1a_outputs, l2_outputs, traj_cfg=traj_cfg
     )
     if len(X) == 0:
@@ -545,6 +625,10 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         raise RuntimeError("L3: not enough post-CAL_END state rows for strict OOT training.")
     train_mask, val_mask = _l3_oot_train_val_masks_by_trade(
         t_state, rows_entry, oot_mask, train_frac=0.7
+    )
+    val_tune_frac = float(os.environ.get("L3_VAL_TUNE_FRAC", "0.5"))
+    val_tune_mask, val_report_mask = _split_l3_val_for_calibration(
+        t_state, val_mask, tune_frac=val_tune_frac, min_rows_each=40
     )
     n_oot_tr = len(np.unique(rows_entry[oot_idx]))
     print(
@@ -562,12 +646,26 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         val_label="policy val (OOT trades, ~30% of distinct entries)",
         extra_note=f"Split by rows_entry (signal bar), not by policy row index. Times in [{CAL_END}, {TEST_END}); holdout t>={TEST_END}.",
     )
+    log_time_key_arrays(
+        "L3(calibration/report)",
+        pd.Series(t_state[val_tune_mask]),
+        pd.Series(t_state[val_report_mask]),
+        train_label="val_tune (exit calibration)",
+        val_label="val_report (headline metrics)",
+        extra_note="Exit probability calibration is fit on val_tune; headline validation metrics use val_report.",
+    )
     if test_mask.any():
         tt_hold = pd.Series(t_state[test_mask])
         print(
             f"  [L3] holdout samples: {int(test_mask.sum()):,}  time_key: [{tt_hold.min()}, {tt_hold.max()}]",
             flush=True,
         )
+    model_row_rate = float(np.mean(rows_from_model.astype(np.float64))) if len(rows_from_model) else float("nan")
+    print(
+        f"  [L3] policy rows from model entries={model_row_rate:.3f}  "
+        f"(fallback rows={int(np.sum(rows_from_model == 0)):,})",
+        flush=True,
+    )
     idx_div = feature_cols.index("l3_regime_divergence")
     div_all = np.asarray(X[:, idx_div], dtype=np.float64)
     fin = np.isfinite(div_all)
@@ -704,6 +802,10 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         l3_outer.update(1)
     finally:
         l3_outer.close()
+    exit_calibrator = _fit_l3_exit_calibrator(
+        y_exit[val_tune_mask],
+        exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64),
+    )
     if use_hybrid:
         st_sh, em_sh = l3_trajectory_embed_importance_ratio(exit_model, n_static, traj_cfg.embed_dim)
         st_v, em_v = l3_trajectory_embed_importance_ratio(value_model, n_static, traj_cfg.embed_dim)
@@ -718,18 +820,26 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         y_value,
         t_state,
         feature_cols,
-        val_mask,
+        val_report_mask,
         test_mask,
         exit_model,
         value_model,
+        exit_calibrator=exit_calibrator,
     )
     os.makedirs(MODEL_DIR, exist_ok=True)
     exit_model.save_model(os.path.join(MODEL_DIR, L3_EXIT_FILE))
     value_model.save_model(os.path.join(MODEL_DIR, L3_VALUE_FILE))
+    model_files: dict[str, str] = {"exit": L3_EXIT_FILE, "value": L3_VALUE_FILE}
+    if exit_calibrator is not None:
+        exit_calib_file = "l3_exit_calibrator.pkl"
+        with open(os.path.join(MODEL_DIR, exit_calib_file), "wb") as f:
+            pickle.dump(exit_calibrator, f)
+        model_files["exit_calibrator"] = exit_calib_file
+    entry_min_confidence, entry_min_size = _l3_entry_policy_config()
     meta = {
         "schema_version": L3_SCHEMA_VERSION,
         "feature_cols": feature_cols,
-        "model_files": {"exit": L3_EXIT_FILE, "value": L3_VALUE_FILE},
+        "model_files": model_files,
         "derived_features": [
             "l3_regime_divergence",
             "l3_vol_surprise",
@@ -738,6 +848,10 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             "l3_hold_bucket",
         ],
         "l3_hybrid": bool(use_hybrid),
+        "l3_val_tune_frac": val_tune_frac,
+        "l3_allow_truth_fallback": os.environ.get("L3_ALLOW_TRUTH_FALLBACK", "0").strip().lower() in {"1", "true", "yes"},
+        "l3_entry_min_confidence": entry_min_confidence,
+        "l3_entry_min_size": entry_min_size,
     }
     if use_hybrid:
         import torch
@@ -751,24 +865,38 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     with open(os.path.join(MODEL_DIR, L3_META_FILE), "wb") as f:
         pickle.dump(meta, f)
     print(
-        f"  [L3] strict OOT split: train={int(train_mask.sum()):,} val={int(val_mask.sum()):,} holdout={int(test_mask.sum()):,}",
+        f"  [L3] strict OOT split: train={int(train_mask.sum()):,} val={int(val_mask.sum()):,} "
+        f"(tune={int(val_tune_mask.sum()):,}, report={int(val_report_mask.sum()):,}) holdout={int(test_mask.sum()):,}",
         flush=True,
     )
     if test_mask.any():
-        prob = exit_model.predict(X_lgb[test_mask])
+        prob = _apply_l3_exit_calibrator(exit_model.predict(X_lgb[test_mask]), exit_calibrator)
         print(f"  [L3] test mean exit prob={float(np.mean(prob)):.4f}", flush=True)
     print(f"  [L3] meta saved -> {os.path.join(MODEL_DIR, L3_META_FILE)}", flush=True)
-    return L3TrainingBundle(models={"exit": exit_model, "value": value_model}, meta=meta)
+    bundle_models: dict[str, Any] = {"exit": exit_model, "value": value_model}
+    if exit_calibrator is not None:
+        bundle_models["exit_calibrator"] = exit_calibrator
+    return L3TrainingBundle(models=bundle_models, meta=meta)
 
 
-def load_l3_exit_manager() -> tuple[dict[str, lgb.Booster], dict[str, Any]]:
+def load_l3_exit_manager() -> tuple[dict[str, Any], dict[str, Any]]:
     with open(os.path.join(MODEL_DIR, L3_META_FILE), "rb") as f:
         meta = pickle.load(f)
+    if meta.get("schema_version") != L3_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"L3 schema mismatch: artifact has {meta.get('schema_version')} but code expects {L3_SCHEMA_VERSION}. "
+            f"Retrain L3 so artifacts match schema {L3_SCHEMA_VERSION}."
+        )
     model_files = meta.get("model_files", {})
-    models = {
+    models: dict[str, Any] = {
         name: lgb.Booster(model_file=os.path.join(MODEL_DIR, fname))
         for name, fname in model_files.items()
+        if name != "exit_calibrator"
     }
+    exit_calib_file = model_files.get("exit_calibrator")
+    if exit_calib_file:
+        with open(os.path.join(MODEL_DIR, exit_calib_file), "rb") as f:
+            models["exit_calibrator"] = pickle.load(f)
     return models, meta
 
 

@@ -319,6 +319,27 @@ def _net_edge_atr_from_state(
     return mfe * _theta_decay_from_bars(hold) - cfg["adverse_penalty"] * mae
 
 
+def _live_trade_state_from_bar(
+    *,
+    side: float,
+    entry_price: float,
+    atr: float,
+    high_price: float,
+    low_price: float,
+    close_price: float,
+) -> tuple[float, float, float]:
+    safe_atr = max(float(atr), 1e-6)
+    if float(side) > 0.0:
+        fav = max(0.0, (float(high_price) - float(entry_price)) / safe_atr)
+        adv = max(0.0, (float(entry_price) - float(low_price)) / safe_atr)
+        unreal = (float(close_price) - float(entry_price)) / safe_atr
+    else:
+        fav = max(0.0, (float(entry_price) - float(low_price)) / safe_atr)
+        adv = max(0.0, (float(high_price) - float(entry_price)) / safe_atr)
+        unreal = (float(entry_price) - float(close_price)) / safe_atr
+    return float(fav), float(adv), float(unreal)
+
+
 def _layer4_policy_feature_names(base_feature_cols: list[str]) -> list[str]:
     return list(base_feature_cols) + list(L4_POLICY_DYNAMIC_FEATURES)
 
@@ -605,6 +626,7 @@ __all__ = [
     "_lgbm_booster_feature_names",
     "_lgbm_n_jobs",
     "_mfe_mae_atr_arrays",
+    "_live_trade_state_from_bar",
     "_net_edge_atr_from_state",
     "_numeric_feature_cols_for_matrix",
     "_opp_regression_sample_weights",

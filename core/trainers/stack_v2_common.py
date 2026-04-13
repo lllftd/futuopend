@@ -105,6 +105,21 @@ def compute_transition_risk_labels(state_label: np.ndarray, symbols: np.ndarray,
     return labels
 
 
+def compute_transition_event_labels(state_label: np.ndarray, symbols: np.ndarray, *, horizon: int = 10) -> np.ndarray:
+    labels = np.zeros(len(state_label), dtype=np.float32)
+    state_label = np.asarray(state_label, dtype=np.int64)
+    symbols = np.asarray(symbols)
+    horizon = max(int(horizon), 1)
+    for sym in np.unique(symbols):
+        idx = np.flatnonzero(symbols == sym)
+        s = state_label[idx]
+        n = len(s)
+        for i in range(n):
+            future = s[i + 1 : min(n, i + 1 + horizon)]
+            labels[idx[i]] = float(np.any(future != s[i])) if future.size else 0.0
+    return labels
+
+
 def compute_cross_asset_context(df: pd.DataFrame) -> pd.DataFrame:
     work = df[["symbol", "time_key", "close"]].copy()
     work["ret_1"] = work.groupby("symbol")["close"].pct_change().fillna(0.0)
@@ -163,7 +178,7 @@ def log_label_baseline(head_name: str, y: np.ndarray, task: str = "auto") -> Non
         print(f"    WARNING: only {nuniq} unique rounded values; label may be degenerate.", flush=True)
 
 
-def diagnose_l1b_leakage(models: dict, feat_names: list[str]) -> tuple[list[str], list[str]]:
+def diagnose_l1b_leakage(models: dict, feat_names: dict[str, list[str]] | list[str]) -> tuple[list[str], list[str]]:
     """Summarize top feature concentration for trained L1b models."""
     print("\n  [L1b] leakage diagnostic", flush=True)
     print(f"  {'head':<30s} {'top1_feat':<30s} {'top1%':>7s} {'top3%':>7s}", flush=True)
@@ -171,6 +186,10 @@ def diagnose_l1b_leakage(models: dict, feat_names: list[str]) -> tuple[list[str]
     deterministic_heads: list[str] = []
     learned_heads: list[str] = []
     for head_name, model in models.items():
+        if isinstance(feat_names, dict):
+            head_feat_names = list(feat_names.get(head_name) or [])
+        else:
+            head_feat_names = list(feat_names)
         imp = np.asarray(model.feature_importance(importance_type="gain"), dtype=np.float64)
         total = float(np.sum(imp))
         if total <= 0.0:
@@ -180,7 +199,7 @@ def diagnose_l1b_leakage(models: dict, feat_names: list[str]) -> tuple[list[str]
         top1_idx = int(order[0])
         top1_pct = float(imp[top1_idx] / total)
         top3_pct = float(np.sum(imp[order[:3]]) / total)
-        top1_name = feat_names[top1_idx] if 0 <= top1_idx < len(feat_names) else f"feat[{top1_idx}]"
+        top1_name = head_feat_names[top1_idx] if 0 <= top1_idx < len(head_feat_names) else f"feat[{top1_idx}]"
         print(f"  {head_name:<30s} {top1_name:<30s} {top1_pct:>6.1%} {top3_pct:>6.1%}", flush=True)
         if top3_pct > 0.85:
             deterministic_heads.append(head_name)
