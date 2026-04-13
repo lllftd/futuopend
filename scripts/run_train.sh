@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run the dual-view stack training pipeline
 # Usage: ./scripts/run_train.sh [layer_name]
-# Example: ./scripts/run_train.sh layer1 (runs L1a -> L1b -> L2 -> L3)
-# Example: ./scripts/run_train.sh layer3 (reuses cached L1a/L2 outputs and trains only L3)
+#   layer1 | layer1a — train L1a → L1b → L2 → L3
+#   layer1b — load l1a_outputs.pkl, train L1b → L2 → L3
+#   layer2 — load l1a + l1b caches, train L2 → L3
+#   layer3 — load l1a + l2 caches, train L3 only
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,24 +21,20 @@ fi
 
 echo "================================================================="
 echo "  Starting Dual-View Training Pipeline from: $START_LAYER"
-echo "  Logs (overwrite each run, under $ROOT/logs/):"
+echo "  Logs (overwrite for stages that run, under $ROOT/logs/):"
 echo "    layer1a.log layer1b.log layer2.log layer3.log"
-if [[ "$START_LAYER" != "layer3" ]]; then
-  echo "  Note: current pipeline still retrains the full stack unless you start from layer3."
-fi
 echo "================================================================="
 
 mkdir -p "$ROOT/logs"
-# Pre-create log files so `tail -f` works immediately.
+# Pre-create log files so `tail -f` works immediately (only stages that will run).
 case "$START_LAYER" in
-  layer1)
+  layer1|layer1a)
     : > "$ROOT/logs/layer1a.log"
     : > "$ROOT/logs/layer1b.log"
     : > "$ROOT/logs/layer2.log"
     : > "$ROOT/logs/layer3.log"
     ;;
-  layer1a|layer1b)
-    : > "$ROOT/logs/layer1a.log"
+  layer1b)
     : > "$ROOT/logs/layer1b.log"
     : > "$ROOT/logs/layer2.log"
     : > "$ROOT/logs/layer3.log"
@@ -67,4 +65,4 @@ if [[ -z "$PY" ]]; then
 fi
 echo "  Python: $PY"
 
-FORCE_TQDM=1 "$PY" -m backtests.train_pipeline --start-from "$START_LAYER"
+FORCE_TQDM=1 "$PY" -u -m backtests.train_pipeline --start-from "$START_LAYER"

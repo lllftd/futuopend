@@ -4,7 +4,11 @@ import sys
 
 import torch
 
-from core.trainers.constants import L1A_OUTPUT_CACHE_FILE, L2_OUTPUT_CACHE_FILE
+from core.trainers.constants import (
+    L1A_OUTPUT_CACHE_FILE,
+    L1B_OUTPUT_CACHE_FILE,
+    L2_OUTPUT_CACHE_FILE,
+)
 from core.trainers.data_prep import prepare_dataset as prepare_lgbm_data
 from core.trainers.layer1a_market import train_l1a_market_encoder
 from core.trainers.layer1b_descriptor import train_l1b_market_descriptor
@@ -44,7 +48,7 @@ class Logger:
         sys.stderr = self.original_stderr
         self.log.close()
 
-# Fixed log filenames (overwrite each run): only these five under logs/
+# Fixed layer log filenames (overwrite each run) under logs/
 _LAYER_LOG_FILES = {
     "layer1a": "layer1a.log",
     "layer1b": "layer1b.log",
@@ -73,11 +77,15 @@ def run_lgbm_layers(start_from: str = "layer1"):
     print("  Dual-View Stack: L1a + L1b + L2 + L3")
     print("=" * 70)
 
+    sf = start_from.strip().lower()
+    if sf == "layer1":
+        sf = "layer1a"
+
     print(f"\n[*] Preparing LGBM dataset...")
     df, feat_cols = prepare_lgbm_data(["QQQ", "SPY"])
 
-    if start_from == "layer3":
-        print("\n[*] L3-only: loading cached L1a / L2 outputs from lgbm_models/ ...")
+    if sf == "layer3":
+        print("\n[*] start-from=layer3: load L1a + L2 output caches, train L3 only.")
         l1a_outputs = load_output_cache(L1A_OUTPUT_CACHE_FILE)
         l2_outputs = load_output_cache(L2_OUTPUT_CACHE_FILE)
         logger = setup_logger("layer3")
@@ -91,31 +99,41 @@ def run_lgbm_layers(start_from: str = "layer1"):
         print("=" * 70)
         return
 
-    logger = setup_logger("layer1a")
-    try:
-        print("\n[1a] --- Training L1a (Sequence Market Encoder) ---")
-        l1a_bundle = train_l1a_market_encoder(df, feat_cols)
-    finally:
-        logger.close()
+    if sf == "layer1a":
+        logger = setup_logger("layer1a")
+        try:
+            print("\n[1a] --- Training L1a (Sequence Market Encoder) ---")
+            l1a_bundle = train_l1a_market_encoder(df, feat_cols)
+        finally:
+            logger.close()
+        l1a_outputs = l1a_bundle.outputs
+    else:
+        print(f"\n[*] start-from={sf}: loading L1a outputs from {L1A_OUTPUT_CACHE_FILE} ...")
+        l1a_outputs = load_output_cache(L1A_OUTPUT_CACHE_FILE)
 
-    logger = setup_logger("layer1b")
-    try:
-        print("\n[1b] --- Training L1b (Tabular Market Descriptor) ---")
-        l1b_bundle = train_l1b_market_descriptor(df, feat_cols)
-    finally:
-        logger.close()
+    if sf in ("layer1a", "layer1b"):
+        logger = setup_logger("layer1b")
+        try:
+            print("\n[1b] --- Training L1b (Tabular Market Descriptor) ---")
+            l1b_bundle = train_l1b_market_descriptor(df, feat_cols)
+        finally:
+            logger.close()
+        l1b_outputs = l1b_bundle.outputs
+    else:
+        print(f"\n[*] start-from={sf}: loading L1b outputs from {L1B_OUTPUT_CACHE_FILE} ...")
+        l1b_outputs = load_output_cache(L1B_OUTPUT_CACHE_FILE)
 
     logger = setup_logger("layer2")
     try:
         print("\n[2] --- Training L2 (Trade Decision) ---")
-        l2_bundle = train_l2_trade_decision(df, l1a_bundle.outputs, l1b_bundle.outputs)
+        l2_bundle = train_l2_trade_decision(df, l1a_outputs, l1b_outputs)
     finally:
         logger.close()
 
     logger = setup_logger("layer3")
     try:
         print("\n[3] --- Training L3 (Exit Manager) ---")
-        train_l3_exit_manager(df, l1a_bundle.outputs, l2_bundle.outputs)
+        train_l3_exit_manager(df, l1a_outputs, l2_bundle.outputs)
     finally:
         logger.close()
 
@@ -131,8 +149,9 @@ def main():
         type=str,
         choices=["layer1", "layer1a", "layer1b", "layer2", "layer3"],
         default="layer1",
-        help="layer3: prepare data + train L3 only (requires l1a_outputs.pkl & l2_outputs.pkl in lgbm_models/). "
-        "Other values still run the full pipeline (CLI compatibility).",
+        help="layer1/layer1a: L1a→L3. layer1b: needs l1a_outputs.pkl, then L1b→L3. "
+        "layer2: needs l1a_outputs.pkl + l1b_outputs.pkl, then L2→L3. "
+        "layer3: needs l1a_outputs.pkl + l2_outputs.pkl, L3 only.",
     )
     args = parser.parse_args()
     run_lgbm_layers(start_from=args.start_from)
