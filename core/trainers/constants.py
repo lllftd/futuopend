@@ -68,9 +68,9 @@ REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 
 # New dual-view stack schema versions
 L1A_SCHEMA_VERSION = "1.2.0"
-L1B_SCHEMA_VERSION = "1.3.0"
-L2_SCHEMA_VERSION = "1.4.0"
-L3_SCHEMA_VERSION = "1.4.0"
+L1B_SCHEMA_VERSION = "1.4.0"
+L2_SCHEMA_VERSION = "1.6.0"
+L3_SCHEMA_VERSION = "1.7.0"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"
@@ -93,6 +93,7 @@ L3_EXIT_FILE = "l3_exit.txt"
 L3_VALUE_FILE = "l3_value.txt"
 L3_META_FILE = "l3_exit_meta.pkl"
 L3_TRAJECTORY_ENCODER_FILE = "l3_trajectory_encoder.pt"
+L3_POLICY_DATASET_CACHE_FILE = "l3_policy_dataset.pkl"
 PREPARED_DATASET_CACHE_FILE = "prepared_lgbm_dataset.pkl"
 
 # New stack feature / contract names

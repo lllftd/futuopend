@@ -28,7 +28,14 @@ from core.trainers.data_prep import ensure_breakout_features, ensure_structure_c
 from core.trainers.layer1a_market import infer_l1a_market_encoder, load_l1a_market_encoder
 from core.trainers.layer1b_descriptor import infer_l1b_market_descriptor, load_l1b_market_descriptor
 from core.trainers.layer2_decision import infer_l2_trade_decision, load_l2_trade_decision
-from core.trainers.layer3_exit import l3_entry_side_from_l2, load_l3_exit_manager, load_l3_trajectory_encoder_for_infer
+from core.trainers.layer3_exit import (
+    l3_entry_policy_params,
+    l3_entry_side_from_l2,
+    l3_exit_policy_params,
+    l3_should_exit_by_policy,
+    load_l3_exit_manager,
+    load_l3_trajectory_encoder_for_infer,
+)
 from core.trainers.l3_trajectory_hybrid import L3TrajRollingState, l3_single_trajectory_embedding
 from core.trainers.lgbm_utils import _live_trade_state_from_bar, _net_edge_atr_from_state
 from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
@@ -168,7 +175,7 @@ def run_single_symbol(
     dev = torch_device if torch_device is not None else TORCH_DEVICE
     hybrid = l3_traj_enc is not None and l3_traj_cfg is not None
     traj_buf: L3TrajRollingState | None = None
-    max_hold = 30
+    max_hold = int(l3_meta.get("l3_target_horizon_bars", 30))
     trades: list[dict[str, object]] = []
 
     in_pos = 0
@@ -177,14 +184,14 @@ def run_single_symbol(
     entry_atr = 1e-3
     entry_time = None
     hold = 0
-    entry_min_conf = float(l3_meta.get("l3_entry_min_confidence", 0.0))
-    entry_min_size = float(l3_meta.get("l3_entry_min_size", 0.05))
-
     for i in range(len(df) - 1):
         if in_pos == 0:
             cls = int(l2_out.loc[i, "l2_decision_class"])
             conf = float(l2_out.loc[i, "l2_decision_confidence"])
             size = float(l2_out.loc[i, "l2_size"])
+            regime_probs = l2_out.loc[i, [f"l2_entry_regime_{idx}" for idx in range(len(L1A_REGIME_COLS))]].to_numpy(dtype=np.float32)
+            entry_vol = float(l2_out.loc[i, "l2_entry_vol"])
+            entry_min_conf, entry_min_size, max_hold, _ = l3_entry_policy_params(regime_probs, entry_vol, l3_meta)
             side = l3_entry_side_from_l2(
                 cls,
                 conf,
@@ -241,7 +248,23 @@ def run_single_symbol(
             value_left = float(value_model.predict(feat_vec)[0])
             flip = int(l2_out.loc[i, "l2_decision_class"])
             flip_against = (in_pos == 1 and flip == 2) or (in_pos == -1 and flip == 0)
-            if exit_prob >= 0.55 and value_left <= 0.02 or flip_against or hold >= max_hold:
+            exit_state_probs = l1a_out.loc[i, L1A_REGIME_COLS].to_numpy(dtype=np.float32)
+            exit_state_vol = float(l1a_out.loc[i, "l1a_vol_forecast"])
+            exit_prob_threshold, value_left_threshold, state_max_hold, _, value_policy_mode, value_tie_margin = l3_exit_policy_params(
+                exit_state_probs,
+                exit_state_vol,
+                hold,
+                l3_meta,
+            )
+            policy_exit = l3_should_exit_by_policy(
+                exit_prob,
+                value_left,
+                exit_prob_threshold=exit_prob_threshold,
+                value_left_threshold=value_left_threshold,
+                value_policy_mode=value_policy_mode,
+                value_tie_margin=value_tie_margin,
+            )
+            if policy_exit or flip_against or hold >= state_max_hold:
                 exit_price = float(df["open"].iloc[i + 1])
                 ret = (exit_price / entry_price - 1.0) * in_pos
                 trades.append(
@@ -254,7 +277,7 @@ def run_single_symbol(
                         "exit_price": exit_price,
                         "return": ret,
                         "holding_bars": hold,
-                        "exit_reason": "Policy_Exit" if exit_prob >= 0.55 and value_left <= 0.02 else ("Signal_Flip" if flip_against else "Max_Hold"),
+                        "exit_reason": "Policy_Exit" if policy_exit else ("Signal_Flip" if flip_against else "Max_Hold"),
                     }
                 )
                 in_pos = 0

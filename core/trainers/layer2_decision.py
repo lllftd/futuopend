@@ -227,8 +227,13 @@ def _apply_binary_calibrator(p: np.ndarray, calibrator: IsotonicRegression | Non
 def _l2_hard_decision_from_gate_dir(gate_p: np.ndarray, dir_p: np.ndarray, thr: float) -> np.ndarray:
     gate_p = np.asarray(gate_p, dtype=np.float64).ravel()
     dir_p = np.asarray(dir_p, dtype=np.float64).ravel()
+    thr_arr = np.asarray(thr, dtype=np.float64)
+    if thr_arr.ndim == 0:
+        thr_arr = np.full(len(gate_p), float(thr_arr), dtype=np.float64)
+    else:
+        thr_arr = np.broadcast_to(thr_arr.reshape(-1), gate_p.shape)
     out = np.ones(len(gate_p), dtype=np.int64)
-    trade = gate_p >= thr
+    trade = gate_p >= thr_arr
     out[trade & (dir_p >= 0.5)] = 0
     out[trade & (dir_p < 0.5)] = 2
     return out
@@ -241,19 +246,30 @@ def _l2_predict_gate_dir_probs(
     *,
     trade_threshold: float,
     direction_head_type: str = "probability",
-    direction_temperature: float = 0.35,
+    direction_temperature: float | np.ndarray = 0.35,
     gate_calibrator: IsotonicRegression | None = None,
     gate_raw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gate_scores = gate_model.predict(X).astype(np.float64) if gate_raw is None else np.asarray(gate_raw, dtype=np.float64).ravel()
     gate_p = _apply_binary_calibrator(gate_scores, gate_calibrator)
+    thr_arr = np.asarray(trade_threshold, dtype=np.float64)
+    if thr_arr.ndim == 0:
+        thr_arr = np.full(len(X), float(thr_arr), dtype=np.float64)
+    else:
+        thr_arr = np.broadcast_to(thr_arr.reshape(-1), (len(X),))
     dir_p = np.full(len(X), 0.5, dtype=np.float64)
     if direction_model is not None:
-        m = gate_p >= trade_threshold
+        temp_arr = np.asarray(direction_temperature, dtype=np.float64)
+        if temp_arr.ndim == 0:
+            temp_arr = np.full(len(X), float(temp_arr), dtype=np.float64)
+        else:
+            temp_arr = np.broadcast_to(temp_arr.reshape(-1), (len(X),))
+        m = gate_p >= thr_arr
         if m.any():
             raw = direction_model.predict(X[m]).astype(np.float64)
             if direction_head_type == "signed_edge_regression":
-                dir_p[m] = _l2_direction_margin_to_prob(raw, temperature=direction_temperature)
+                dir_p[m] = _l2_direction_margin_to_prob(raw, temperature=1.0)
+                dir_p[m] = (1.0 / (1.0 + np.exp(-np.clip(raw / np.maximum(temp_arr[m], 1e-3), -12.0, 12.0)))).astype(np.float64)
             else:
                 dir_p[m] = raw
     decision_probs = _l2_compose_probs_from_gate_dir(gate_p, dir_p)
@@ -315,13 +331,22 @@ def _log_l2_two_stage_val_diagnostics(
     y_decision = np.asarray(y_decision, dtype=np.int64).ravel()
     gate_p = np.asarray(gate_p, dtype=np.float64).ravel()
     dir_p = np.asarray(dir_p, dtype=np.float64).ravel()
+    thr_arr = np.asarray(trade_threshold, dtype=np.float64)
+    if thr_arr.ndim == 0:
+        thr_arr = np.full(len(gate_p), float(thr_arr), dtype=np.float64)
+    else:
+        thr_arr = np.broadcast_to(thr_arr.reshape(-1), gate_p.shape)
     print("\n  [L2] val — two-stage gate", flush=True)
     try:
         auc_g = float(roc_auc_score(y_gate, gate_p))
     except ValueError:
         auc_g = float("nan")
-    pred_gate = (gate_p >= trade_threshold).astype(np.int32)
-    print(f"    gate AUC={auc_g:.4f}  threshold={trade_threshold:.2f}", flush=True)
+    pred_gate = (gate_p >= thr_arr).astype(np.int32)
+    print(
+        f"    gate AUC={auc_g:.4f}  threshold_mean={float(np.mean(thr_arr)):.4f}  "
+        f"threshold_pcts={np.round(np.percentile(thr_arr, [5, 50, 95]), 4).tolist()}",
+        flush=True,
+    )
     print(
         "    gate classification_report:\n"
         + classification_report(y_gate, pred_gate, target_names=["no_trade", "trade"], digits=4, zero_division=0),
@@ -332,7 +357,7 @@ def _log_l2_two_stage_val_diagnostics(
         if recall_trade < 0.15:
             print(f"    WARNING: trade recall={recall_trade:.3f} < 0.15 — consider lowering threshold", flush=True)
     act = y_dir >= 0
-    gated = act & (gate_p >= trade_threshold)
+    gated = act & (gate_p >= thr_arr)
     if gated.sum() >= 20:
         print("\n  [L2] val — direction (deploy path: gated active bars)", flush=True)
         yda = y_dir[gated].astype(np.int32)
@@ -344,7 +369,7 @@ def _log_l2_two_stage_val_diagnostics(
         pred_d = (dpa >= 0.5).astype(np.int32)
         print(
             f"    direction AUC={auc_d:.4f}  n_gated_active={int(gated.sum()):,}  "
-            f"coverage_of_true_active={float(np.mean(gate_p[act] >= trade_threshold)) if act.any() else 0.0:.3f}",
+            f"coverage_of_true_active={float(np.mean(gate_p[act] >= thr_arr[act])) if act.any() else 0.0:.3f}",
             flush=True,
         )
         print(
@@ -446,12 +471,26 @@ def _log_l2_extended_val_metrics(
             flush=True,
         )
     neutral_pred_rate = float(np.mean(pred == 1))
+    long_pred_rate = float(np.mean(pred == 0))
+    short_pred_rate = float(np.mean(pred == 2))
     if neutral_pred_rate > 0.95:
         print(f"    WARNING: still collapsing toward neutral ({100.0 * neutral_pred_rate:.1f}% predicted neutral)", flush=True)
     elif neutral_pred_rate > 0.85:
         print(f"    WARNING: borderline neutral-heavy predictions ({100.0 * neutral_pred_rate:.1f}%)", flush=True)
     else:
         print(f"    neutral prediction rate={100.0 * neutral_pred_rate:.1f}%", flush=True)
+    print(
+        f"    predicted class mix: long={100.0 * long_pred_rate:.1f}%  neutral={100.0 * neutral_pred_rate:.1f}%  "
+        f"short={100.0 * short_pred_rate:.1f}%",
+        flush=True,
+    )
+    active_pred = pred != 1
+    if active_pred.any():
+        print(
+            f"    active-side mix: long_share={float(np.mean(pred[active_pred] == 0)):.3f}  "
+            f"short_share={float(np.mean(pred[active_pred] == 2)):.3f}",
+            flush=True,
+        )
     R = frame[L1A_REGIME_COLS].to_numpy(dtype=np.float64)[vm]
     R = np.clip(R, 1e-12, 1.0)
     R = R / R.sum(axis=1, keepdims=True)
@@ -519,21 +558,33 @@ def _log_l2_l1b_ablation(
     if not vm.any():
         return
 
-    def _eval_probs(prob_mat: np.ndarray) -> tuple[float, float, float]:
+    def _eval_probs(gate_p: np.ndarray, dir_p: np.ndarray, prob_mat: np.ndarray) -> tuple[float, float, float, float, float]:
         Pv = np.asarray(prob_mat[vm], dtype=np.float64)
         Pv = np.clip(Pv, 1e-15, 1.0)
         Pv = Pv / Pv.sum(axis=1, keepdims=True)
         yv = np.asarray(y_decision[vm], dtype=np.int64)
+        thr_eval = np.asarray(trade_threshold, dtype=np.float32)
+        if thr_eval.ndim == 0:
+            thr_eval = np.full(int(np.sum(vm)), float(thr_eval), dtype=np.float32)
+        else:
+            thr_eval = np.asarray(thr_eval, dtype=np.float32).ravel()[vm]
         try:
             ll = float(log_loss(yv, Pv, labels=[0, 1, 2]))
         except ValueError:
             ll = float("nan")
-        pred = np.argmax(Pv, axis=1)
+        pred, _ = _l2_hard_decode_outputs(
+            gate_p=np.asarray(gate_p, dtype=np.float32)[vm],
+            dir_p=np.asarray(dir_p, dtype=np.float32)[vm],
+            decision_probs=Pv,
+            trade_threshold=thr_eval,
+        )
         f1m = float(f1_score(yv, pred, average="macro", zero_division=0))
         trade_rate = float(np.mean(pred != 1))
-        return ll, f1m, trade_rate
+        long_rate = float(np.mean(pred == 0))
+        short_rate = float(np.mean(pred == 2))
+        return ll, f1m, trade_rate, long_rate, short_rate
 
-    _, _, base_probs = _l2_predict_gate_dir_probs(
+    base_gate_p, base_dir_p, base_probs = _l2_predict_gate_dir_probs(
         gate_model,
         direction_model,
         X,
@@ -544,7 +595,7 @@ def _log_l2_l1b_ablation(
     )
     X_no_l1b = np.array(X, copy=True)
     X_no_l1b[:, l1b_idx] = 0.0
-    _, _, ablated_probs = _l2_predict_gate_dir_probs(
+    abl_gate_p, abl_dir_p, ablated_probs = _l2_predict_gate_dir_probs(
         gate_model,
         direction_model,
         X_no_l1b,
@@ -553,20 +604,23 @@ def _log_l2_l1b_ablation(
         direction_temperature=direction_temperature,
         gate_calibrator=gate_calibrator,
     )
-    base_ll, base_f1, base_trade = _eval_probs(base_probs)
-    abl_ll, abl_f1, abl_trade = _eval_probs(ablated_probs)
+    base_ll, base_f1, base_trade, base_long, base_short = _eval_probs(base_gate_p, base_dir_p, base_probs)
+    abl_ll, abl_f1, abl_trade, abl_long, abl_short = _eval_probs(abl_gate_p, abl_dir_p, ablated_probs)
     print("\n  [L2] l1b val ablation (zero l1b_* at inference)", flush=True)
     print(
-        f"    baseline:      log_loss={base_ll:.4f}  F1_macro={base_f1:.4f}  trade_rate={base_trade:.3f}",
+        f"    baseline:      log_loss={base_ll:.4f}  F1_macro={base_f1:.4f}  trade_rate={base_trade:.3f}  "
+        f"long_rate={base_long:.3f}  short_rate={base_short:.3f}",
         flush=True,
     )
     print(
-        f"    without_l1b:   log_loss={abl_ll:.4f}  F1_macro={abl_f1:.4f}  trade_rate={abl_trade:.3f}",
+        f"    without_l1b:   log_loss={abl_ll:.4f}  F1_macro={abl_f1:.4f}  trade_rate={abl_trade:.3f}  "
+        f"long_rate={abl_long:.3f}  short_rate={abl_short:.3f}",
         flush=True,
     )
     print(
         f"    delta(no_l1b-base):  log_loss={abl_ll - base_ll:+.4f}  F1_macro={abl_f1 - base_f1:+.4f}  "
-        f"trade_rate={abl_trade - base_trade:+.3f}",
+        f"trade_rate={abl_trade - base_trade:+.3f}  long_rate={abl_long - base_long:+.3f}  "
+        f"short_rate={abl_short - base_short:+.3f}",
         flush=True,
     )
 
@@ -581,6 +635,345 @@ def _session_context(df: pd.DataFrame) -> pd.DataFrame:
 
 def _l2_target_trade_rate() -> float:
     return float(np.clip(float(os.environ.get("L2_TARGET_TRADE_RATE", "0.10")), 0.08, 0.12))
+
+
+def _l2_decision_edge_tau() -> float:
+    return float(max(0.0, float(os.environ.get("STACK_DECISION_EDGE_TAU", "0.05"))))
+
+
+def _env_float_candidates(key: str, default: list[float], *, lo: float, hi: float) -> list[float]:
+    raw = os.environ.get(key, "").strip()
+    vals = default
+    if raw:
+        parsed: list[float] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            parsed.append(float(part))
+        if parsed:
+            vals = parsed
+    clipped = sorted({float(np.clip(v, lo, hi)) for v in vals})
+    return clipped or [float(np.clip(default[0], lo, hi))]
+
+
+def _policy_vol_quantiles(values: np.ndarray, *, fit_mask: np.ndarray | None = None, n_buckets: int = 3) -> list[float]:
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    mask = np.isfinite(arr)
+    if fit_mask is not None:
+        mask &= np.asarray(fit_mask, dtype=bool).ravel()
+    finite = arr[mask]
+    if finite.size == 0:
+        finite = arr[np.isfinite(arr)]
+    if finite.size == 0 or n_buckets <= 1:
+        return []
+    qs = np.linspace(0.0, 1.0, int(n_buckets) + 1)[1:-1]
+    return [float(np.quantile(finite, q)) for q in qs]
+
+
+def _bucketize_by_quantiles(values: np.ndarray, quantiles: list[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    if not quantiles:
+        return np.zeros(len(arr), dtype=np.int32)
+    bins = np.asarray(sorted(float(x) for x in quantiles), dtype=np.float64)
+    safe = np.nan_to_num(arr, nan=float(np.nanmedian(arr[np.isfinite(arr)])) if np.isfinite(arr).any() else 0.0)
+    return np.searchsorted(bins, safe, side="right").astype(np.int32)
+
+
+def _regime_ids_from_probs(regime_probs: np.ndarray) -> np.ndarray:
+    probs = np.asarray(regime_probs, dtype=np.float64)
+    if probs.ndim != 2 or probs.shape[1] == 0:
+        return np.zeros(len(probs), dtype=np.int32)
+    safe = np.nan_to_num(probs, nan=0.0)
+    return np.argmax(safe, axis=1).astype(np.int32)
+
+
+def _state_keys_from_regime_vol(regime_probs: np.ndarray, vol_values: np.ndarray, *, vol_quantiles: list[float]) -> np.ndarray:
+    reg = _regime_ids_from_probs(regime_probs)
+    vb = _bucketize_by_quantiles(vol_values, vol_quantiles)
+    return np.asarray([f"r{int(r)}_v{int(v)}" for r, v in zip(reg, vb)], dtype=object)
+
+
+def _l2_policy_state_keys(frame: pd.DataFrame, *, vol_quantiles: list[float]) -> np.ndarray:
+    regime_probs = frame[L1A_REGIME_COLS].to_numpy(dtype=np.float32, copy=False)
+    vol_values = frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
+    return _state_keys_from_regime_vol(regime_probs, vol_values, vol_quantiles=vol_quantiles)
+
+
+def _l2_conditional_policy_arrays(meta: dict[str, Any], frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    vol_quantiles = [float(x) for x in (meta.get("policy_state_vol_quantiles") or [])]
+    state_keys = _l2_policy_state_keys(frame, vol_quantiles=vol_quantiles)
+    by_state = meta.get("conditional_policy_by_state") or {}
+    n = len(frame)
+    thr = np.full(n, float(meta.get("trade_threshold", 0.35)), dtype=np.float32)
+    temp = np.full(n, float(meta.get("direction_temperature", 0.35)), dtype=np.float32)
+    reward = np.full(n, float(meta.get("expected_edge_reward_mult", 1.0)), dtype=np.float32)
+    risk = np.full(n, float(meta.get("expected_edge_risk_mult", 1.0)), dtype=np.float32)
+    for key, params in by_state.items():
+        m = state_keys == key
+        if not np.any(m):
+            continue
+        thr[m] = float(params.get("trade_threshold", thr[m][0]))
+        temp[m] = float(params.get("direction_temperature", temp[m][0]))
+        reward[m] = float(params.get("expected_edge_reward_mult", reward[m][0]))
+        risk[m] = float(params.get("expected_edge_risk_mult", risk[m][0]))
+    return state_keys, thr, temp, reward, risk
+
+
+def _conditional_tau_from_state(
+    frame: pd.DataFrame,
+    edge: np.ndarray,
+    train_mask: np.ndarray,
+) -> tuple[float, list[float], dict[str, float], np.ndarray]:
+    base_tau = _l2_decision_edge_tau()
+    target_trade = _l2_target_trade_rate()
+    tau_quantile = float(np.clip(1.0 - 2.0 * target_trade, 0.55, 0.90))
+    vol_quantiles = _policy_vol_quantiles(frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False), fit_mask=train_mask)
+    state_keys = _l2_policy_state_keys(frame, vol_quantiles=vol_quantiles)
+    edge_abs = np.abs(np.asarray(edge, dtype=np.float64).ravel())
+    train = np.asarray(train_mask, dtype=bool)
+    finite_train = train & np.isfinite(edge_abs)
+    global_tau = float(np.quantile(edge_abs[finite_train], tau_quantile)) if finite_train.any() else base_tau
+    global_tau = float(max(base_tau * 0.5, global_tau))
+    state_map: dict[str, float] = {}
+    min_rows = max(80, int(os.environ.get("L2_CONDITIONAL_TAU_MIN_ROWS", "120")))
+    for key in np.unique(state_keys[train]):
+        m = finite_train & (state_keys == key)
+        if int(np.sum(m)) < min_rows:
+            continue
+        state_tau = float(np.quantile(edge_abs[m], tau_quantile))
+        state_map[str(key)] = float(np.clip(state_tau, base_tau * 0.5, max(base_tau * 3.0, global_tau * 2.0)))
+    tau_row = np.full(len(frame), global_tau, dtype=np.float32)
+    for key, val in state_map.items():
+        tau_row[state_keys == key] = float(val)
+    print(
+        f"  [L2] conditional decision tau: base={base_tau:.4f}  global={global_tau:.4f}  "
+        f"states={len(state_map)}  vol_quantiles={np.round(vol_quantiles, 4).tolist()}",
+        flush=True,
+    )
+    return global_tau, vol_quantiles, state_map, tau_row
+
+
+def _l2_expected_edge_proxy(
+    gate_p: np.ndarray,
+    dir_p: np.ndarray,
+    size_pred: np.ndarray,
+    mfe_pred: np.ndarray,
+    mae_pred: np.ndarray,
+    *,
+    reward_mult: float,
+    risk_mult: float,
+) -> np.ndarray:
+    gate = np.asarray(gate_p, dtype=np.float64).ravel()
+    direction = np.asarray(dir_p, dtype=np.float64).ravel()
+    size = np.asarray(size_pred, dtype=np.float64).ravel()
+    mfe = np.asarray(mfe_pred, dtype=np.float64).ravel()
+    mae = np.asarray(mae_pred, dtype=np.float64).ravel()
+    signed_dir = np.clip(2.0 * direction - 1.0, -1.0, 1.0)
+    reward = np.asarray(reward_mult, dtype=np.float64)
+    if reward.ndim == 0:
+        reward = np.full(len(gate), float(reward), dtype=np.float64)
+    else:
+        reward = np.broadcast_to(reward.reshape(-1), gate.shape)
+    risk = np.asarray(risk_mult, dtype=np.float64)
+    if risk.ndim == 0:
+        risk = np.full(len(gate), float(risk), dtype=np.float64)
+    else:
+        risk = np.broadcast_to(risk.reshape(-1), gate.shape)
+    payoff = reward * mfe - risk * mae
+    edge = gate * size * signed_dir * payoff
+    return np.clip(edge, -5.0, 5.0).astype(np.float32)
+
+
+def _l2_search_policy_params(
+    gate_p: np.ndarray,
+    dir_raw: np.ndarray | None,
+    y_decision: np.ndarray,
+    true_edge: np.ndarray,
+    size_pred: np.ndarray,
+    mfe_pred: np.ndarray,
+    mae_pred: np.ndarray,
+) -> dict[str, float]:
+    gate = np.asarray(gate_p, dtype=np.float64).ravel()
+    truth = np.asarray(y_decision, dtype=np.int64).ravel()
+    edge = np.asarray(true_edge, dtype=np.float64).ravel()
+    size = np.asarray(size_pred, dtype=np.float64).ravel()
+    mfe = np.asarray(mfe_pred, dtype=np.float64).ravel()
+    mae = np.asarray(mae_pred, dtype=np.float64).ravel()
+    valid = np.isfinite(gate) & np.isfinite(edge) & np.isfinite(size) & np.isfinite(mfe) & np.isfinite(mae)
+    if not valid.any():
+        return {
+            "trade_threshold": 0.35,
+            "target_trade_rate": _l2_target_trade_rate(),
+            "direction_temperature": 0.35,
+            "expected_edge_reward_mult": 1.0,
+            "expected_edge_risk_mult": 1.0,
+        }
+    gate = gate[valid]
+    truth = truth[valid]
+    edge = edge[valid]
+    size = size[valid]
+    mfe = mfe[valid]
+    mae = mae[valid]
+    base_temp = float(os.environ.get("L2_DIRECTION_TEMPERATURE", "0.35"))
+    target = _l2_target_trade_rate()
+    target_rates = _env_float_candidates(
+        "L2_TARGET_TRADE_RATE_GRID",
+        [max(0.06, target - 0.02), target, min(0.18, target + 0.02)],
+        lo=0.04,
+        hi=0.20,
+    )
+    temps = [base_temp]
+    if dir_raw is not None:
+        temps = _env_float_candidates(
+            "L2_DIRECTION_TEMPERATURE_GRID",
+            [max(0.10, base_temp * 0.7), base_temp, min(1.25, base_temp * 1.5)],
+            lo=0.05,
+            hi=2.0,
+        )
+        dir_raw = np.asarray(dir_raw, dtype=np.float64).ravel()[valid]
+    reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [0.85, 1.0, 1.15], lo=0.10, hi=3.0)
+    risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [0.85, 1.0, 1.15], lo=0.10, hi=3.0)
+    true_active = truth != 1
+    true_long_share = float(np.mean(truth[true_active] == 0)) if true_active.any() else 0.5
+    best: dict[str, float] | None = None
+    best_score = -1e18
+    print("\n  [L2] policy search on val_tune", flush=True)
+    print(
+        f"    target_rates={np.round(target_rates, 4).tolist()}  temps={np.round(temps, 4).tolist()}  "
+        f"reward_mults={np.round(reward_mults, 4).tolist()}  risk_mults={np.round(risk_mults, 4).tolist()}",
+        flush=True,
+    )
+    for temp in temps:
+        dir_p = np.full(len(gate), 0.5, dtype=np.float64)
+        if dir_raw is not None:
+            dir_p = _l2_direction_margin_to_prob(dir_raw, temperature=temp)
+        for target_rate in target_rates:
+            thr = float(np.quantile(gate, 1.0 - target_rate))
+            decision_probs = _l2_compose_probs_from_gate_dir(gate, dir_p)
+            pred, _ = _l2_hard_decode_outputs(
+                gate_p=gate.astype(np.float32),
+                dir_p=dir_p.astype(np.float32),
+                decision_probs=decision_probs,
+                trade_threshold=thr,
+            )
+            trade_rate = float(np.mean(pred != 1))
+            f1m = float(f1_score(truth, pred, average="macro", zero_division=0))
+            active_pred = pred != 1
+            long_share = float(np.mean(pred[active_pred] == 0)) if active_pred.any() else true_long_share
+            exp_edge = _l2_expected_edge_proxy(
+                gate,
+                dir_p,
+                size,
+                mfe,
+                mae,
+                reward_mult=1.0,
+                risk_mult=1.0,
+            )
+            for reward_mult in reward_mults:
+                for risk_mult in risk_mults:
+                    exp_edge = _l2_expected_edge_proxy(
+                        gate,
+                        dir_p,
+                        size,
+                        mfe,
+                        mae,
+                        reward_mult=reward_mult,
+                        risk_mult=risk_mult,
+                    )
+                    corr_all = pearson_corr(exp_edge, edge)
+                    corr_active = pearson_corr(exp_edge[active_pred], edge[active_pred]) if active_pred.any() else float("nan")
+                    sign_acc = (
+                        float(np.mean(np.sign(exp_edge[active_pred]) == np.sign(edge[active_pred])))
+                        if active_pred.any()
+                        else 0.0
+                    )
+                    trade_pen = abs(trade_rate - target_rate)
+                    balance_pen = abs(long_share - true_long_share)
+                    score = (
+                        1.20 * float(np.nan_to_num(corr_active, nan=-1.0))
+                        + 0.70 * float(np.nan_to_num(corr_all, nan=-1.0))
+                        + 0.45 * f1m
+                        + 0.20 * sign_acc
+                        - 0.35 * trade_pen
+                        - 0.20 * balance_pen
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best = {
+                            "trade_threshold": thr,
+                            "target_trade_rate": float(target_rate),
+                            "direction_temperature": float(temp),
+                            "expected_edge_reward_mult": float(reward_mult),
+                            "expected_edge_risk_mult": float(risk_mult),
+                            "score": float(score),
+                            "trade_rate": float(trade_rate),
+                            "long_share_active": float(long_share),
+                            "corr_all": float(np.nan_to_num(corr_all, nan=0.0)),
+                            "corr_active": float(np.nan_to_num(corr_active, nan=0.0)),
+                            "f1_macro": float(f1m),
+                            "sign_acc_active": float(sign_acc),
+                        }
+    if best is None:
+        best = {
+            "trade_threshold": 0.35,
+            "target_trade_rate": target,
+            "direction_temperature": base_temp,
+            "expected_edge_reward_mult": 1.0,
+            "expected_edge_risk_mult": 1.0,
+            "score": float("nan"),
+            "trade_rate": float("nan"),
+            "long_share_active": float("nan"),
+            "corr_all": float("nan"),
+            "corr_active": float("nan"),
+            "f1_macro": float("nan"),
+            "sign_acc_active": float("nan"),
+        }
+    print(
+        f"  [L2] selected policy: thr={best['trade_threshold']:.4f}  target_trade_rate={best['target_trade_rate']:.3f}  "
+        f"temp={best['direction_temperature']:.3f}  reward_mult={best['expected_edge_reward_mult']:.3f}  "
+        f"risk_mult={best['expected_edge_risk_mult']:.3f}  realized_trade_rate={best['trade_rate']:.3f}  "
+        f"corr_active={best['corr_active']:.4f}  F1_macro={best['f1_macro']:.4f}",
+        flush=True,
+    )
+    return best
+
+
+def _l2_search_conditional_policy(
+    state_keys: np.ndarray,
+    gate_p: np.ndarray,
+    dir_raw: np.ndarray | None,
+    y_decision: np.ndarray,
+    true_edge: np.ndarray,
+    size_pred: np.ndarray,
+    mfe_pred: np.ndarray,
+    mae_pred: np.ndarray,
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    global_policy = _l2_search_policy_params(gate_p, dir_raw, y_decision, true_edge, size_pred, mfe_pred, mae_pred)
+    keys = np.asarray(state_keys, dtype=object).ravel()
+    valid = np.isfinite(np.asarray(gate_p, dtype=np.float64).ravel())
+    keys = keys[valid]
+    by_state: dict[str, dict[str, float]] = {}
+    min_rows = max(80, int(os.environ.get("L2_POLICY_MIN_STATE_ROWS", "140")))
+    unique_keys = sorted({str(k) for k in keys.tolist()})
+    if unique_keys:
+        print(f"  [L2] conditional policy search: candidate_states={len(unique_keys)}  min_rows={min_rows}", flush=True)
+    for key in unique_keys:
+        m = keys == key
+        if int(np.sum(m)) < min_rows:
+            continue
+        state_policy = _l2_search_policy_params(
+            np.asarray(gate_p, dtype=np.float64).ravel()[valid][m],
+            None if dir_raw is None else np.asarray(dir_raw, dtype=np.float64).ravel()[valid][m],
+            np.asarray(y_decision, dtype=np.int64).ravel()[valid][m],
+            np.asarray(true_edge, dtype=np.float64).ravel()[valid][m],
+            np.asarray(size_pred, dtype=np.float64).ravel()[valid][m],
+            np.asarray(mfe_pred, dtype=np.float64).ravel()[valid][m],
+            np.asarray(mae_pred, dtype=np.float64).ravel()[valid][m],
+        )
+        by_state[key] = state_policy
+    print(f"  [L2] conditional policy states learned={len(by_state)}", flush=True)
+    return global_policy, by_state
 
 
 def _quantile_rescale_01(
@@ -690,10 +1083,10 @@ def train_l2_trade_decision(
 
     edge = _decision_edge_atr_array(df)
     mfe, mae = _mfe_mae_atr_arrays(df)
-    tau = 0.05
+    tau_global, policy_vol_quantiles, decision_tau_by_state, tau_row = _conditional_tau_from_state(frame, edge, train_mask)
     y_decision = np.full(len(df), 1, dtype=np.int64)
-    y_decision[edge > tau] = 0
-    y_decision[edge < -tau] = 2
+    y_decision[edge > tau_row] = 0
+    y_decision[edge < -tau_row] = 2
     rr = np.clip(mfe / np.maximum(mae, 0.10), 0.0, 4.0)
     size_raw = np.clip(np.abs(edge), 0.0, 1.5) * (rr / (1.0 + rr)) * np.exp(-0.35 * np.clip(mae, 0.0, 4.0))
     active_train = train_mask & (y_decision != 1)
@@ -741,7 +1134,7 @@ def train_l2_trade_decision(
         flush=True,
     )
     print(
-        "  [L2] note: l1a_*/l1b_* here come from in-memory outputs (full-history forward in this run), not time-OOF caches.",
+        "  [L2] note: l1a_*/l1b_* come from supplied upstream outputs; preferred pipeline path uses frozen-artifact inference caches.",
         flush=True,
     )
     print(f"  [L2] will write: {artifact_path(L2_META_FILE)} | {artifact_path(L2_OUTPUT_CACHE_FILE)}", flush=True)
@@ -942,29 +1335,56 @@ def train_l2_trade_decision(
         l2_outer.close()
 
     gate_raw_all = gate_model.predict(X).astype(np.float64)
+    dir_raw_all = direction_model.predict(X).astype(np.float64) if direction_model is not None else None
     gate_calibrator = _fit_binary_calibrator(y_gate[val_tune_mask], gate_raw_all[val_tune_mask])
-    gate_p_tune = _apply_binary_calibrator(gate_raw_all[val_tune_mask], gate_calibrator)
-    trade_threshold = _search_l2_trade_threshold(
-        gate_p_tune,
-        target_trade_rate=_l2_target_trade_rate(),
+    size_pred = np.clip(size_model.predict(X).astype(np.float32), 0.0, 1.0)
+    mfe_pred = np.clip(mfe_model.predict(X).astype(np.float32), 0.0, 5.0)
+    mae_pred = np.clip(mae_model.predict(X).astype(np.float32), 0.0, 4.0)
+    state_keys_all = _l2_policy_state_keys(frame, vol_quantiles=policy_vol_quantiles)
+    policy, conditional_policy_by_state = _l2_search_conditional_policy(
+        state_keys_all[val_tune_mask],
+        _apply_binary_calibrator(gate_raw_all[val_tune_mask], gate_calibrator),
+        None if dir_raw_all is None else dir_raw_all[val_tune_mask],
+        y_decision[val_tune_mask],
+        edge[val_tune_mask],
+        size_pred[val_tune_mask],
+        mfe_pred[val_tune_mask],
+        mae_pred[val_tune_mask],
     )
+    trade_threshold = float(policy["trade_threshold"])
+    direction_temperature = float(policy["direction_temperature"])
+    expected_edge_reward_mult = float(policy["expected_edge_reward_mult"])
+    expected_edge_risk_mult = float(policy["expected_edge_risk_mult"])
     gate_thr_after_search = float(trade_threshold)
     if direction_model is None:
         bump, cap = _l2_no_direction_gate_bump_cap()
         trade_threshold = float(min(cap, gate_thr_after_search + bump))
+        for params in conditional_policy_by_state.values():
+            params["trade_threshold"] = float(min(cap, float(params.get("trade_threshold", trade_threshold)) + bump))
         print(
             f"  [L2] direction head skipped: raising gate trade_threshold "
             f"{gate_thr_after_search:.2f} -> {trade_threshold:.2f} "
             f"(bump={bump:.2f}, cap={cap:.2f}); composed long/short split is degenerate at d=0.5",
             flush=True,
         )
+    _, trade_threshold_arr_all, direction_temperature_arr_all, reward_arr_all, risk_arr_all = _l2_conditional_policy_arrays(
+        {
+            "trade_threshold": trade_threshold,
+            "direction_temperature": direction_temperature,
+            "expected_edge_reward_mult": expected_edge_reward_mult,
+            "expected_edge_risk_mult": expected_edge_risk_mult,
+            "policy_state_vol_quantiles": policy_vol_quantiles,
+            "conditional_policy_by_state": conditional_policy_by_state,
+        },
+        frame,
+    )
     gate_p_report, dir_p_report, _ = _l2_predict_gate_dir_probs(
         gate_model,
         direction_model,
         X[val_report_mask],
-        trade_threshold=trade_threshold,
+        trade_threshold=trade_threshold_arr_all[val_report_mask],
         direction_head_type="signed_edge_regression",
-        direction_temperature=0.35,
+        direction_temperature=direction_temperature_arr_all[val_report_mask],
         gate_calibrator=gate_calibrator,
     )
     _log_l2_two_stage_val_diagnostics(
@@ -973,26 +1393,23 @@ def train_l2_trade_decision(
         y_gate[val_report_mask],
         y_dir[val_report_mask],
         y_decision[val_report_mask],
-        trade_threshold,
+        trade_threshold_arr_all[val_report_mask],
     )
     gate_p_all, dir_p_all, decision_probs = _l2_predict_gate_dir_probs(
         gate_model,
         direction_model,
         X,
-        trade_threshold=trade_threshold,
+        trade_threshold=trade_threshold_arr_all,
         direction_head_type="signed_edge_regression",
-        direction_temperature=0.35,
+        direction_temperature=direction_temperature_arr_all,
         gate_calibrator=gate_calibrator,
         gate_raw=gate_raw_all,
     )
-    size_pred = np.clip(size_model.predict(X).astype(np.float32), 0.0, 1.0)
-    mfe_pred = np.clip(mfe_model.predict(X).astype(np.float32), 0.0, 5.0)
-    mae_pred = np.clip(mae_model.predict(X).astype(np.float32), 0.0, 4.0)
     hard_decision_class, decision_confidence = _l2_hard_decode_outputs(
         gate_p=gate_p_all,
         dir_p=dir_p_all,
         decision_probs=decision_probs,
-        trade_threshold=trade_threshold,
+        trade_threshold=trade_threshold_arr_all,
     )
     _log_l2_extended_val_metrics(
         frame,
@@ -1014,9 +1431,9 @@ def train_l2_trade_decision(
         y_decision,
         gate_model,
         direction_model,
-        trade_threshold=trade_threshold,
+        trade_threshold=trade_threshold_arr_all,
         direction_head_type="signed_edge_regression",
-        direction_temperature=0.35,
+        direction_temperature=direction_temperature_arr_all,
         gate_calibrator=gate_calibrator,
     )
     outputs = df[["symbol", "time_key"]].copy()
@@ -1032,7 +1449,15 @@ def train_l2_trade_decision(
     for idx in range(NUM_REGIME_CLASSES):
         outputs[f"l2_entry_regime_{idx}"] = entry_regime[:, idx]
     outputs["l2_entry_vol"] = frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
-    outputs["l2_expected_edge"] = (outputs["l2_decision_long"] - outputs["l2_decision_short"]) * outputs["l2_size"]
+    outputs["l2_expected_edge"] = _l2_expected_edge_proxy(
+        gate_p_all,
+        dir_p_all,
+        size_pred,
+        mfe_pred,
+        mae_pred,
+        reward_mult=reward_arr_all,
+        risk_mult=risk_arr_all,
+    )
     outputs["l2_rr_proxy"] = outputs["l2_pred_mfe"] / np.maximum(outputs["l2_pred_mae"], 0.05)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -1060,15 +1485,23 @@ def train_l2_trade_decision(
         "feature_cols": feature_cols,
         "output_cols": L2_OUTPUT_COLS,
         "decision_mode": "two_stage",
-        "decision_tau": tau,
+        "decision_tau": tau_global,
+        "decision_tau_global": tau_global,
+        "decision_tau_by_state": decision_tau_by_state,
+        "policy_state_vol_quantiles": policy_vol_quantiles,
+        "conditional_policy_by_state": conditional_policy_by_state,
         "trade_threshold": trade_threshold,
-        "trade_threshold_applies_to": "gate_probability",
+        "trade_threshold_applies_to": "gate_probability (state-conditioned overrides allowed)",
         "direction_available": direction_model is not None,
         "direction_head_type": "signed_edge_regression" if direction_model is not None else "none",
-        "direction_temperature": 0.35,
+        "direction_temperature": direction_temperature,
         "confidence_semantics": "hard-decode aligned; neutral uses 1-gate, active uses max(gate, composed class prob)",
-        "decision_class_semantics": "hard two-stage decode: gate_p>=trade_threshold triggers trade, then dir_p>=0.5 picks long else short",
+        "decision_class_semantics": "hard two-stage decode with state-conditioned thresholds: gate_p>=trade_threshold(state) triggers trade, then dir_p>=0.5 picks long else short",
         "size_semantics": "risk_adjusted_position_fraction",
+        "expected_edge_reward_mult": expected_edge_reward_mult,
+        "expected_edge_risk_mult": expected_edge_risk_mult,
+        "expected_edge_semantics": "gate * size * signed_dir * (reward_mult * pred_mfe - risk_mult * pred_mae)",
+        "policy_search": policy,
         "model_files": model_files,
         "output_cache_file": L2_OUTPUT_CACHE_FILE,
         "target_trade_rate": _l2_target_trade_rate(),
@@ -1161,24 +1594,25 @@ def infer_l2_trade_decision(
     X = frame[target_cols].to_numpy(dtype=np.float32, copy=False)
     mode = meta.get("decision_mode", "multiclass")
     if mode == "two_stage":
-        thr = float(meta.get("trade_threshold", 0.35))
+        _, thr_arr, temp_arr, reward_arr, risk_arr = _l2_conditional_policy_arrays(meta, frame)
         gate_m = models["gate"]
         dir_m = models.get("direction")
         gate_calibrator = models.get("gate_calibrator")
-        # thr applies to gate_p >= thr (not argmax on composed 3-way probs); see meta trade_threshold_applies_to
         gate_p, dir_p, decision_probs = _l2_predict_gate_dir_probs(
             gate_m,
             dir_m,
             X,
-            trade_threshold=thr,
+            trade_threshold=thr_arr,
             direction_head_type=str(meta.get("direction_head_type", "probability")),
-            direction_temperature=float(meta.get("direction_temperature", 0.35)),
+            direction_temperature=temp_arr,
             gate_calibrator=gate_calibrator,
         )
     elif "decision" in models:
         gate_p = np.max(models["decision"].predict(X).astype(np.float32), axis=1)
         dir_p = np.full(len(X), 0.5, dtype=np.float32)
         decision_probs = models["decision"].predict(X).astype(np.float32)
+        reward_arr = np.full(len(X), float(meta.get("expected_edge_reward_mult", 1.0)), dtype=np.float32)
+        risk_arr = np.full(len(X), float(meta.get("expected_edge_risk_mult", 1.0)), dtype=np.float32)
     else:
         raise RuntimeError("L2 meta missing two_stage gate or legacy decision model.")
     size_pred = np.clip(models["size"].predict(X).astype(np.float32), 0.0, 1.0)
@@ -1189,7 +1623,7 @@ def infer_l2_trade_decision(
             gate_p=gate_p,
             dir_p=dir_p,
             decision_probs=decision_probs,
-            trade_threshold=thr,
+            trade_threshold=thr_arr,
         )
     else:
         hard_decision_class = np.argmax(decision_probs, axis=1).astype(np.int64)
@@ -1207,6 +1641,14 @@ def infer_l2_trade_decision(
     for idx in range(NUM_REGIME_CLASSES):
         outputs[f"l2_entry_regime_{idx}"] = entry_regime[:, idx]
     outputs["l2_entry_vol"] = frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
-    outputs["l2_expected_edge"] = (outputs["l2_decision_long"] - outputs["l2_decision_short"]) * outputs["l2_size"]
+    outputs["l2_expected_edge"] = _l2_expected_edge_proxy(
+        gate_p,
+        dir_p,
+        size_pred,
+        mfe_pred,
+        mae_pred,
+        reward_mult=reward_arr,
+        risk_mult=risk_arr,
+    )
     outputs["l2_rr_proxy"] = outputs["l2_pred_mfe"] / np.maximum(outputs["l2_pred_mae"], 0.05)
     return outputs

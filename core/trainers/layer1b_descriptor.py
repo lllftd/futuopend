@@ -167,32 +167,14 @@ def _col_f32(df: pd.DataFrame, name: str) -> np.ndarray:
     return pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
 
 
-def _stretch_score(
-    x: np.ndarray,
-    *,
-    fit_mask: np.ndarray | None = None,
-    q_low: float = 0.01,
-    q_high: float = 0.99,
-) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float32)
-    fit = np.isfinite(arr)
-    if fit_mask is not None:
-        fit &= np.asarray(fit_mask, dtype=bool).ravel()
-    finite = arr[fit]
-    if finite.size == 0:
-        finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return np.full_like(arr, 0.5, dtype=np.float32)
-    lo = float(np.quantile(finite, q_low))
-    hi = float(np.quantile(finite, q_high))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-6:
-        return np.full_like(arr, 0.5, dtype=np.float32)
-    clipped = np.clip(arr, lo, hi)
-    return ((clipped - lo) / (hi - lo)).astype(np.float32, copy=False)
-
-
 def _clip01(x: np.ndarray | float) -> np.ndarray:
     return np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
+
+
+def _sigmoid_score(x: np.ndarray | float, *, center: float, scale: float) -> np.ndarray:
+    z = (np.asarray(x, dtype=np.float32) - float(center)) / max(float(scale), 1e-6)
+    z = np.clip(z, -12.0, 12.0)
+    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
 def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
@@ -246,6 +228,8 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str
             "pa_hsmm_remaining_duration",
             "pa_ctx_range_pressure",
             "bo_bb_width",
+            "pa_hmm_transition_pressure",
+            "pa_egarch_std_residual",
         ],
         "l1b_range_reversal_setup": [
             "pa_ctx_range_pressure",
@@ -301,6 +285,8 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str
             "pa_garch_shock",
             "pa_egarch_downside_vol_ratio",
             "pa_hsmm_switch_hazard",
+            "pa_hmm_transition_pressure",
+            "bo_atr_zscore",
         ],
         "l1b_shock_risk": [
             "pa_garch_shock",
@@ -315,6 +301,8 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str
             "bo_atr_zscore",
             "bo_vol_spike",
             "pa_vol_zscore_20",
+            "pa_hmm_transition_pressure",
+            "pa_vol_evr_ratio",
         ],
         "l1b_liquidity_score": [
             "pa_vol_rvol",
@@ -410,7 +398,7 @@ def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray
     }
 
 
-def _build_l1b_targets(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
+def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
     direct_outputs = _build_l1b_direct_semantic_outputs(df)
     edge = np.clip(_decision_edge_atr_array(df), -4.0, 4.0).astype(np.float32)
     mfe, mae = _mfe_mae_atr_arrays(df)
@@ -427,13 +415,30 @@ def _build_l1b_targets(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) 
     late_peak_bonus = np.clip((peak_frac - 0.25) / 0.75, 0.0, 1.0).astype(np.float32)
     early_peak_bonus = np.clip(1.0 - peak_frac, 0.0, 1.0).astype(np.float32)
     rr = mfe / np.maximum(mae, 0.10)
-    pullback_raw = np.clip(edge, 0.0, None) * np.exp(-0.55 * mae) * (0.35 + 0.65 * late_peak_bonus)
-    failure_raw = np.clip(-edge, 0.0, None) + 0.55 * mae + 0.20 * np.clip(1.5 - rr, 0.0, 1.5)
-    shock_raw = (mfe + mae) * (0.70 + 0.30 * early_peak_bonus) + 0.15 * np.abs(edge)
+    pullback_raw = (
+        0.42 * _sigmoid_score(edge, center=0.10, scale=0.30)
+        + 0.22 * _sigmoid_score(rr, center=1.15, scale=0.45)
+        + 0.20 * late_peak_bonus
+        + 0.10 * _sigmoid_score(-mae, center=-0.75, scale=0.30)
+        + 0.06 * _sigmoid_score(mfe, center=0.80, scale=0.35)
+    )
+    failure_raw = (
+        0.45 * _sigmoid_score(-edge, center=0.05, scale=0.30)
+        + 0.23 * _sigmoid_score(mae, center=0.95, scale=0.28)
+        + 0.17 * _sigmoid_score(1.0 - rr, center=0.05, scale=0.35)
+        + 0.15 * early_peak_bonus
+    )
+    shock_raw = (
+        0.30 * _sigmoid_score(mfe + mae, center=1.40, scale=0.45)
+        + 0.25 * _sigmoid_score(np.abs(edge), center=0.55, scale=0.25)
+        + 0.20 * _sigmoid_score(mae, center=0.90, scale=0.25)
+        + 0.15 * early_peak_bonus
+        + 0.10 * _sigmoid_score(np.abs(mfe - mae), center=0.50, scale=0.25)
+    )
     targets = {
-        "l1b_pullback_setup": _stretch_score(pullback_raw, fit_mask=fit_mask),
-        "l1b_failure_risk": _stretch_score(failure_raw, fit_mask=fit_mask),
-        "l1b_shock_risk": _stretch_score(shock_raw, fit_mask=fit_mask),
+        "l1b_pullback_setup": _clip01(pullback_raw),
+        "l1b_failure_risk": _clip01(failure_raw),
+        "l1b_shock_risk": _clip01(shock_raw),
     }
     cross = compute_cross_asset_context(df)
     cross.index = df.index
@@ -522,7 +527,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
     cal_mask = splits.cal_mask
-    targets, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
+    targets, direct_outputs, cross = _build_l1b_targets(work)
     cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")

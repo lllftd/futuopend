@@ -13,12 +13,20 @@ from core.trainers.constants import (
     PREPARED_DATASET_CACHE_FILE,
 )
 from core.trainers.data_prep import prepare_dataset as prepare_lgbm_data
-from core.trainers.layer1a_market import train_l1a_market_encoder
-from core.trainers.layer1b_descriptor import train_l1b_market_descriptor
-from core.trainers.layer2_decision import train_l2_trade_decision
+from core.trainers.layer1a_market import (
+    infer_l1a_market_encoder,
+    load_l1a_market_encoder,
+    train_l1a_market_encoder,
+)
+from core.trainers.layer1b_descriptor import (
+    infer_l1b_market_descriptor,
+    load_l1b_market_descriptor,
+    train_l1b_market_descriptor,
+)
+from core.trainers.layer2_decision import infer_l2_trade_decision, load_l2_trade_decision, train_l2_trade_decision
 from core.trainers.layer3_exit import train_l3_exit_manager
 from core.trainers.lgbm_utils import configure_compute_threads, _lgbm_n_jobs
-from core.trainers.stack_v2_common import load_output_cache
+from core.trainers.stack_v2_common import load_output_cache, save_output_cache
 
 
 class Logger:
@@ -105,6 +113,27 @@ def _prepare_or_load_lgbm_dataset(symbols: list[str], *, prefer_cache: bool):
     return df, feat_cols
 
 
+def _artifact_inferred_l1a_outputs(df):
+    model, meta = load_l1a_market_encoder()
+    outputs = infer_l1a_market_encoder(model, meta, df)
+    save_output_cache(outputs, L1A_OUTPUT_CACHE_FILE)
+    return outputs
+
+
+def _artifact_inferred_l1b_outputs(df):
+    models, meta = load_l1b_market_descriptor()
+    outputs = infer_l1b_market_descriptor(models, meta, df)
+    save_output_cache(outputs, L1B_OUTPUT_CACHE_FILE)
+    return outputs
+
+
+def _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs):
+    models, meta = load_l2_trade_decision()
+    outputs = infer_l2_trade_decision(models, meta, df, l1a_outputs, l1b_outputs)
+    save_output_cache(outputs, L2_OUTPUT_CACHE_FILE)
+    return outputs
+
+
 def run_lgbm_layers(start_from: str = "layer1"):
     configure_compute_threads()
     n_th = torch.get_num_threads()
@@ -139,10 +168,11 @@ def run_lgbm_layers(start_from: str = "layer1"):
         logger = setup_logger("layer1a")
         try:
             print("\n[1a] --- Training L1a (Sequence Market Encoder) ---")
-            l1a_bundle = train_l1a_market_encoder(df, feat_cols)
+            train_l1a_market_encoder(df, feat_cols)
         finally:
             logger.close()
-        l1a_outputs = l1a_bundle.outputs
+        print("\n[*] Recomputing downstream-facing L1a outputs from frozen artifact ...")
+        l1a_outputs = _artifact_inferred_l1a_outputs(df)
     else:
         print(f"\n[*] start-from={sf}: loading L1a outputs from {L1A_OUTPUT_CACHE_FILE} ...")
         l1a_outputs = load_output_cache(L1A_OUTPUT_CACHE_FILE)
@@ -151,10 +181,11 @@ def run_lgbm_layers(start_from: str = "layer1"):
         logger = setup_logger("layer1b")
         try:
             print("\n[1b] --- Training L1b (Tabular Market Descriptor) ---")
-            l1b_bundle = train_l1b_market_descriptor(df, feat_cols)
+            train_l1b_market_descriptor(df, feat_cols)
         finally:
             logger.close()
-        l1b_outputs = l1b_bundle.outputs
+        print("\n[*] Recomputing downstream-facing L1b outputs from frozen artifact ...")
+        l1b_outputs = _artifact_inferred_l1b_outputs(df)
     else:
         print(f"\n[*] start-from={sf}: loading L1b outputs from {L1B_OUTPUT_CACHE_FILE} ...")
         l1b_outputs = load_output_cache(L1B_OUTPUT_CACHE_FILE)
@@ -162,14 +193,16 @@ def run_lgbm_layers(start_from: str = "layer1"):
     logger = setup_logger("layer2")
     try:
         print("\n[2] --- Training L2 (Trade Decision) ---")
-        l2_bundle = train_l2_trade_decision(df, l1a_outputs, l1b_outputs)
+        train_l2_trade_decision(df, l1a_outputs, l1b_outputs)
     finally:
         logger.close()
+    print("\n[*] Recomputing downstream-facing L2 outputs from frozen artifact ...")
+    l2_outputs = _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs)
 
     logger = setup_logger("layer3")
     try:
         print("\n[3] --- Training L3 (Exit Manager) ---")
-        train_l3_exit_manager(df, l1a_outputs, l2_bundle.outputs)
+        train_l3_exit_manager(df, l1a_outputs, l2_outputs)
     finally:
         logger.close()
 
