@@ -33,10 +33,13 @@ from core.trainers.constants import (
 )
 from core.trainers.lgbm_utils import (
     TQDM_FILE,
+    _decision_edge_atr_array,
     _lgb_round_tqdm_enabled,
     _lgb_train_callbacks_with_round_tqdm,
     _lgbm_n_jobs,
+    _mfe_mae_atr_arrays,
     _numeric_feature_cols_for_matrix,
+    _options_target_config,
 )
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_split
 from core.trainers.val_metrics_extra import brier_binary
@@ -50,16 +53,18 @@ from core.trainers.stack_v2_common import (
 
 
 L1B_MODEL_HEADS = [
+    "l1b_pullback_setup",
+    "l1b_failure_risk",
+    "l1b_shock_risk",
+]
+L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_breakout_quality",
     "l1b_mean_reversion_setup",
     "l1b_trend_strength",
-    "l1b_pullback_setup",
     "l1b_range_reversal_setup",
     "l1b_failed_breakout_setup",
     "l1b_setup_alignment",
     "l1b_follow_through_score",
-    "l1b_failure_risk",
-    "l1b_shock_risk",
     "l1b_liquidity_score",
 ]
 L1B_BINARY_HEADS: tuple[str, ...] = ()
@@ -68,7 +73,7 @@ L1B_DIRECT_CONTEXT_COLS = [
     "l1b_correlation_regime",
     "l1b_market_breadth",
 ]
-L1B_OUTPUT_COLS = list(L1B_MODEL_HEADS) + list(L1B_DIRECT_CONTEXT_COLS)
+L1B_OUTPUT_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_MODEL_HEADS) + list(L1B_DIRECT_CONTEXT_COLS)
 
 
 @dataclass
@@ -152,7 +157,7 @@ def _select_l1b_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str
 def _l1b_cross_context_reliable(df: pd.DataFrame) -> bool:
     n_symbols = int(pd.Series(df["symbol"]).nunique(dropna=True))
     n_rows = len(df)
-    return n_symbols >= 3 and n_rows >= 200
+    return n_symbols >= 2 and n_rows >= 200
 
 
 def _col_f32(df: pd.DataFrame, name: str) -> np.ndarray:
@@ -184,6 +189,10 @@ def _stretch_score(
         return np.full_like(arr, 0.5, dtype=np.float32)
     clipped = np.clip(arr, lo, hi)
     return ((clipped - lo) / (hi - lo)).astype(np.float32, copy=False)
+
+
+def _clip01(x: np.ndarray | float) -> np.ndarray:
+    return np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
 
 
 def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
@@ -349,7 +358,7 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str
     return augmented, True
 
 
-def _build_l1b_parule_semantic_heads(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) -> dict[str, np.ndarray]:
+def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
     trend_long = _col_f32(df, "pa_ctx_setup_trend_long")
     trend_short = _col_f32(df, "pa_ctx_setup_trend_short")
     pullback_long = _col_f32(df, "pa_ctx_setup_pullback_long")
@@ -363,91 +372,69 @@ def _build_l1b_parule_semantic_heads(df: pd.DataFrame, *, fit_mask: np.ndarray |
     structure_veto = _col_f32(df, "pa_ctx_structure_veto")
     premise_break_long = _col_f32(df, "pa_ctx_premise_break_long")
     premise_break_short = _col_f32(df, "pa_ctx_premise_break_short")
+    vol_rvol = _col_f32(df, "pa_vol_rvol")
+    wick_imbalance = _col_f32(df, "bo_wick_imbalance")
 
-    pullback_setup = _stretch_score(np.maximum(pullback_long, pullback_short), fit_mask=fit_mask)
-    range_reversal_setup = _stretch_score(np.maximum(range_long, range_short), fit_mask=fit_mask)
-    failed_breakout_setup = _stretch_score(np.maximum(failed_breakout_long, failed_breakout_short), fit_mask=fit_mask)
+    breakout_quality = _clip01(
+        0.22 * np.clip(_col_f32(df, "bo_body_atr"), 0.0, 2.0) / 2.0
+        + 0.18 * np.clip(_col_f32(df, "bo_range_atr"), 0.0, 2.5) / 2.5
+        + 0.18 * np.clip(_col_f32(df, "bo_vol_spike"), 0.0, 2.0) / 2.0
+        + 0.14 * np.clip(_col_f32(df, "bo_close_extremity"), 0.0, 1.0)
+        + 0.12 * np.maximum(follow_long, follow_short)
+        + 0.10 * np.maximum(_col_f32(df, "pa_ctx_setup_long"), _col_f32(df, "pa_ctx_setup_short"))
+        - 0.10 * structure_veto
+        - 0.08 * np.maximum(premise_break_long, premise_break_short)
+    )
+    mean_reversion_setup = _clip01(np.maximum(range_long, range_short))
+    trend_strength = _clip01(np.maximum(trend_long, trend_short))
+    range_reversal_setup = _clip01(np.maximum(range_long, range_short))
+    failed_breakout_setup = _clip01(np.maximum(failed_breakout_long, failed_breakout_short))
 
     long_continuation = np.maximum(trend_long, pullback_long) * follow_long * (1.0 - premise_break_long)
     short_continuation = np.maximum(trend_short, pullback_short) * follow_short * (1.0 - premise_break_short)
     long_reversal = np.maximum(range_long, failed_breakout_long) * (1.0 - 0.5 * structure_veto) * (1.0 - premise_break_long)
     short_reversal = np.maximum(range_short, failed_breakout_short) * (1.0 - 0.5 * structure_veto) * (1.0 - premise_break_short)
-    setup_alignment = _stretch_score(
-        np.maximum.reduce([long_continuation, short_continuation, long_reversal, short_reversal]),
-        fit_mask=fit_mask,
-    )
+    setup_alignment = _clip01(np.maximum.reduce([long_continuation, short_continuation, long_reversal, short_reversal]))
+    follow_through_score = _clip01(np.maximum(follow_long, follow_short))
+    liquidity_score = _clip01(0.5 + 0.15 * vol_rvol - 0.10 * wick_imbalance)
 
     return {
-        "l1b_pullback_setup": pullback_setup.astype(np.float32, copy=False),
+        "l1b_breakout_quality": breakout_quality.astype(np.float32, copy=False),
+        "l1b_mean_reversion_setup": mean_reversion_setup.astype(np.float32, copy=False),
+        "l1b_trend_strength": trend_strength.astype(np.float32, copy=False),
         "l1b_range_reversal_setup": range_reversal_setup.astype(np.float32, copy=False),
         "l1b_failed_breakout_setup": failed_breakout_setup.astype(np.float32, copy=False),
         "l1b_setup_alignment": setup_alignment.astype(np.float32, copy=False),
+        "l1b_follow_through_score": follow_through_score.astype(np.float32, copy=False),
+        "l1b_liquidity_score": liquidity_score.astype(np.float32, copy=False),
     }
 
 
-def _build_l1b_targets(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
-    breakout_quality_raw = (
-        0.22 * np.clip(_col_f32(df, "bo_body_atr"), 0.0, 2.0)
-        + 0.18 * np.clip(_col_f32(df, "bo_range_atr"), 0.0, 2.5)
-        + 0.18 * np.clip(_col_f32(df, "bo_vol_spike"), 0.0, 2.0)
-        + 0.14 * np.clip(_col_f32(df, "bo_close_extremity"), 0.0, 1.0)
-        + 0.12 * np.maximum(_col_f32(df, "pa_ctx_follow_through_long"), _col_f32(df, "pa_ctx_follow_through_short"))
-        + 0.10 * np.maximum(_col_f32(df, "pa_ctx_setup_long"), _col_f32(df, "pa_ctx_setup_short"))
-        - 0.10 * _col_f32(df, "pa_ctx_structure_veto")
-        - 0.08 * np.maximum(_col_f32(df, "pa_ctx_premise_break_long"), _col_f32(df, "pa_ctx_premise_break_short"))
-    )
-    breakout_quality = _stretch_score(breakout_quality_raw, fit_mask=fit_mask)
-    parule_heads = _build_l1b_parule_semantic_heads(df, fit_mask=fit_mask)
-    mean_reversion_setup = _stretch_score(
-        np.maximum(_col_f32(df, "pa_ctx_setup_range_long"), _col_f32(df, "pa_ctx_setup_range_short")),
-        fit_mask=fit_mask,
-    )
-    trend_strength = _stretch_score(
-        np.maximum(_col_f32(df, "pa_ctx_setup_trend_long"), _col_f32(df, "pa_ctx_setup_trend_short")),
-        fit_mask=fit_mask,
-    )
-    follow_through = _stretch_score(
-        np.maximum(_col_f32(df, "pa_ctx_follow_through_long"), _col_f32(df, "pa_ctx_follow_through_short")),
-        fit_mask=fit_mask,
-    )
-    structure_veto = _col_f32(df, "pa_ctx_structure_veto")
-    premise_break = np.clip(
-        np.maximum(_col_f32(df, "pa_ctx_premise_break_long"), _col_f32(df, "pa_ctx_premise_break_short")),
-        0.0,
-        1.0,
-    )
-    failure_risk = _stretch_score(
-        np.maximum.reduce(
-            [
-                _col_f32(df, "pa_ctx_setup_failed_breakout_long"),
-                _col_f32(df, "pa_ctx_setup_failed_breakout_short"),
-                premise_break,
-                structure_veto,
-            ]
-        ),
-        fit_mask=fit_mask,
-    )
-    shock_risk_raw = (
-        0.26 * np.clip(_col_f32(df, "pa_garch_shock"), 0.0, 2.5)
-        + 0.18 * np.clip(_col_f32(df, "pa_garch_vol_of_vol"), 0.0, 2.0)
-        + 0.18 * np.clip(np.abs(_col_f32(df, "pa_egarch_leverage_effect")), 0.0, 1.5)
-        + 0.14 * np.clip(_col_f32(df, "pa_egarch_downside_vol_ratio"), 0.0, 3.0)
-        + 0.10 * np.clip(np.abs(_col_f32(df, "pa_egarch_std_residual")), 0.0, 3.0)
-        + 0.10 * np.clip(_col_f32(df, "pa_hsmm_switch_hazard"), 0.0, 1.0)
-        + 0.08 * np.clip(_col_f32(df, "bo_atr_zscore"), 0.0, 3.0)
-        - 0.08 * np.clip(_col_f32(df, "pa_vol_absorption_bull"), 0.0, 1.0)
-        - 0.08 * np.clip(_col_f32(df, "pa_vol_absorption_bear"), 0.0, 1.0)
-    )
-    shock_risk = _stretch_score(shock_risk_raw, fit_mask=fit_mask)
-    liquidity_score = _stretch_score(
-        np.clip(
-            0.5 + 0.15 * _col_f32(df, "pa_vol_rvol") - 0.10 * _col_f32(df, "bo_wick_imbalance"),
-            0.0,
-            1.0,
-        ),
-        fit_mask=fit_mask,
-    )
-
+def _build_l1b_targets(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
+    direct_outputs = _build_l1b_direct_semantic_outputs(df)
+    edge = np.clip(_decision_edge_atr_array(df), -4.0, 4.0).astype(np.float32)
+    mfe, mae = _mfe_mae_atr_arrays(df)
+    mfe = np.clip(mfe, 0.0, 5.0).astype(np.float32)
+    mae = np.clip(mae, 0.0, 4.0).astype(np.float32)
+    cfg = _options_target_config()
+    horizon = float(max(int(cfg["decision_horizon_bars"]), 1))
+    if "decision_peak_bar" in df.columns:
+        peak_bar = pd.to_numeric(df["decision_peak_bar"], errors="coerce").fillna(horizon).to_numpy(dtype=np.float32)
+    else:
+        peak_bar = np.full(len(df), horizon, dtype=np.float32)
+    peak_bar = np.clip(peak_bar, 1.0, horizon)
+    peak_frac = np.clip(peak_bar / horizon, 0.0, 1.0).astype(np.float32)
+    late_peak_bonus = np.clip((peak_frac - 0.25) / 0.75, 0.0, 1.0).astype(np.float32)
+    early_peak_bonus = np.clip(1.0 - peak_frac, 0.0, 1.0).astype(np.float32)
+    rr = mfe / np.maximum(mae, 0.10)
+    pullback_raw = np.clip(edge, 0.0, None) * np.exp(-0.55 * mae) * (0.35 + 0.65 * late_peak_bonus)
+    failure_raw = np.clip(-edge, 0.0, None) + 0.55 * mae + 0.20 * np.clip(1.5 - rr, 0.0, 1.5)
+    shock_raw = (mfe + mae) * (0.70 + 0.30 * early_peak_bonus) + 0.15 * np.abs(edge)
+    targets = {
+        "l1b_pullback_setup": _stretch_score(pullback_raw, fit_mask=fit_mask),
+        "l1b_failure_risk": _stretch_score(failure_raw, fit_mask=fit_mask),
+        "l1b_shock_risk": _stretch_score(shock_raw, fit_mask=fit_mask),
+    }
     cross = compute_cross_asset_context(df)
     cross.index = df.index
     cross = cross.rename(
@@ -457,30 +444,24 @@ def _build_l1b_targets(df: pd.DataFrame, *, fit_mask: np.ndarray | None = None) 
             "market_breadth": "l1b_market_breadth",
         }
     )
-    targets = {
-        "l1b_breakout_quality": breakout_quality,
-        "l1b_mean_reversion_setup": mean_reversion_setup,
-        "l1b_trend_strength": trend_strength,
-        **parule_heads,
-        "l1b_follow_through_score": follow_through,
-        "l1b_failure_risk": failure_risk,
-        "l1b_shock_risk": shock_risk,
-        "l1b_liquidity_score": liquidity_score,
-    }
-    return targets, cross
+    return targets, direct_outputs, cross
 
 
 def _compute_l1b_deterministic_outputs(
-    df: pd.DataFrame,
+    direct_outputs: dict[str, np.ndarray],
     cross: pd.DataFrame,
     *,
     cross_context_reliable: bool,
 ) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
+    n_rows = len(cross.index)
+    out = pd.DataFrame(index=cross.index)
+    for col in L1B_DIRECT_SEMANTIC_COLS:
+        values = np.asarray(direct_outputs.get(col, np.zeros(n_rows, dtype=np.float32)), dtype=np.float32).ravel()
+        out[col] = values
     for col in L1B_DIRECT_CONTEXT_COLS:
         values = pd.to_numeric(cross[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         if not cross_context_reliable:
-            values = np.zeros(len(df), dtype=np.float32)
+            values = np.zeros(n_rows, dtype=np.float32)
         out[col] = values
     return out
 
@@ -541,7 +522,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
     cal_mask = splits.cal_mask
-    targets, cross = _build_l1b_targets(work, fit_mask=train_mask)
+    targets, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
     cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")
@@ -573,14 +554,22 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     constant_output_values: dict[str, float] = {}
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     outputs = pd.concat(
-        [outputs, _compute_l1b_deterministic_outputs(work, cross, cross_context_reliable=cross_context_reliable)],
+        [
+            outputs,
+            _compute_l1b_deterministic_outputs(
+                direct_outputs,
+                cross,
+                cross_context_reliable=cross_context_reliable,
+            ),
+        ],
         axis=1,
     )
     print(f"  [L1b] model heads: {L1B_MODEL_HEADS}", flush=True)
+    print(f"  [L1b] direct semantic heads: {L1B_DIRECT_SEMANTIC_COLS}", flush=True)
     print(f"  [L1b] direct context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
     if not cross_context_reliable:
         print(
-            "  [L1b] cross-asset context deemed unreliable (too few symbols/rows); direct context heads will be zeroed.",
+            "  [L1b] cross-asset context deemed unreliable (need at least 2 aligned symbols/200 rows); direct context heads will be zeroed.",
             flush=True,
         )
 
@@ -661,14 +650,17 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "feature_cols": feature_cols,
         "output_cols": L1B_OUTPUT_COLS,
         "model_output_cols": sorted(model_map),
-        "direct_output_cols": sorted(L1B_DIRECT_CONTEXT_COLS),
-        "deterministic_output_cols": list(L1B_DIRECT_CONTEXT_COLS),
+        "direct_output_cols": sorted(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
+        "deterministic_output_cols": list(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deprecated_output_cols": [],
         "constant_output_values": constant_output_values,
         "model_files": model_files,
         "head_feature_cols": {name: _l1b_head_feature_cols(name, feature_cols)[0] for name in model_map},
         "cross_context_reliable": cross_context_reliable,
-        "weak_supervision_semantics": "current-bar and historical-context only; no future-price targets in L1b labels",
+        "weak_supervision_semantics": (
+            "hybrid contract: deterministic semantic descriptors from current-bar context plus "
+            "forward-looking predictive heads aligned to decision-window labels"
+        ),
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
     with open(os.path.join(MODEL_DIR, L1B_META_FILE), "wb") as f:
@@ -701,6 +693,7 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
         if col not in work.columns:
             work[col] = 0.0
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
+    direct_outputs = _build_l1b_direct_semantic_outputs(work)
     cross = compute_cross_asset_context(work)
     cross.index = work.index
     cross = cross.rename(
@@ -714,7 +707,7 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
         [
             outputs,
             _compute_l1b_deterministic_outputs(
-                work,
+                direct_outputs,
                 cross,
                 cross_context_reliable=bool(meta.get("cross_context_reliable", True)),
             ),

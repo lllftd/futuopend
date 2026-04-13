@@ -260,6 +260,23 @@ def _l2_predict_gate_dir_probs(
     return gate_p.astype(np.float32), dir_p.astype(np.float32), decision_probs
 
 
+def _l2_hard_decode_outputs(
+    gate_p: np.ndarray,
+    dir_p: np.ndarray,
+    decision_probs: np.ndarray,
+    *,
+    trade_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    hard_cls = _l2_hard_decision_from_gate_dir(gate_p, dir_p, trade_threshold)
+    gate_arr = np.asarray(gate_p, dtype=np.float32).ravel()
+    prob_mat = np.asarray(decision_probs, dtype=np.float32)
+    neutral_conf = np.clip(1.0 - gate_arr, 0.0, 1.0)
+    chosen_prob = prob_mat[np.arange(len(prob_mat)), hard_cls]
+    active_conf = np.maximum(chosen_prob, gate_arr)
+    confidence = np.where(hard_cls == 1, neutral_conf, active_conf).astype(np.float32)
+    return hard_cls.astype(np.int64), confidence
+
+
 def _search_l2_trade_threshold(
     gate_p: np.ndarray,
     *,
@@ -354,6 +371,7 @@ def _log_l2_extended_val_metrics(
     val_mask: np.ndarray,
     y_decision: np.ndarray,
     decision_probs: np.ndarray,
+    hard_decision: np.ndarray | None,
     y_size: np.ndarray,
     size_pred: np.ndarray,
     y_mfe: np.ndarray,
@@ -375,7 +393,10 @@ def _log_l2_extended_val_metrics(
         ll = float("nan")
     br = brier_multiclass(yv, Pv, 3)
     ece = ece_multiclass_maxprob(yv, Pv)
-    pred = np.argmax(Pv, axis=1)
+    if hard_decision is None:
+        pred = np.argmax(Pv, axis=1)
+    else:
+        pred = np.asarray(hard_decision, dtype=np.int64)[vm]
     acc = float(accuracy_score(yv, pred))
     f1m = float(f1_score(yv, pred, average="macro", zero_division=0))
     cm = confusion_matrix(yv, pred, labels=[0, 1, 2])
@@ -954,7 +975,7 @@ def train_l2_trade_decision(
         y_decision[val_report_mask],
         trade_threshold,
     )
-    _, _, decision_probs = _l2_predict_gate_dir_probs(
+    gate_p_all, dir_p_all, decision_probs = _l2_predict_gate_dir_probs(
         gate_model,
         direction_model,
         X,
@@ -967,11 +988,18 @@ def train_l2_trade_decision(
     size_pred = np.clip(size_model.predict(X).astype(np.float32), 0.0, 1.0)
     mfe_pred = np.clip(mfe_model.predict(X).astype(np.float32), 0.0, 5.0)
     mae_pred = np.clip(mae_model.predict(X).astype(np.float32), 0.0, 4.0)
+    hard_decision_class, decision_confidence = _l2_hard_decode_outputs(
+        gate_p=gate_p_all,
+        dir_p=dir_p_all,
+        decision_probs=decision_probs,
+        trade_threshold=trade_threshold,
+    )
     _log_l2_extended_val_metrics(
         frame,
         val_report_mask,
         y_decision,
         decision_probs,
+        hard_decision_class,
         y_size,
         size_pred,
         y_mfe,
@@ -992,11 +1020,11 @@ def train_l2_trade_decision(
         gate_calibrator=gate_calibrator,
     )
     outputs = df[["symbol", "time_key"]].copy()
-    outputs["l2_decision_class"] = np.argmax(decision_probs, axis=1).astype(np.int64)
+    outputs["l2_decision_class"] = hard_decision_class
     outputs["l2_decision_long"] = decision_probs[:, 0]
     outputs["l2_decision_neutral"] = decision_probs[:, 1]
     outputs["l2_decision_short"] = decision_probs[:, 2]
-    outputs["l2_decision_confidence"] = np.max(decision_probs, axis=1).astype(np.float32)
+    outputs["l2_decision_confidence"] = decision_confidence
     outputs["l2_size"] = size_pred
     outputs["l2_pred_mfe"] = mfe_pred
     outputs["l2_pred_mae"] = mae_pred
@@ -1038,7 +1066,8 @@ def train_l2_trade_decision(
         "direction_available": direction_model is not None,
         "direction_head_type": "signed_edge_regression" if direction_model is not None else "none",
         "direction_temperature": 0.35,
-        "confidence_semantics": "max(composed long, neutral, short); composed from gate*dir",
+        "confidence_semantics": "hard-decode aligned; neutral uses 1-gate, active uses max(gate, composed class prob)",
+        "decision_class_semantics": "hard two-stage decode: gate_p>=trade_threshold triggers trade, then dir_p>=0.5 picks long else short",
         "size_semantics": "risk_adjusted_position_fraction",
         "model_files": model_files,
         "output_cache_file": L2_OUTPUT_CACHE_FILE,
@@ -1137,7 +1166,7 @@ def infer_l2_trade_decision(
         dir_m = models.get("direction")
         gate_calibrator = models.get("gate_calibrator")
         # thr applies to gate_p >= thr (not argmax on composed 3-way probs); see meta trade_threshold_applies_to
-        _, _, decision_probs = _l2_predict_gate_dir_probs(
+        gate_p, dir_p, decision_probs = _l2_predict_gate_dir_probs(
             gate_m,
             dir_m,
             X,
@@ -1147,18 +1176,30 @@ def infer_l2_trade_decision(
             gate_calibrator=gate_calibrator,
         )
     elif "decision" in models:
+        gate_p = np.max(models["decision"].predict(X).astype(np.float32), axis=1)
+        dir_p = np.full(len(X), 0.5, dtype=np.float32)
         decision_probs = models["decision"].predict(X).astype(np.float32)
     else:
         raise RuntimeError("L2 meta missing two_stage gate or legacy decision model.")
     size_pred = np.clip(models["size"].predict(X).astype(np.float32), 0.0, 1.0)
     mfe_pred = np.clip(models["mfe"].predict(X).astype(np.float32), 0.0, 5.0)
     mae_pred = np.clip(models["mae"].predict(X).astype(np.float32), 0.0, 4.0)
+    if mode == "two_stage":
+        hard_decision_class, decision_confidence = _l2_hard_decode_outputs(
+            gate_p=gate_p,
+            dir_p=dir_p,
+            decision_probs=decision_probs,
+            trade_threshold=thr,
+        )
+    else:
+        hard_decision_class = np.argmax(decision_probs, axis=1).astype(np.int64)
+        decision_confidence = np.max(decision_probs, axis=1).astype(np.float32)
     outputs = df[["symbol", "time_key"]].copy()
-    outputs["l2_decision_class"] = np.argmax(decision_probs, axis=1).astype(np.int64)
+    outputs["l2_decision_class"] = hard_decision_class
     outputs["l2_decision_long"] = decision_probs[:, 0]
     outputs["l2_decision_neutral"] = decision_probs[:, 1]
     outputs["l2_decision_short"] = decision_probs[:, 2]
-    outputs["l2_decision_confidence"] = np.max(decision_probs, axis=1).astype(np.float32)
+    outputs["l2_decision_confidence"] = decision_confidence
     outputs["l2_size"] = size_pred
     outputs["l2_pred_mfe"] = mfe_pred
     outputs["l2_pred_mae"] = mae_pred

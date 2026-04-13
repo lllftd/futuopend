@@ -42,7 +42,7 @@ from core.trainers.lgbm_utils import (
     _live_trade_state_from_bar,
     _lgbm_n_jobs,
     _net_edge_atr_from_state,
-    _optimal_exit_target_arrays,
+    _options_target_config,
 )
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_arrays
 from core.trainers.stack_v2_common import log_label_baseline
@@ -191,6 +191,12 @@ def _l3_entry_policy_config() -> tuple[float, float]:
     return min_conf, min_size
 
 
+def _l3_target_horizon_bars(max_hold: int) -> int:
+    cfg = _options_target_config()
+    raw = int(os.environ.get("L3_TARGET_HORIZON_BARS", str(cfg["decision_horizon_bars"])))
+    return max(1, min(int(max_hold), raw))
+
+
 def l3_entry_side_from_l2(decision_class: int, decision_confidence: float, size: float, *, min_confidence: float, min_size: float) -> float:
     if float(size) < float(min_size) or float(decision_confidence) < float(min_confidence):
         return 0.0
@@ -235,17 +241,10 @@ def _build_l3_policy_dataset(
     tau_edge = 0.05  # same as L2 y_decision threshold
     pred_mfe = merged["l2_pred_mfe"].to_numpy(dtype=np.float32, copy=False)
     pred_mae = merged["l2_pred_mae"].to_numpy(dtype=np.float32, copy=False)
-    opt_tp, opt_sl, opt_exit_bars = _optimal_exit_target_arrays(merged)
-    opt_exit = opt_exit_bars.astype(np.int32)
-    opt_value = merged.get("optimal_net_edge_atr")
-    if opt_value is None:
-        opt_value = _net_edge_atr_from_state(opt_tp, opt_sl, opt_exit_bars)
-    else:
-        opt_value = pd.to_numeric(opt_value, errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-
     _t_cfg = traj_cfg or L3TrajectoryConfig()
     _t_max = _t_cfg.max_seq_len
     _t_ref = max(_t_max, int(max_hold))
+    target_horizon = _l3_target_horizon_bars(max_hold)
 
     rows_x: list[np.ndarray] = []
     rows_exit: list[int] = []
@@ -324,14 +323,20 @@ def _build_l3_policy_dataset(
             continue
         entry_price = float(open_px[i + 1])
         atr = float(safe_atr[i])
-        end = min(len(merged), i + max_hold + 1)
+        end = min(len(merged), i + target_horizon + 1, i + max_hold + 1)
         live_mfe = 0.0
         live_mae = 0.0
-        opt_bar = max(1, int(opt_exit[i]))
         entry_regime_row = entry_regime[i : i + 1]
         prev_unreal = 0.0
         peak_unreal = -1e9
         traj_hist: list[np.ndarray] = []
+        entry_rows_x: list[np.ndarray] = []
+        entry_rows_time: list[np.datetime64] = []
+        entry_rows_entry: list[int] = []
+        entry_rows_traj: list[np.ndarray] = []
+        entry_rows_traj_len: list[int] = []
+        entry_rows_unreal: list[float] = []
+        entry_rows_from_model: list[int] = []
         for j in range(i + 1, end):
             if symbols[j] != symbols[i]:
                 break
@@ -375,12 +380,12 @@ def _build_l3_policy_dataset(
             seq_pad = np.zeros((_t_max, _t_cfg.seq_feat_dim), dtype=np.float32)
             if sl:
                 seq_pad[:sl] = np.stack(window, axis=0)
-            rows_traj.append(seq_pad)
-            rows_traj_len.append(sl)
+            entry_rows_traj.append(seq_pad)
+            entry_rows_traj_len.append(sl)
             log_h = float(np.log1p(hold))
             h_sq = float(hold * hold) / 100.0
             h_bkt = float(np.searchsorted(_hold_bin_edges, int(hold), side="right"))
-            rows_x.append(
+            entry_rows_x.append(
                 np.asarray(
                     [
                         decision_conf[i],
@@ -406,14 +411,23 @@ def _build_l3_policy_dataset(
                     dtype=np.float32,
                 )
             )
-            future_gain_left = float(opt_value[i] - live_edge)
-            rows_exit.append(1 if hold >= opt_bar or future_gain_left <= exit_epsilon_atr else 0)
-            rows_value.append(future_gain_left)
-            rows_time.append(times[j])
-            rows_entry.append(int(i))
-            rows_from_model.append(from_model)
-            if hold >= opt_bar:
-                break
+            entry_rows_unreal.append(float(unreal))
+            entry_rows_time.append(times[j])
+            entry_rows_entry.append(int(i))
+            entry_rows_from_model.append(from_model)
+        if entry_rows_x:
+            terminal_unreal = float(entry_rows_unreal[-1])
+            last_idx = len(entry_rows_x) - 1
+            for row_idx, feat_row in enumerate(entry_rows_x):
+                future_gain_left = float(terminal_unreal - entry_rows_unreal[row_idx])
+                rows_x.append(feat_row)
+                rows_exit.append(1 if row_idx == last_idx or future_gain_left <= exit_epsilon_atr else 0)
+                rows_value.append(future_gain_left)
+                rows_time.append(entry_rows_time[row_idx])
+                rows_entry.append(entry_rows_entry[row_idx])
+                rows_traj.append(entry_rows_traj[row_idx])
+                rows_traj_len.append(entry_rows_traj_len[row_idx])
+                rows_from_model.append(entry_rows_from_model[row_idx])
     if not rows_x:
         print(
             f"  [L3] policy dataset empty: no bars with L2 model trade (class≠neutral, size>0.05) "
@@ -434,7 +448,8 @@ def _build_l3_policy_dataset(
     print(
         f"  [L3] policy dataset: entry signals model={n_policy_signals_model:,} "
         f"truth_edge_fallback={n_policy_signals_truth:,}  policy_rows={len(rows_x):,}  "
-        f"allow_truth_fallback={allow_truth_fallback}  entry_min_conf={min_confidence:.2f}  entry_min_size={min_size:.2f}",
+        f"allow_truth_fallback={allow_truth_fallback}  entry_min_conf={min_confidence:.2f}  "
+        f"entry_min_size={min_size:.2f}  target_horizon={target_horizon}",
         flush=True,
     )
     if n_policy_signals_truth and not n_policy_signals_model:
@@ -685,6 +700,10 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "  [L3] note: l2_* / l1a_* in policy rows are from merged pipeline outputs (same run), not a separate OOF run.",
         flush=True,
     )
+    print(
+        "  [L3] target semantics: continuation value to a fixed deadline (non-oracle), not optimal future exit.",
+        flush=True,
+    )
     print(f"  [L3] will write: {artifact_path(L3_EXIT_FILE)} | {artifact_path(L3_VALUE_FILE)} | {artifact_path(L3_META_FILE)}", flush=True)
     log_label_baseline("l3_exit", y_exit[train_mask], task="cls")
     log_label_baseline("l3_value", y_value[train_mask], task="reg")
@@ -852,6 +871,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_allow_truth_fallback": os.environ.get("L3_ALLOW_TRUTH_FALLBACK", "0").strip().lower() in {"1", "true", "yes"},
         "l3_entry_min_confidence": entry_min_confidence,
         "l3_entry_min_size": entry_min_size,
+        "l3_target_horizon_bars": _l3_target_horizon_bars(30),
+        "l3_target_semantics": "continuation_value_to_fixed_deadline",
     }
     if use_hybrid:
         import torch
