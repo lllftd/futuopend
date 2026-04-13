@@ -57,6 +57,10 @@ L1B_OUTPUT_COLS = [
     "l1b_breakout_quality",
     "l1b_mean_reversion_setup",
     "l1b_trend_strength",
+    "l1b_pullback_setup",
+    "l1b_range_reversal_setup",
+    "l1b_failed_breakout_setup",
+    "l1b_setup_alignment",
     "l1b_follow_through_score",
     "l1b_failure_risk",
     "l1b_vol_expansion_prob",
@@ -74,6 +78,10 @@ L1B_OUTPUT_COLS = [
 L1B_DETERMINISTIC_HEADS = [
     "l1b_mean_reversion_setup",
     "l1b_trend_strength",
+    "l1b_pullback_setup",
+    "l1b_range_reversal_setup",
+    "l1b_failed_breakout_setup",
+    "l1b_setup_alignment",
     "l1b_follow_through_score",
     "l1b_failure_risk",
     "l1b_momentum_score",
@@ -159,6 +167,43 @@ def _col_f32(df: pd.DataFrame, name: str) -> np.ndarray:
     return pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
 
 
+def _build_l1b_parule_semantic_heads(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    trend_long = _col_f32(df, "pa_ctx_setup_trend_long")
+    trend_short = _col_f32(df, "pa_ctx_setup_trend_short")
+    pullback_long = _col_f32(df, "pa_ctx_setup_pullback_long")
+    pullback_short = _col_f32(df, "pa_ctx_setup_pullback_short")
+    range_long = _col_f32(df, "pa_ctx_setup_range_long")
+    range_short = _col_f32(df, "pa_ctx_setup_range_short")
+    failed_breakout_long = _col_f32(df, "pa_ctx_setup_failed_breakout_long")
+    failed_breakout_short = _col_f32(df, "pa_ctx_setup_failed_breakout_short")
+    follow_long = _col_f32(df, "pa_ctx_follow_through_long")
+    follow_short = _col_f32(df, "pa_ctx_follow_through_short")
+    structure_veto = _col_f32(df, "pa_ctx_structure_veto")
+    premise_break_long = _col_f32(df, "pa_ctx_premise_break_long")
+    premise_break_short = _col_f32(df, "pa_ctx_premise_break_short")
+
+    pullback_setup = np.clip(np.maximum(pullback_long, pullback_short), 0.0, 1.0)
+    range_reversal_setup = np.clip(np.maximum(range_long, range_short), 0.0, 1.0)
+    failed_breakout_setup = np.clip(np.maximum(failed_breakout_long, failed_breakout_short), 0.0, 1.0)
+
+    long_continuation = np.maximum(trend_long, pullback_long) * follow_long * (1.0 - premise_break_long)
+    short_continuation = np.maximum(trend_short, pullback_short) * follow_short * (1.0 - premise_break_short)
+    long_reversal = np.maximum(range_long, failed_breakout_long) * (1.0 - 0.5 * structure_veto) * (1.0 - premise_break_long)
+    short_reversal = np.maximum(range_short, failed_breakout_short) * (1.0 - 0.5 * structure_veto) * (1.0 - premise_break_short)
+    setup_alignment = np.clip(
+        np.maximum.reduce([long_continuation, short_continuation, long_reversal, short_reversal]),
+        0.0,
+        1.0,
+    )
+
+    return {
+        "l1b_pullback_setup": pullback_setup.astype(np.float32, copy=False),
+        "l1b_range_reversal_setup": range_reversal_setup.astype(np.float32, copy=False),
+        "l1b_failed_breakout_setup": failed_breakout_setup.astype(np.float32, copy=False),
+        "l1b_setup_alignment": setup_alignment.astype(np.float32, copy=False),
+    }
+
+
 def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], pd.DataFrame]:
     cfg = _options_target_config()
     horizon = int(cfg["decision_horizon_bars"])
@@ -172,6 +217,7 @@ def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], pd.Data
         0.0,
         1.0,
     )
+    parule_heads = _build_l1b_parule_semantic_heads(df)
     mean_reversion_setup = np.clip(
         np.maximum(_col_f32(df, "pa_ctx_setup_range_long"), _col_f32(df, "pa_ctx_setup_range_short")),
         0.0,
@@ -233,6 +279,7 @@ def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], pd.Data
         "l1b_breakout_quality": breakout_quality,
         "l1b_mean_reversion_setup": mean_reversion_setup,
         "l1b_trend_strength": trend_strength,
+        **parule_heads,
         "l1b_follow_through_score": follow_through,
         "l1b_failure_risk": failure_risk,
         "l1b_vol_expansion_prob": vol_expansion,
@@ -248,6 +295,7 @@ def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], pd.Data
 
 def _compute_l1b_deterministic_outputs(df: pd.DataFrame, cross: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
+    parule_heads = _build_l1b_parule_semantic_heads(df)
     structure_veto = _col_f32(df, "pa_ctx_structure_veto")
     premise_break = np.clip(
         np.maximum(_col_f32(df, "pa_ctx_premise_break_long"), _col_f32(df, "pa_ctx_premise_break_short")),
@@ -264,6 +312,8 @@ def _compute_l1b_deterministic_outputs(df: pd.DataFrame, cross: pd.DataFrame) ->
         0.0,
         1.0,
     ).astype(np.float32)
+    for col, values in parule_heads.items():
+        out[col] = values
     out["l1b_follow_through_score"] = np.clip(
         np.maximum(_col_f32(df, "pa_ctx_follow_through_long"), _col_f32(df, "pa_ctx_follow_through_short")),
         0.0,

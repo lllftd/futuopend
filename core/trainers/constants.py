@@ -14,21 +14,17 @@ STATE_NAMES: dict[int, str] = {
     4: "range_conv",
     5: "range_div",
 }
-STATE_CLASSIFIER_FILE = "state_classifier_6c.txt"
 REGIME_NOW_PROB_COLS = ["bull_conv", "bull_div", "bear_conv", "bear_div", "range_conv", "range_div"]
 REGIME_PROB_COLS = REGIME_NOW_PROB_COLS
 RANGE_REGIME_INDICES = [4, 5]
+
+# Sequence-derived feature contracts reused by data prep.
 TCN_REGIME_FUT_PROB_COLS = ["tcn_barrier_hit_up", "tcn_barrier_hit_dn", "tcn_barrier_chop"]
 MAMBA_REGIME_FUT_PROB_COLS = ["mamba_transition_same", "mamba_transition_prob"]
 TCN_BOTTLENECK_DIM = max(1, int(os.environ.get("TCN_BOTTLENECK_DIM", "8")))
 TCN_TRANSITION_PROB_COL = "tcn_transition_prob"
 TCN_BARRIER_DIR_DIFF_COL = "tcn_barrier_dir_diff"
 TCN_FEATURES_ENABLED = os.environ.get("TCN_FEATURES_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
-TCN_FEATURES_FOR_L2B = [
-    TCN_TRANSITION_PROB_COL,
-    "tcn_regime_fut_entropy",
-    TCN_BARRIER_DIR_DIFF_COL,
-]
 
 LGBM_EXCLUDE_PA_STRING_COLS = {
     "symbol", "time_key", "date", "market_state", "code", "name",
@@ -41,16 +37,6 @@ TEST_END = "2025-01-01"
 FAST_TRAIN_MODE = os.environ.get("FAST_TRAIN", "").strip().lower() in {"1", "true", "yes"}
 
 RNG = np.random.default_accuracy if hasattr(np.random, "default_accuracy") else np.random.RandomState(42)
-
-QUALITY_CLASS_NAMES = ["LONG", "NEUTRAL", "CHOP", "SHORT"]
-QUALITY_CLASS_ORDER = {name: i for i, name in enumerate(QUALITY_CLASS_NAMES)}
-TRADABLE_CLASS_IDS = [0, 3]
-
-EXECUTION_SIZER_GATE_FILE = "execution_sizer_gate.txt"
-EXECUTION_SIZER_SIZE_FILE = "execution_sizer_size.txt"
-EXECUTION_SIZER_TP_FILE = "execution_sizer_tp.txt"
-EXECUTION_SIZER_SL_FILE = "execution_sizer_sl.txt"
-EXECUTION_SIZER_LEGACY_V1_FILE = "execution_sizer_v1.txt"
 
 BO_FEAT_COLS = [
     "bo_body_atr", "bo_range_atr", "bo_vol_spike", "bo_close_extremity",
@@ -77,63 +63,6 @@ PA_CTX_FEATURES = [
     "pa_ctx_premise_break_long",
     "pa_ctx_premise_break_short",
 ]
-
-L2B_OPP_X_REGIME_COLS = [f"l2b_opp_x_{r}" for r in REGIME_NOW_PROB_COLS]
-L2B_PER_REGIME_OPP_COLS = [f"l2b_opp_{r}" for r in REGIME_NOW_PROB_COLS]
-L2B_OPP_SUMMARY_COLS = [
-    "l2b_opp_best_regime",
-    "l2b_opp_worst_regime",
-    "l2b_opp_regime_std",
-    "l2b_opp_regime_range",
-    "l2b_opp_top2_weighted",
-    "l2b_conf_x_opp",
-]
-L2B_REGIME_CONTEXT_COLS = [
-    "l2b_bull_mass",
-    "l2b_bear_mass",
-    "l2b_range_mass",
-    "l2b_regime_margin",
-    "l2b_regime_entropy",
-]
-L2B_DIRECTIONAL_BASE_COLS = [
-    "l2b_opportunity_score",
-    "l2b_pred_mfe",
-    "l2b_pred_mae",
-    "l2b_mfe_mae_gap",
-    "l2b_mfe_mae_ratio",
-    "l2b_bull_edge",
-    "l2b_bear_edge",
-    "l2b_range_drag",
-    "l2b_regime_conf",
-    *L2B_REGIME_CONTEXT_COLS,
-]
-L2B_META_GATE_PROB_COLS = ["l2b_gate_long", "l2b_gate_short"]
-L2B_META_GATE_DERIVED_COLS = ["l2b_gate_spread", "l2b_gate_max", "l2b_gate_entropy"]
-L2B_META_GATE_ALL_COLS = L2B_META_GATE_PROB_COLS + L2B_META_GATE_DERIVED_COLS
-L2B_GATE_DECOMP_COLS = [
-    "l2b_gate_trade_raw",
-    "l2b_gate_trade_post",
-    "l2b_gate_dir_long_raw",
-    "l2b_gate_dir_long_post",
-]
-L3_INTERACTION_FEATURE_COLS = [
-    "l3_gate_x_mfe",
-    "l3_gate_x_rr",
-    "l3_gate_spread_x_opp",
-    "l3_signal_agree",
-]
-
-LAYER3_PA_KEY_FEATURES = (
-    "pa_ctx_setup_long", "pa_ctx_setup_short",
-    "pa_ctx_follow_through_long", "pa_ctx_follow_through_short",
-    "pa_ctx_structure_veto", "pa_ctx_range_pressure",
-    "pa_ctx_premise_break_long", "pa_ctx_premise_break_short",
-    "pa_vol_rvol", "pa_vol_momentum", "pa_bo_wick_imbalance", "pa_bo_close_extremity",
-    "pa_lead_macd_hist_slope", "pa_lead_rsi_slope", "pa_bo_dist_vwap",
-    "pa_struct_swing_range_atr", "pa_tr_mm_target_up", "pa_tr_mm_target_down",
-    "pa_vol_exhaustion_climax", "pa_vol_zscore_20", "pa_vol_evr_ratio",
-    "pa_vol_absorption_bull", "pa_vol_absorption_bear",
-)
 
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 

@@ -5,17 +5,25 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
-from core.trainers.constants import L1A_REGIME_COLS
+from core.trainers.constants import (
+    L1A_META_FILE,
+    L1A_REGIME_COLS,
+    L1B_META_FILE,
+    L2_META_FILE,
+    L3_META_FILE,
+    MODEL_DIR,
+)
 from core.trainers.data_prep import ensure_breakout_features, ensure_structure_context_features
 from core.trainers.layer1a_market import infer_l1a_market_encoder, load_l1a_market_encoder
 from core.trainers.layer1b_descriptor import infer_l1b_market_descriptor, load_l1b_market_descriptor
@@ -24,15 +32,15 @@ from core.trainers.layer3_exit import load_l3_exit_manager, load_l3_trajectory_e
 from core.trainers.l3_trajectory_hybrid import L3TrajRollingState, l3_single_trajectory_embedding
 from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 
-DATA_DIR = os.path.join(_REPO_ROOT, "data")
-RESULTS_DIR = os.environ.get("OOS_RESULTS_DIR", os.path.join(_REPO_ROOT, "results"))
+DATA_DIR = _REPO_ROOT / "data"
+RESULTS_DIR = Path(os.environ.get("OOS_RESULTS_DIR", str(_REPO_ROOT / "results")))
 OOS_START = os.environ.get("OOS_START", "2025-01-01")
 OOS_END = os.environ.get("OOS_END", "2026-01-01")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
 def _prepare_symbol_df(symbol: str) -> pd.DataFrame:
-    raw = pd.read_csv(os.path.join(DATA_DIR, f"{symbol}.csv"))
+    raw = pd.read_csv(DATA_DIR / f"{symbol}.csv")
     raw["time_key"] = pd.to_datetime(raw["time_key"])
     raw = raw[
         (raw["time_key"] >= pd.Timestamp(OOS_START) - pd.Timedelta(days=10))
@@ -47,7 +55,7 @@ def _prepare_symbol_df(symbol: str) -> pd.DataFrame:
             df["lbl_atr"] = pd.to_numeric(df["atr_5m"], errors="coerce").fillna(method="ffill").fillna(0.25)
         elif "atr_1m" in df.columns:
             df["lbl_atr"] = pd.to_numeric(df["atr_1m"], errors="coerce").fillna(method="ffill").fillna(0.25)
-    else:
+        else:
             df["lbl_atr"] = (df["high"] - df["low"]).ewm(span=14, min_periods=1).mean().clip(lower=1e-3)
     df["symbol"] = symbol
     return df[df["time_key"] >= pd.Timestamp(OOS_START)].reset_index(drop=True)
@@ -110,6 +118,22 @@ def _build_l3_feature_vector(
         ],
         dtype=np.float32,
     )
+
+
+def _ensure_backtest_artifacts_exist() -> None:
+    required = [
+        L1A_META_FILE,
+        L1B_META_FILE,
+        L2_META_FILE,
+        L3_META_FILE,
+    ]
+    missing = [name for name in required if not (Path(MODEL_DIR) / name).exists()]
+    if missing:
+        missing_list = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Missing trained stack artifacts under {Path(MODEL_DIR).resolve()}: {missing_list}. "
+            "Train the new stack first, e.g. `./scripts/run_train.sh layer1`."
+        )
 
 
 def run_single_symbol(
@@ -194,7 +218,7 @@ def run_single_symbol(
                 seq, sl = traj_buf.padded_sequence()
                 emb = l3_single_trajectory_embedding(l3_traj_enc, seq, sl, dev)
                 feat_vec = np.concatenate([static, emb], dtype=np.float32).reshape(1, -1)
-                else:
+            else:
                 feat_vec = static.reshape(1, -1)
             if feat_vec.shape[1] != len(feature_cols):
                 raise RuntimeError(f"L3 feature width mismatch: {feat_vec.shape[1]} vs {len(feature_cols)}")
@@ -228,6 +252,7 @@ def main():
     print("=" * 70)
     print("  Running OOS Dual-View Pipeline (L1a -> L1b -> L2 -> L3)")
     print("=" * 70)
+    _ensure_backtest_artifacts_exist()
     l1a_model, l1a_meta = load_l1a_market_encoder()
     l1b_models, l1b_meta = load_l1b_market_descriptor()
     l2_models, l2_meta = load_l2_trade_decision()
@@ -260,11 +285,11 @@ def main():
         )
         if not tr_df.empty:
             all_trades.append(tr_df)
-            tr_df.to_csv(os.path.join(RESULTS_DIR, f"trades_{sym}.csv"), index=False)
+            tr_df.to_csv(RESULTS_DIR / f"trades_{sym}.csv", index=False)
             print(f"[{sym}] generated {len(tr_df)} trades.")
     if all_trades:
         combined = pd.concat(all_trades, ignore_index=True)
-        combined.to_csv(os.path.join(RESULTS_DIR, "trades_ALL.csv"), index=False)
+        combined.to_csv(RESULTS_DIR / "trades_ALL.csv", index=False)
         print(f"\nTotal trades: {len(combined)}")
         print(f"Win Rate: {(combined['return'] > 0).mean():.2%}")
         print(f"Avg Return: {combined['return'].mean():.4%}")
