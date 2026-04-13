@@ -484,7 +484,7 @@ def _build_l1b_targets(
     df: pd.DataFrame,
     *,
     fit_mask: np.ndarray | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
     direct_outputs = _build_l1b_direct_semantic_outputs(df)
     edge = np.clip(_decision_edge_atr_array(df), -4.0, 4.0).astype(np.float32)
     mfe, mae = _mfe_mae_atr_arrays(df)
@@ -522,6 +522,11 @@ def _build_l1b_targets(
         + 0.15 * early_peak_bonus
         + 0.11 * np.clip(np.abs(mfe - mae), 0.0, 4.0)
     ).astype(np.float32)
+    raw_targets = {
+        "l1b_pullback_setup": pullback_raw,
+        "l1b_failure_risk": failure_raw,
+        "l1b_shock_risk": shock_raw,
+    }
     targets = {
         "l1b_pullback_setup": _rank_normalized_target(pullback_raw, fit_mask=fit_mask),
         "l1b_failure_risk": _rank_normalized_target(failure_raw, fit_mask=fit_mask),
@@ -536,7 +541,7 @@ def _build_l1b_targets(
             "market_breadth": "l1b_market_breadth",
         }
     )
-    return targets, direct_outputs, cross
+    return raw_targets, targets, direct_outputs, cross
 
 
 def _compute_l1b_deterministic_outputs(
@@ -606,6 +611,67 @@ def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray) -> None:
     cor = _corr1d(y_t, y_p)
     print(f"    MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}  corr(y,pred)={cor:.4f}", flush=True)
 
+
+def _log_l1b_target_diagnostics(
+    head: str,
+    raw_target: np.ndarray,
+    shaped_target: np.ndarray,
+    *,
+    train_mask: np.ndarray,
+) -> None:
+    def _summarize(arr: np.ndarray, *, decimals: int = 6) -> tuple[int, int, float, float, list[tuple[float, float]]]:
+        vals = np.asarray(arr, dtype=np.float64).ravel()
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return 0, 0, 0.0, 0.0, []
+        rounded = np.round(vals, decimals=decimals)
+        uniq_exact = int(np.unique(vals).size)
+        uniq_round = int(np.unique(rounded).size)
+        uniq_vals, counts = np.unique(rounded, return_counts=True)
+        order = np.argsort(counts)[::-1]
+        counts = counts[order]
+        uniq_vals = uniq_vals[order]
+        top1_share = float(counts[0] / vals.size) if counts.size else 0.0
+        top3_share = float(counts[:3].sum() / vals.size) if counts.size else 0.0
+        top_vals = [
+            (float(uniq_vals[i]), float(counts[i] / vals.size))
+            for i in range(min(3, counts.size))
+        ]
+        return uniq_exact, uniq_round, top1_share, top3_share, top_vals
+
+    tm = np.asarray(train_mask, dtype=bool).ravel()
+    raw = np.asarray(raw_target, dtype=np.float32).ravel()[tm]
+    shaped = np.asarray(shaped_target, dtype=np.float32).ravel()[tm]
+    raw_unique, raw_round_unique, raw_top1, raw_top3, raw_top_vals = _summarize(raw)
+    shp_unique, shp_round_unique, shp_top1, shp_top3, shp_top_vals = _summarize(shaped)
+    print(f"  [L1b] target diagnostic — {head} [train]", flush=True)
+    print(
+        f"    raw:    unique={raw_unique:,}  rounded6_unique={raw_round_unique:,}  "
+        f"top1_share={raw_top1:.3f}  top3_share={raw_top3:.3f}",
+        flush=True,
+    )
+    if raw_top_vals:
+        print(
+            f"    raw top rounded values: {[(round(v, 6), round(s, 3)) for v, s in raw_top_vals]}",
+            flush=True,
+        )
+    print(
+        f"    shaped: unique={shp_unique:,}  rounded6_unique={shp_round_unique:,}  "
+        f"top1_share={shp_top1:.3f}  top3_share={shp_top3:.3f}",
+        flush=True,
+    )
+    if shp_top_vals:
+        print(
+            f"    shaped top rounded values: {[(round(v, 6), round(s, 3)) for v, s in shp_top_vals]}",
+            flush=True,
+        )
+    if shp_round_unique <= 8 or shp_top3 >= 0.80:
+        print(
+            "    WARNING: shaped target is highly concentrated; consider classification/ordinal labels or less aggressive shaping.",
+            flush=True,
+        )
+
+
 def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTrainingBundle:
     work = df.copy()
     feature_cols = _select_l1b_feature_cols(work, feat_cols)
@@ -614,7 +680,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
     cal_mask = splits.cal_mask
-    targets, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
+    raw_targets, targets, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
     cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")
@@ -675,6 +741,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     ):
         binary = name in L1B_BINARY_HEADS
         log_label_baseline(name, y[train_mask], task="cls" if binary else "reg")
+        _log_l1b_target_diagnostics(name, raw_targets[name], y, train_mask=train_mask)
         head_feature_cols, used_fallback = _l1b_head_feature_cols(name, feature_cols)
         X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
         print(f"  [L1b] {name}: input_dim={len(head_feature_cols)}", flush=True)

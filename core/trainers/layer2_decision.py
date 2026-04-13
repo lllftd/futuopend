@@ -550,10 +550,16 @@ def _log_l2_l1b_ablation(
     direction_temperature: float,
     gate_calibrator: IsotonicRegression | None,
 ) -> None:
+    learned_head_cols = (
+        "l1b_pullback_setup",
+        "l1b_failure_risk",
+        "l1b_shock_risk",
+    )
     l1b_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_")]
     if not l1b_idx:
         print("\n  [L2] l1b ablation: skip (no l1b_* columns after selection)", flush=True)
         return
+    learned_idx = [i for i, c in enumerate(feature_cols) if c in learned_head_cols]
     vm = np.asarray(val_mask, dtype=bool)
     if not vm.any():
         return
@@ -584,34 +590,45 @@ def _log_l2_l1b_ablation(
         short_rate = float(np.mean(pred == 2))
         return ll, f1m, trade_rate, long_rate, short_rate
 
-    base_gate_p, base_dir_p, base_probs = _l2_predict_gate_dir_probs(
-        gate_model,
-        direction_model,
-        X,
-        trade_threshold=trade_threshold,
-        direction_head_type=direction_head_type,
-        direction_temperature=direction_temperature,
-        gate_calibrator=gate_calibrator,
-    )
+    def _eval_variant(X_variant: np.ndarray) -> tuple[float, float, float, float, float]:
+        gate_p, dir_p, probs = _l2_predict_gate_dir_probs(
+            gate_model,
+            direction_model,
+            X_variant,
+            trade_threshold=trade_threshold,
+            direction_head_type=direction_head_type,
+            direction_temperature=direction_temperature,
+            gate_calibrator=gate_calibrator,
+        )
+        return _eval_probs(gate_p, dir_p, probs)
+
+    base_ll, base_f1, base_trade, base_long, base_short = _eval_variant(X)
+    learned_ll = learned_f1 = learned_trade = learned_long = learned_short = float("nan")
+    if learned_idx:
+        X_no_learned = np.array(X, copy=True)
+        X_no_learned[:, learned_idx] = 0.0
+        learned_ll, learned_f1, learned_trade, learned_long, learned_short = _eval_variant(X_no_learned)
     X_no_l1b = np.array(X, copy=True)
     X_no_l1b[:, l1b_idx] = 0.0
-    abl_gate_p, abl_dir_p, ablated_probs = _l2_predict_gate_dir_probs(
-        gate_model,
-        direction_model,
-        X_no_l1b,
-        trade_threshold=trade_threshold,
-        direction_head_type=direction_head_type,
-        direction_temperature=direction_temperature,
-        gate_calibrator=gate_calibrator,
-    )
-    base_ll, base_f1, base_trade, base_long, base_short = _eval_probs(base_gate_p, base_dir_p, base_probs)
-    abl_ll, abl_f1, abl_trade, abl_long, abl_short = _eval_probs(abl_gate_p, abl_dir_p, ablated_probs)
+    abl_ll, abl_f1, abl_trade, abl_long, abl_short = _eval_variant(X_no_l1b)
     print("\n  [L2] l1b val ablation (zero l1b_* at inference)", flush=True)
     print(
         f"    baseline:      log_loss={base_ll:.4f}  F1_macro={base_f1:.4f}  trade_rate={base_trade:.3f}  "
         f"long_rate={base_long:.3f}  short_rate={base_short:.3f}",
         flush=True,
     )
+    if learned_idx:
+        print(
+            f"    no_model_heads: log_loss={learned_ll:.4f}  F1_macro={learned_f1:.4f}  trade_rate={learned_trade:.3f}  "
+            f"long_rate={learned_long:.3f}  short_rate={learned_short:.3f}",
+            flush=True,
+        )
+        print(
+            f"    delta(no_model-base): log_loss={learned_ll - base_ll:+.4f}  F1_macro={learned_f1 - base_f1:+.4f}  "
+            f"trade_rate={learned_trade - base_trade:+.3f}  long_rate={learned_long - base_long:+.3f}  "
+            f"short_rate={learned_short - base_short:+.3f}",
+            flush=True,
+        )
     print(
         f"    without_l1b:   log_loss={abl_ll:.4f}  F1_macro={abl_f1:.4f}  trade_rate={abl_trade:.3f}  "
         f"long_rate={abl_long:.3f}  short_rate={abl_short:.3f}",
