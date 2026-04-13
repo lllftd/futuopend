@@ -231,20 +231,72 @@ def _l2_signed_edge_target_prep(
         clip_abs = float(np.quantile(abs_train, clip_q))
     clip_abs = float(np.clip(clip_abs, 0.10, 5.0))
     target = np.clip(edge, -clip_abs, clip_abs).astype(np.float32)
+    nz_train = abs_train[abs_train > 1e-4]
+    if nz_train.size == 0:
+        asinh_scale = 0.10
+    else:
+        asinh_scale = float(np.median(nz_train))
+    asinh_scale = float(np.clip(asinh_scale, 0.02, clip_abs))
+    transform = (os.environ.get("L2_SIGNED_EDGE_TARGET_TRANSFORM", "asinh").strip().lower() or "asinh")
+    if transform not in {"none", "asinh"}:
+        transform = "asinh"
+    if transform == "asinh":
+        target_fit = np.arcsinh(target.astype(np.float64) / asinh_scale).astype(np.float32)
+    else:
+        target_fit = target.astype(np.float32, copy=False)
     prep: dict[str, float | str] = {
         "clip_abs": clip_abs,
+        "target_transform": transform,
+        "asinh_scale": asinh_scale,
         "objective": "huber",
         "metric": "l1",
         "alpha": 0.90,
     }
-    return target, prep
+    return target_fit, prep
 
 
 def _l2_signed_edge_predict(model: lgb.Booster, X: np.ndarray, prep: dict[str, Any] | None) -> np.ndarray:
     cfg = dict(prep or {})
     clip_abs = float(cfg.get("clip_abs", 5.0))
+    transform = str(cfg.get("target_transform", "none")).strip().lower() or "none"
+    asinh_scale = float(cfg.get("asinh_scale", 0.10))
     pred = model.predict(X).astype(np.float64)
+    if transform == "asinh":
+        pred = np.sinh(pred) * max(asinh_scale, 1e-4)
     return np.clip(pred, -clip_abs, clip_abs).astype(np.float32)
+
+
+def _l2_signed_edge_sample_weights(
+    edge_raw: np.ndarray,
+    train_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, float]]:
+    edge = np.asarray(edge_raw, dtype=np.float64).ravel()
+    tm = np.asarray(train_mask, dtype=bool).ravel()
+    abs_edge = np.abs(edge)
+    weights = np.ones(len(edge), dtype=np.float32)
+    train_abs = abs_edge[tm & np.isfinite(abs_edge)]
+    if train_abs.size == 0:
+        return weights, {"focus_floor": 0.0, "nonzero_share": 0.0}
+    target_rate = _l2_target_trade_rate()
+    focus_floor = float(np.quantile(train_abs, 1.0 - target_rate))
+    focus_floor = float(
+        max(
+            focus_floor,
+            _env_float_clipped("L2_SIGNED_EDGE_FOCUS_FLOOR_MIN", 0.02, lo=0.0, hi=2.0),
+        )
+    )
+    nonzero_mask = abs_edge > 1e-4
+    informative_mask = abs_edge >= focus_floor
+    weights[~nonzero_mask] = float(_env_float_clipped("L2_SIGNED_EDGE_ZERO_WEIGHT", 0.35, lo=0.05, hi=2.0))
+    weights[nonzero_mask] = float(_env_float_clipped("L2_SIGNED_EDGE_NONZERO_WEIGHT", 1.0, lo=0.1, hi=5.0))
+    weights[informative_mask] *= float(_env_float_clipped("L2_SIGNED_EDGE_INFORMATIVE_MULT", 2.5, lo=1.0, hi=10.0))
+    hi_q = float(np.clip(float(os.environ.get("L2_SIGNED_EDGE_TOP_Q", "0.98")), 0.80, 0.999))
+    top_floor = float(np.quantile(train_abs, hi_q))
+    weights[abs_edge >= top_floor] *= float(_env_float_clipped("L2_SIGNED_EDGE_TOP_MULT", 1.75, lo=1.0, hi=10.0))
+    return np.clip(weights, 0.05, 20.0).astype(np.float32), {
+        "focus_floor": float(focus_floor),
+        "nonzero_share": float(np.mean(train_abs > 1e-4)),
+    }
 
 
 def _l2_trade_score(gate_p: np.ndarray, signed_edge_pred: np.ndarray) -> np.ndarray:
@@ -1126,12 +1178,10 @@ def _l2_expected_edge_proxy(
 def _l2_search_policy_params(
     gate_p: np.ndarray,
     signed_edge_pred: np.ndarray,
-    y_decision: np.ndarray,
     true_edge: np.ndarray,
 ) -> dict[str, float]:
     gate = np.asarray(gate_p, dtype=np.float64).ravel()
     pred_edge = np.asarray(signed_edge_pred, dtype=np.float64).ravel()
-    truth = np.asarray(y_decision, dtype=np.int64).ravel()
     edge = np.asarray(true_edge, dtype=np.float64).ravel()
     valid = np.isfinite(gate) & np.isfinite(pred_edge) & np.isfinite(edge)
     if not valid.any():
@@ -1143,16 +1193,20 @@ def _l2_search_policy_params(
         }
     gate = gate[valid]
     pred_edge = pred_edge[valid]
-    truth = truth[valid]
     edge = edge[valid]
+    target_rate = float(np.clip(_l2_target_trade_rate(), 0.04, 0.20))
+    true_floor = float(np.quantile(np.abs(edge), 1.0 - target_rate)) if edge.size else 0.0
+    true_floor = float(max(true_floor, _env_float_clipped("L2_POLICY_TRUE_EDGE_FLOOR_MIN", 0.02, lo=0.0, hi=2.0)))
+    truth = np.ones(len(edge), dtype=np.int64)
+    truth[edge >= true_floor] = 0
+    truth[edge <= -true_floor] = 2
     true_active = truth != 1
-    target_rate = float(np.clip(np.mean(true_active) if true_active.any() else _l2_target_trade_rate(), 0.04, 0.20))
     trade_score = _l2_trade_score(gate, pred_edge)
     thr = float(np.quantile(trade_score, 1.0 - target_rate))
     score_temp = float(np.median(np.abs(trade_score - thr))) if trade_score.size else 0.05
-    score_temp = float(np.clip(max(score_temp, 1e-4), 0.01, 2.0))
+    score_temp = float(np.clip(max(score_temp, 1e-4), 0.02, 2.0))
     edge_temp = float(np.median(np.abs(pred_edge[true_active]))) if true_active.any() else float(np.median(np.abs(pred_edge)))
-    edge_temp = float(np.clip(max(edge_temp, 1e-4), 0.01, 2.0))
+    edge_temp = float(np.clip(max(edge_temp, 1e-4), 0.02, 2.0))
     _, _, decision_probs = _l2_compose_probs_from_gate_edge(
         gate,
         pred_edge,
@@ -1181,6 +1235,7 @@ def _l2_search_policy_params(
         "trade_score_temperature": float(score_temp),
         "target_trade_rate": float(target_rate),
         "edge_temperature": float(edge_temp),
+        "true_edge_floor": float(true_floor),
         "trade_rate": float(trade_rate),
         "long_share_active": float(long_share),
         "long_recall": float(long_recall),
@@ -1206,13 +1261,11 @@ def _l2_search_conditional_policy(
     state_keys: np.ndarray,
     gate_p: np.ndarray,
     signed_edge_pred: np.ndarray,
-    y_decision: np.ndarray,
     true_edge: np.ndarray,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     global_policy = _l2_search_policy_params(
         gate_p,
         signed_edge_pred,
-        y_decision,
         true_edge,
     )
     keys = np.asarray(state_keys, dtype=object).ravel()
@@ -1235,12 +1288,11 @@ def _l2_search_conditional_policy(
         raw_policy = _l2_search_policy_params(
             np.asarray(gate_p, dtype=np.float64).ravel()[valid][m],
             np.asarray(signed_edge_pred, dtype=np.float64).ravel()[valid][m],
-            np.asarray(y_decision, dtype=np.int64).ravel()[valid][m],
             np.asarray(true_edge, dtype=np.float64).ravel()[valid][m],
         )
         shrink = float(n_rows / (n_rows + shrink_rows))
         state_policy = dict(raw_policy)
-        for param_name in ("trade_score_threshold", "trade_score_temperature", "edge_temperature"):
+        for param_name in ("trade_score_threshold", "trade_score_temperature", "edge_temperature", "true_edge_floor"):
             state_policy[param_name] = float(
                 shrink * float(raw_policy[param_name]) + (1.0 - shrink) * float(global_policy[param_name])
             )
@@ -1445,6 +1497,7 @@ def train_l2_trade_decision(
     y_mfe = np.clip(mfe, 0.0, 5.0).astype(np.float32)
     y_mae = np.clip(mae, 0.0, 4.0).astype(np.float32)
     y_signed_edge, signed_edge_prep = _l2_signed_edge_target_prep(edge, train_mask)
+    signed_edge_weights, signed_edge_weight_stats = _l2_signed_edge_sample_weights(edge, train_mask)
     y_mfe_fit, mfe_head_prep = _l2_positive_head_target_prep(y_mfe, head_name="mfe", clip_max=5.0)
     y_mae_fit, mae_head_prep = _l2_positive_head_target_prep(y_mae, head_name="mae", clip_max=4.0)
 
@@ -1493,9 +1546,15 @@ def train_l2_trade_decision(
     log_label_baseline("l2_mfe", y_mfe[train_mask & (y_decision != 1)], task="reg")
     log_label_baseline("l2_mae", y_mae[train_mask & (y_decision != 1)], task="reg")
     print(
-        f"  [L2] aux target prep: signed_edge(clip_abs={signed_edge_prep['clip_abs']:.4f}, objective={signed_edge_prep['objective']}, metric={signed_edge_prep['metric']})  "
+        f"  [L2] aux target prep: signed_edge(clip_abs={signed_edge_prep['clip_abs']:.4f}, transform={signed_edge_prep['target_transform']}, "
+        f"scale={signed_edge_prep['asinh_scale']:.4f}, objective={signed_edge_prep['objective']}, metric={signed_edge_prep['metric']})  "
         f"mfe(transform={mfe_head_prep['target_transform']}, objective={mfe_head_prep['objective']}, metric={mfe_head_prep['metric']})  "
         f"mae(transform={mae_head_prep['target_transform']}, objective={mae_head_prep['objective']}, metric={mae_head_prep['metric']})",
+        flush=True,
+    )
+    print(
+        f"  [L2] signed_edge weights: focus_floor={signed_edge_weight_stats['focus_floor']:.4f}  "
+        f"nonzero_share_train={signed_edge_weight_stats['nonzero_share']:.3f}",
         flush=True,
     )
 
@@ -1617,9 +1676,23 @@ def train_l2_trade_decision(
         try:
             signed_edge_model = lgb.train(
                 signed_edge_params,
-                lgb.Dataset(X[train_mask], label=y_signed_edge[train_mask], feature_name=feature_cols, free_raw_data=False),
+                lgb.Dataset(
+                    X[train_mask],
+                    label=y_signed_edge[train_mask],
+                    weight=signed_edge_weights[train_mask],
+                    feature_name=feature_cols,
+                    free_raw_data=False,
+                ),
                 num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X[val_mask], label=y_signed_edge[val_mask], feature_name=feature_cols, free_raw_data=False)],
+                valid_sets=[
+                    lgb.Dataset(
+                        X[val_mask],
+                        label=y_signed_edge[val_mask],
+                        weight=signed_edge_weights[val_mask],
+                        feature_name=feature_cols,
+                        free_raw_data=False,
+                    )
+                ],
                 callbacks=cbs,
             )
         finally:
@@ -1692,7 +1765,6 @@ def train_l2_trade_decision(
         state_keys_all[val_tune_mask],
         _apply_binary_calibrator(gate_raw_all[val_tune_mask], gate_calibrator),
         signed_edge_all[val_tune_mask],
-        y_decision[val_tune_mask],
         edge[val_tune_mask],
     )
     trade_score_threshold = float(policy["trade_score_threshold"])
@@ -1830,6 +1902,7 @@ def train_l2_trade_decision(
             "mfe": mfe_head_prep,
             "mae": mae_head_prep,
         },
+        "l2_signed_edge_weight_stats": signed_edge_weight_stats,
         "policy_search": policy,
         "auxiliary_feature_semantics": "frozen L1b deterministic plus unsupervised features remain as auxiliary inputs to the signed-edge main head",
         "model_files": model_files,
