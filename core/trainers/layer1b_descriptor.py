@@ -340,9 +340,9 @@ def _build_l1b_semantic_binary_targets(
     train_mask: np.ndarray,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict[str, float]]]:
     cfg = {
-        "l1b_pullback_setup": {"cand_thr": 0.30, "pos_q": 0.65},
-        "l1b_failure_risk": {"cand_thr": 0.25, "pos_q": 0.65},
-        "l1b_shock_risk": {"cand_thr": 0.20, "pos_q": 0.70},
+        "l1b_pullback_setup": {"cand_thr": 0.30, "pos_frac": 0.35},
+        "l1b_failure_risk": {"cand_thr": 0.25, "pos_frac": 0.30},
+        "l1b_shock_risk": {"cand_thr": 0.20, "pos_frac": 0.20},
     }
     labels: dict[str, np.ndarray] = {}
     candidate_masks: dict[str, np.ndarray] = {}
@@ -351,30 +351,41 @@ def _build_l1b_semantic_binary_targets(
     for name, raw in raw_targets.items():
         cand_score = np.asarray(candidate_scores[name], dtype=np.float32).ravel()
         cand_thr = float(cfg[name]["cand_thr"])
-        pos_q = float(cfg[name]["pos_q"])
+        pos_frac = float(cfg[name]["pos_frac"])
         cand_mask = cand_score >= cand_thr
-        fit = cand_mask & train & np.isfinite(np.asarray(raw, dtype=np.float32).ravel())
-        fit_vals = np.asarray(raw, dtype=np.float32).ravel()[fit]
+        raw_arr = np.asarray(raw, dtype=np.float32).ravel()
+        fit = cand_mask & train & np.isfinite(raw_arr)
+        fit_idx = np.flatnonzero(fit)
+        fit_vals = raw_arr[fit]
         if fit_vals.size < 50:
             labels[name] = np.zeros(len(cand_score), dtype=np.float32)
             candidate_masks[name] = cand_mask.astype(bool)
             meta[name] = {
                 "candidate_threshold": cand_thr,
-                "positive_quantile": pos_q,
+                "positive_fraction": pos_frac,
                 "raw_positive_threshold": float("nan"),
                 "candidate_train_coverage": float(np.mean(cand_mask[train])) if train.any() else 0.0,
                 "candidate_train_rows": float(fit_vals.size),
                 "positive_rate_in_candidate_train": 0.0,
             }
             continue
-        pos_thr = float(np.quantile(fit_vals, pos_q))
-        y = (cand_mask & (np.asarray(raw, dtype=np.float32).ravel() >= pos_thr)).astype(np.float32)
+
+        pos_count = int(round(fit_vals.size * pos_frac))
+        pos_count = int(np.clip(pos_count, 1, max(1, fit_vals.size - 1)))
+        # Break large weak-label ties deterministically so we keep both classes inside the candidate set.
+        order = np.lexsort((fit_idx.astype(np.int64), cand_score[fit], raw_arr[fit]))
+        pos_idx = fit_idx[order[-pos_count:]]
+        y = np.zeros(len(cand_score), dtype=np.float32)
+        y[pos_idx] = 1.0
+        y[~cand_mask] = 0.0
+
+        raw_pos_cutoff = float(raw_arr[pos_idx].min()) if pos_idx.size else float("nan")
         labels[name] = y
         candidate_masks[name] = cand_mask.astype(bool)
         meta[name] = {
             "candidate_threshold": cand_thr,
-            "positive_quantile": pos_q,
-            "raw_positive_threshold": pos_thr,
+            "positive_fraction": pos_frac,
+            "raw_positive_threshold": raw_pos_cutoff,
             "candidate_train_coverage": float(np.mean(cand_mask[train])) if train.any() else 0.0,
             "candidate_train_rows": float(fit_vals.size),
             "positive_rate_in_candidate_train": float(np.mean(y[fit])) if fit.any() else 0.0,
@@ -453,6 +464,13 @@ def _apply_l1b_latent_block(df: pd.DataFrame, latent_meta: dict[str, Any]) -> pd
         out[f"l1b_latent_{i}"] = np.zeros(len(work), dtype=np.float32)
     out["l1b_novelty_score"] = novelty.astype(np.float32, copy=False)
     return out
+
+
+def _candidate_mask_from_scores(head: str, candidate_scores: dict[str, np.ndarray], candidate_meta: dict[str, dict[str, float]]) -> np.ndarray:
+    score = np.asarray(candidate_scores.get(head, 0.0), dtype=np.float32).ravel()
+    head_meta = candidate_meta.get(head) or {}
+    cand_thr = float(head_meta.get("candidate_threshold", 0.5))
+    return (score >= cand_thr).astype(bool)
 
 
 def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
@@ -785,7 +803,7 @@ def _corr1d(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray) -> None:
+def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray, *, binary: bool | None = None) -> None:
     """Validation metrics on calibration split (train=pre-CAL_END, val=cal window)."""
     y_t = np.asarray(y_t, dtype=np.float64).ravel()
     y_p = np.asarray(y_p, dtype=np.float64).ravel()
@@ -795,7 +813,10 @@ def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray) -> None:
         print("    (skip: too few val rows)", flush=True)
         return
 
-    if head in L1B_BINARY_HEADS:
+    if binary is None:
+        binary = head in L1B_BINARY_HEADS
+
+    if binary:
         yi = np.clip(np.round(y_t), 0, 1).astype(np.int32)
         y_pc = np.clip(y_p, 1e-7, 1.0 - 1e-7)
         try:
@@ -1013,7 +1034,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
                 f"train_classes={len(np.unique(y[train_rows]))}, val_classes={len(np.unique(y[val_rows]))}) -> constant prior={const:.4f}",
                 flush=True,
             )
-            outputs[name] = np.asarray(candidate_scores[name], dtype=np.float32) * const
+            outputs[name] = cand_mask.astype(np.float32) * const
             constant_output_values[name] = const
             continue
         params = {
@@ -1067,10 +1088,10 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
                 fn()
         model_map[name] = model
         pred_model = model.predict(X_head).astype(np.float32)
-        pred_full = np.asarray(candidate_scores[name], dtype=np.float32) * pred_model
-        _l1b_val_report(name, y[val_rows], pred_full[val_rows])
+        pred_full = cand_mask.astype(np.float32) * pred_model
+        _l1b_val_report(name, y[val_rows], pred_model[val_rows], binary=binary)
         if cal_rows.sum() != val_rows.sum():
-            _l1b_val_report(f"{name} [cal_full]", y[cal_rows], pred_full[cal_rows])
+            _l1b_val_report(f"{name} [cal_full]", y[cal_rows], pred_model[cal_rows], binary=binary)
         outputs[name] = pred_full
 
     if model_map:
@@ -1104,7 +1125,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "hybrid contract: deterministic semantic descriptors from current-bar context, "
             "candidate-aware semantic classification heads, and train-only latent context heads"
         ),
-        "target_shaping": "candidate-aware binary labels from raw weak targets; outputs are candidate-weighted probabilities",
+        "target_shaping": "candidate-aware binary labels from strict within-candidate ranking; semantic outputs are masked conditional probabilities",
         "latent_head_meta": latent_meta,
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
@@ -1163,8 +1184,10 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
     latent_meta = meta.get("latent_head_meta") or {}
     if latent_meta:
         outputs = pd.concat([outputs, _apply_l1b_latent_block(work, latent_meta).reset_index(drop=True)], axis=1)
+    candidate_meta = meta.get("semantic_candidate_meta") or {}
     for name, value in (meta.get("constant_output_values") or {}).items():
-        outputs[name] = np.asarray(candidate_scores.get(name, np.ones(len(work), dtype=np.float32)), dtype=np.float32) * float(value)
+        cand_mask = _candidate_mask_from_scores(name, candidate_scores, candidate_meta)
+        outputs[name] = cand_mask.astype(np.float32) * float(value)
     head_feature_cols_map = meta.get("head_feature_cols") or {}
     for name, model in models.items():
         head_feature_cols = list(head_feature_cols_map.get(name) or feature_cols)
@@ -1173,7 +1196,8 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
                 work[col] = 0.0
         X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
         pred = model.predict(X_head).astype(np.float32)
-        outputs[name] = np.asarray(candidate_scores.get(name, np.ones(len(work), dtype=np.float32)), dtype=np.float32) * pred
+        cand_mask = _candidate_mask_from_scores(name, candidate_scores, candidate_meta)
+        outputs[name] = cand_mask.astype(np.float32) * pred
     for col in meta.get("output_cols", L1B_OUTPUT_COLS):
         if col not in outputs.columns:
             outputs[col] = 0.0
