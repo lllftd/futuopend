@@ -17,6 +17,10 @@ from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, c
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
+# Real console stream — `backtests.train_pipeline.Logger` replaces `sys.stderr` with a tee that
+# also writes to logs/; tqdm must not use that tee or progress bars pollute layer*.log.
+TQDM_FILE = getattr(sys, "__stderr__", None) or sys.stderr
+
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
 from core.tcn_pa_state import PAStateTCN, FocalLoss
@@ -196,10 +200,11 @@ def _tq(it, **kwargs):
     d = os.environ.get("DISABLE_TQDM", "").strip().lower()
     if d in {"1", "true", "yes"}:
         return it
-    if not sys.stderr.isatty():
+    if not TQDM_FILE.isatty():
         if os.environ.get("FORCE_TQDM", "").strip().lower() not in {"1", "true", "yes"}:
             return it
-    return tqdm(it, **kwargs)
+    kw = {"file": TQDM_FILE, **kwargs}
+    return tqdm(it, **kw)
 
 
 def _lgb_log_eval_period() -> int:
@@ -207,15 +212,15 @@ def _lgb_log_eval_period() -> int:
     raw = os.environ.get("LGBM_LOG_EVAL_PERIOD", "").strip()
     if raw:
         return max(0, int(raw))
-    return 100 if sys.stderr.isatty() else 0
+    return 100 if TQDM_FILE.isatty() else 0
 
 
-def _lgb_train_callbacks(early_stopping_rounds: int) -> list:
+def _lgb_train_callbacks(early_stopping_rounds: int, *, first_metric_only: bool = True) -> list:
     p = _lgb_log_eval_period()
     out = []
     if p > 0:
         out.append(lgb.log_evaluation(p))
-    out.append(lgb.early_stopping(early_stopping_rounds))
+    out.append(lgb.early_stopping(early_stopping_rounds, first_metric_only=first_metric_only))
     return out
 
 
@@ -365,7 +370,7 @@ def _lgb_round_tqdm_enabled() -> bool:
         return False
     if os.environ.get("LGBM_DISABLE_ROUND_TQDM", "").strip().lower() in {"1", "true", "yes"}:
         return False
-    if not sys.stderr.isatty():
+    if not TQDM_FILE.isatty():
         if os.environ.get("FORCE_TQDM", "").strip().lower() not in {"1", "true", "yes"}:
             return False
     return True
@@ -375,9 +380,11 @@ def _lgb_train_callbacks_with_round_tqdm(
     early_stopping_rounds: int,
     num_boost_round: int,
     tqdm_desc: str,
+    *,
+    first_metric_only: bool = True,
 ) -> tuple[list, list]:
     """LightGBM callbacks plus per-boosting-round tqdm. Returns (callbacks, cleanup_fns)."""
-    base = _lgb_train_callbacks(early_stopping_rounds)
+    base = _lgb_train_callbacks(early_stopping_rounds, first_metric_only=first_metric_only)
     if not _lgb_round_tqdm_enabled() or num_boost_round <= 0:
         return base, []
 
@@ -387,7 +394,7 @@ def _lgb_train_callbacks_with_round_tqdm(
         unit="round",
         leave=False,
         mininterval=0.2,
-        file=sys.stderr,
+        file=TQDM_FILE,
     )
 
     def _round_cb(env) -> None:
@@ -556,6 +563,14 @@ def _layer3_chunk_rows() -> int:
     return max(4096, int(os.environ.get("LAYER3_CHUNK", "65536")))
 
 
+def _stacking_calibration_front_fraction() -> float:
+    """Front fraction of the calibration window reserved for upstream calibration/tuning."""
+    raw = os.environ.get("STACKING_CAL_FRONT_FRACTION", "").strip()
+    if not raw:
+        return 0.60
+    return float(np.clip(float(raw), 0.05, 1.0))
+
+
 # `from module import *` skips leading-underscore names unless listed here.
 __all__ = [
     "configure_compute_threads",
@@ -564,13 +579,16 @@ __all__ = [
     "_is_lgbm_string_tag_col",
     "_l2b_reg_objective_params",
     "_layer3_chunk_rows",
+    "_stacking_calibration_front_fraction",
     "_layer4_policy_feature_names",
     "_layer4_policy_state_vector",
+    "L4_POLICY_DYNAMIC_FEATURES",
     "_apply_structure_veto_to_gates",
     "_lgb_log_eval_period",
     "_lgb_round_tqdm_enabled",
     "_lgb_train_callbacks",
     "_lgb_train_callbacks_with_round_tqdm",
+    "TQDM_FILE",
     "_lgbm_booster_feature_names",
     "_lgbm_n_jobs",
     "_mfe_mae_atr_arrays",

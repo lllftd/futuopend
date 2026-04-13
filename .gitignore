@@ -13,6 +13,7 @@ results/
 lgbm_models/
 data/*.csv
 data/.tcn_*.dat
+data/.pa_feature_cache/
 
 # IDE/runtime local folders
 .cursor/

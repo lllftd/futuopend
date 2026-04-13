@@ -110,6 +110,12 @@ L2B_DIRECTIONAL_BASE_COLS = [
 L2B_META_GATE_PROB_COLS = ["l2b_gate_long", "l2b_gate_short"]
 L2B_META_GATE_DERIVED_COLS = ["l2b_gate_spread", "l2b_gate_max", "l2b_gate_entropy"]
 L2B_META_GATE_ALL_COLS = L2B_META_GATE_PROB_COLS + L2B_META_GATE_DERIVED_COLS
+L2B_GATE_DECOMP_COLS = [
+    "l2b_gate_trade_raw",
+    "l2b_gate_trade_post",
+    "l2b_gate_dir_long_raw",
+    "l2b_gate_dir_long_post",
+]
 L3_INTERACTION_FEATURE_COLS = [
     "l3_gate_x_mfe",
     "l3_gate_x_rr",
@@ -130,3 +136,35 @@ LAYER3_PA_KEY_FEATURES = (
 )
 
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
+
+# New dual-view stack schema versions
+L1A_SCHEMA_VERSION = "1.0.0"
+L1B_SCHEMA_VERSION = "1.0.0"
+L2_SCHEMA_VERSION = "1.1.5"
+L3_SCHEMA_VERSION = "1.2.0"
+
+# New artifact names
+L1A_MODEL_FILE = "l1a_market_tcn.pt"
+L1A_META_FILE = "l1a_market_tcn_meta.pkl"
+L1A_OUTPUT_CACHE_FILE = "l1a_outputs.pkl"
+
+L1B_META_FILE = "l1b_descriptor_meta.pkl"
+L1B_OUTPUT_CACHE_FILE = "l1b_outputs.pkl"
+
+L2_DECISION_FILE = "l2_decision.txt"
+L2_GATE_FILE = "l2_trade_gate.txt"
+L2_DIRECTION_FILE = "l2_direction.txt"
+L2_SIZE_FILE = "l2_size.txt"
+L2_MFE_FILE = "l2_mfe.txt"
+L2_MAE_FILE = "l2_mae.txt"
+L2_META_FILE = "l2_decision_meta.pkl"
+L2_OUTPUT_CACHE_FILE = "l2_outputs.pkl"
+
+L3_EXIT_FILE = "l3_exit.txt"
+L3_VALUE_FILE = "l3_value.txt"
+L3_META_FILE = "l3_exit_meta.pkl"
+L3_TRAJECTORY_ENCODER_FILE = "l3_trajectory_encoder.pt"
+
+# New stack feature / contract names
+L1A_REGIME_COLS = [f"l1a_regime_prob_{name}" for name in REGIME_NOW_PROB_COLS]
+L2_ENTRY_REGIME_COLS = [f"l2_entry_regime_{idx}" for idx in range(NUM_REGIME_CLASSES)]
