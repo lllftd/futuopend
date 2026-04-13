@@ -2531,9 +2531,16 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
       - Soft state probabilities from trend-strength + volatility context
       - State confidence / persistence / transition pressure
 
+    HSMM-style block:
+      - Duration-aware state smoothing / hazard / persistence features
+
     GARCH-style block:
       - Recursive variance estimate: var_t = w + a*r_{t-1}^2 + b*var_{t-1}
       - Volatility ratio / z-score / shock / vol-of-vol
+
+    EGARCH-style block:
+      - Log-variance recursion with asymmetric shock response
+      - Regime-aware leverage / standardized stress features
     """
     close = df_1m["close"].to_numpy(dtype=float)
     n = len(close)
@@ -2609,6 +2616,45 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
         hmm_persist[i] = min(run, 40) / 40.0
         prev_state = cur_state
 
+    # HSMM-style duration-aware state smoothing.
+    hsmm_switch_hazard = np.zeros(n, dtype=float)
+    hsmm_duration_norm = np.zeros(n, dtype=float)
+    hsmm_remaining_duration = np.zeros(n, dtype=float)
+    hsmm_duration_percentile = np.zeros(n, dtype=float)
+    expected_duration = np.asarray([24.0, 14.0, 24.0, 14.0, 18.0, 10.0], dtype=float)
+    hsmm_run = 0
+    prev_hsmm_state = int(hmm_state[0]) if n > 0 else 4
+    hsmm_state = np.zeros(n, dtype=int)
+    for i in range(n):
+        adj_scores = scores[i].copy()
+        if i > 0:
+            prev_target = expected_duration[prev_hsmm_state]
+            prev_duration = min((hsmm_run + 1) / max(prev_target, 1.0), 2.0)
+            continue_bonus = 0.45 * max(1.0 - prev_duration, 0.0)
+            overstay_penalty = 0.35 * max(prev_duration - 1.0, 0.0)
+            adj_scores[prev_hsmm_state] += continue_bonus - overstay_penalty
+        adj_scores = np.clip(adj_scores, -12.0, 12.0)
+        adj_scores -= np.max(adj_scores)
+        adj_exp = np.exp(adj_scores)
+        adj_prob = adj_exp / max(float(adj_exp.sum()), eps)
+        cur_state = int(np.argmax(adj_prob))
+        if i == 0 or cur_state != prev_hsmm_state:
+            hsmm_run = 0
+        else:
+            hsmm_run += 1
+        duration_bars = float(hsmm_run + 1)
+        duration_target = expected_duration[cur_state]
+        duration_norm = min(duration_bars / max(duration_target, 1.0), 2.0)
+        remaining_duration = max(duration_target - duration_bars, 0.0) / max(duration_target, 1.0)
+        duration_percentile = 1.0 - np.exp(-duration_bars / max(duration_target, 1.0))
+        switch_hazard = np.clip((1.0 - float(adj_prob[cur_state])) + 0.55 * max(duration_norm - 1.0, 0.0), 0.0, 1.0)
+        hsmm_state[i] = cur_state
+        hsmm_duration_norm[i] = duration_norm
+        hsmm_remaining_duration[i] = remaining_duration
+        hsmm_duration_percentile[i] = np.clip(duration_percentile, 0.0, 1.0)
+        hsmm_switch_hazard[i] = switch_hazard
+        prev_hsmm_state = cur_state
+
     # GARCH(1,1)-style recursion (Pseudo-MSGARCH dynamics controlled by HMM state).
     var = np.zeros(n, dtype=float)
     # Calculate seed variance using strictly past/current data to prevent leakage from bar 60 to bar 0
@@ -2648,6 +2694,37 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     if n > 1:
         garch_vol_of_vol[1:] = np.abs(np.diff(garch_vol)) / garch_vol_ma[1:]
 
+    # EGARCH-style recursion with asymmetric response to downside shocks.
+    egarch_log_var = np.zeros(n, dtype=float)
+    egarch_leverage_effect = np.zeros(n, dtype=float)
+    egarch_log_var[0] = np.log(max(seed_var, eps))
+    expected_abs_z = np.sqrt(2.0 / np.pi)
+    for i in range(1, n):
+        prev_sigma = np.sqrt(max(np.exp(egarch_log_var[i - 1]), eps))
+        z_prev = log_ret[i - 1] / max(prev_sigma, eps)
+        prev_state = hsmm_state[i - 1]
+        high_vol_state = prev_state in (1, 3, 5)
+        omega = -0.18 if high_vol_state else -0.30
+        alpha = 0.16 if high_vol_state else 0.10
+        beta = 0.88 if high_vol_state else 0.92
+        gamma = -0.10 if high_vol_state else -0.06
+        asym_term = gamma * z_prev
+        egarch_log_var[i] = omega + beta * egarch_log_var[i - 1] + alpha * (abs(z_prev) - expected_abs_z) + asym_term
+        egarch_log_var[i] = np.clip(egarch_log_var[i], np.log(1e-10), np.log(5e-2))
+        egarch_leverage_effect[i] = asym_term
+    egarch_vol = np.sqrt(np.maximum(np.exp(egarch_log_var), eps))
+    ret_neg_sq = np.square(np.minimum(log_ret, 0.0))
+    ret_pos_sq = np.square(np.maximum(log_ret, 0.0))
+    downside_vol = np.sqrt(
+        pd.Series(ret_neg_sq).ewm(span=30, adjust=False, min_periods=5).mean().fillna(0.0).to_numpy(dtype=float) + eps
+    )
+    upside_vol = np.sqrt(
+        pd.Series(ret_pos_sq).ewm(span=30, adjust=False, min_periods=5).mean().fillna(0.0).to_numpy(dtype=float) + eps
+    )
+    egarch_downside_vol_ratio = np.clip(downside_vol / np.maximum(upside_vol, eps), 0.0, 6.0)
+    egarch_std_residual = np.clip(log_ret / np.maximum(egarch_vol, eps), -6.0, 6.0)
+    egarch_vol_asymmetry = np.clip(egarch_std_residual * egarch_leverage_effect, -6.0, 6.0)
+
     out = pd.DataFrame(index=df_1m.index)
     out["time_key"] = df_1m["time_key"].values
 
@@ -2655,10 +2732,22 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     out["pa_hmm_state"] = hmm_state
     out["pa_hmm_transition_pressure"] = hmm_transition_pressure
 
+    # HSMM-style features
+    out["pa_hsmm_duration_norm"] = hsmm_duration_norm
+    out["pa_hsmm_remaining_duration"] = hsmm_remaining_duration
+    out["pa_hsmm_switch_hazard"] = hsmm_switch_hazard
+    out["pa_hsmm_duration_percentile"] = hsmm_duration_percentile
+
     # GARCH-style features
     out["pa_garch_vol"] = garch_vol
     out["pa_garch_shock"] = garch_shock
     out["pa_garch_vol_of_vol"] = garch_vol_of_vol
+
+    # EGARCH-style features
+    out["pa_egarch_leverage_effect"] = np.clip(egarch_leverage_effect, -2.0, 2.0)
+    out["pa_egarch_downside_vol_ratio"] = egarch_downside_vol_ratio
+    out["pa_egarch_vol_asymmetry"] = egarch_vol_asymmetry
+    out["pa_egarch_std_residual"] = egarch_std_residual
     return out
 
 

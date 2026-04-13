@@ -19,22 +19,30 @@ class StackTimeSplits:
     l2_val_mask: np.ndarray
 
 
-def build_stack_time_splits(time_key: pd.Series | np.ndarray, *, l2_train_frac: float = 0.7) -> StackTimeSplits:
+def l2_val_start_time() -> np.datetime64:
+    raw = os.environ.get("L2_VAL_START", "2023-05-01").strip() or "2023-05-01"
+    return np.datetime64(raw)
+
+
+def build_stack_time_splits(time_key: pd.Series | np.ndarray) -> StackTimeSplits:
     ts = pd.to_datetime(np.asarray(time_key))
     train_mask = ts < np.datetime64(TRAIN_END)
     cal_mask = (ts >= np.datetime64(TRAIN_END)) & (ts < np.datetime64(CAL_END))
     test_mask = (ts >= np.datetime64(CAL_END)) & (ts < np.datetime64(TEST_END))
 
-    cal_idx = np.flatnonzero(cal_mask)
-    l2_train_mask = np.zeros(len(ts), dtype=bool)
-    l2_val_mask = np.zeros(len(ts), dtype=bool)
-    if len(cal_idx) > 0:
-        split = max(1, min(len(cal_idx) - 1, int(len(cal_idx) * l2_train_frac))) if len(cal_idx) > 1 else 1
-        l2_train_mask[cal_idx[:split]] = True
-        l2_val_mask[cal_idx[split:]] = True
-        if not l2_val_mask.any():
-            l2_val_mask[cal_idx[-1:]] = True
-            l2_train_mask[cal_idx[-1:]] = False
+    l2_val_start = l2_val_start_time()
+    if not (np.datetime64(TRAIN_END) < l2_val_start < np.datetime64(CAL_END)):
+        raise ValueError(
+            f"L2_VAL_START={str(l2_val_start)!r} must lie strictly inside calibration window "
+            f"[{TRAIN_END}, {CAL_END})."
+        )
+    l2_train_mask = (ts >= np.datetime64(TRAIN_END)) & (ts < l2_val_start)
+    l2_val_mask = (ts >= l2_val_start) & (ts < np.datetime64(CAL_END))
+    if not l2_train_mask.any() or not l2_val_mask.any():
+        raise RuntimeError(
+            "L2 strict time split produced an empty train or val mask. "
+            f"Check TRAIN_END={TRAIN_END}, L2_VAL_START={str(l2_val_start)}, CAL_END={CAL_END}."
+        )
 
     return StackTimeSplits(
         train_mask=train_mask,

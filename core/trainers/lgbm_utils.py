@@ -53,12 +53,12 @@ def _mamba_bottleneck_dim_from_meta() -> int:
 def _tcn_derived_feature_names(bottleneck_dim: int | None = None) -> list[str]:
     bd = int(bottleneck_dim) if bottleneck_dim is not None else _tcn_bottleneck_dim_from_meta()
     emb = [f"tcn_emb_{i}" for i in range(bd)]
-    return TCN_REGIME_FUT_PROB_COLS + [TCN_TRANSITION_PROB_COL, "tcn_regime_fut_entropy", TCN_BARRIER_DIR_DIFF_COL] + emb
+    return TCN_REGIME_FUT_PROB_COLS + [TCN_TRANSITION_PROB_COL, "tcn_regime_fut_entropy", TCN_BARRIER_DIR_DIFF_COL, "tcn_is_warm"] + emb
 
 def _mamba_derived_feature_names(bottleneck_dim: int | None = None) -> list[str]:
     bd = int(bottleneck_dim) if bottleneck_dim is not None else _mamba_bottleneck_dim_from_meta()
     emb = [f"mamba_emb_{i}" for i in range(bd)]
-    return MAMBA_REGIME_FUT_PROB_COLS + ["mamba_regime_fut_entropy"] + emb
+    return MAMBA_REGIME_FUT_PROB_COLS + ["mamba_regime_fut_entropy", "mamba_is_warm"] + emb
 
 
 def configure_compute_threads() -> None:
@@ -177,21 +177,28 @@ def _lgbm_booster_feature_names(model: lgb.Booster) -> list[str]:
     return names
 
 
-def _split_feature_groups(feat_cols: list[str]) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+def _split_feature_groups(
+    feat_cols: list[str],
+) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str], list[str]]:
     hmm = [c for c in feat_cols if c.startswith("pa_hmm_")]
     garch = [c for c in feat_cols if c.startswith("pa_garch_")]
+    hsmm = [c for c in feat_cols if c.startswith("pa_hsmm_")]
+    egarch = [c for c in feat_cols if c.startswith("pa_egarch_")]
     tcn = [c for c in feat_cols if c.startswith("tcn_")]
     mamba = [c for c in feat_cols if c.startswith("mamba_")]
-    base = [c for c in feat_cols if c not in set(hmm + garch + tcn + mamba)]
-    return base, hmm, garch, tcn, mamba
+    base = [c for c in feat_cols if c not in set(hmm + garch + hsmm + egarch + tcn + mamba)]
+    return base, hmm, garch, hsmm, egarch, tcn, mamba
 
 
 def _regime_lgbm_feature_cols(feat_cols: list[str]) -> list[str]:
-    """PA + GARCH only for regime head / L2b regime predict (no TCN, no Mamba, no pa_hmm_* — avoids label leakage)."""
+    """PA + volatility stats only for regime head (no TCN/Mamba/HMM-style state columns)."""
     return [
         c
         for c in feat_cols
-        if not c.startswith("tcn_") and not c.startswith("mamba_") and not c.startswith("pa_hmm_")
+        if not c.startswith("tcn_")
+        and not c.startswith("mamba_")
+        and not c.startswith("pa_hmm_")
+        and not c.startswith("pa_hsmm_")
     ]
 
 
@@ -248,13 +255,23 @@ def _theta_decay_from_bars(bars: np.ndarray | pd.Series | list[float]) -> np.nda
 def _decision_edge_atr_array(df: pd.DataFrame) -> np.ndarray:
     if "decision_net_edge_atr" in df.columns:
         return df["decision_net_edge_atr"].fillna(0.0).values.astype(np.float64)
-    lbl_atr = df["lbl_atr"].values
-    safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
-    mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
-    mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
-    peak_bar = df["exit_bar"].fillna(0).values.astype(float) if "exit_bar" in df.columns else np.zeros(len(df), dtype=float)
-    cfg = _options_target_config()
-    return mfe * _theta_decay_from_bars(peak_bar) - cfg["adverse_penalty"] * mae
+    if {"decision_mfe_atr", "decision_mae_atr", "decision_theta_decay"}.issubset(df.columns):
+        mfe = np.clip(df["decision_mfe_atr"].fillna(0.0).values.astype(np.float64), 0.0, 5.0)
+        mae = np.clip(df["decision_mae_atr"].fillna(0.0).values.astype(np.float64), 0.0, 4.0)
+        theta_decay = np.clip(df["decision_theta_decay"].fillna(1.0).values.astype(np.float64), 0.0, 1.0)
+        cfg = _options_target_config()
+        return mfe * theta_decay - cfg["adverse_penalty"] * mae
+    if {"decision_mfe_atr", "decision_mae_atr", "decision_peak_bar"}.issubset(df.columns):
+        mfe = np.clip(df["decision_mfe_atr"].fillna(0.0).values.astype(np.float64), 0.0, 5.0)
+        mae = np.clip(df["decision_mae_atr"].fillna(0.0).values.astype(np.float64), 0.0, 4.0)
+        peak_bar = df["decision_peak_bar"].fillna(0).values.astype(float)
+        cfg = _options_target_config()
+        return mfe * _theta_decay_from_bars(peak_bar) - cfg["adverse_penalty"] * mae
+    raise RuntimeError(
+        "Missing decision-window label columns for L2/L3 targets. "
+        "Expected `decision_net_edge_atr` or (`decision_mfe_atr`, `decision_mae_atr`, `decision_theta_decay`/`decision_peak_bar`). "
+        "Regenerate labels with `data_tools/label_v2.py` before training."
+    )
 
 
 def _optimal_exit_target_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -503,19 +520,15 @@ def _optuna_search_params(
 
 
 def _mfe_mae_atr_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Same scaling as trade-quality KMeans targets (MFE/MAE in ATR units)."""
-    lbl_atr = df["lbl_atr"].values
-    safe_atr = np.where(lbl_atr > 1e-3, lbl_atr, 1e-3)
-    mfe = np.clip(df["max_favorable"].values / safe_atr, 0.0, 5.0)
-    mae = np.clip(df["max_adverse"].values / safe_atr, 0.0, 4.0)
-    
-    # Options Gamma Scalping: Apply time-decay penalty to regression targets
-    if "exit_bar" in df.columns:
-        hold_time = np.maximum(df["exit_bar"].fillna(0).values.astype(float), 0.0)
-        gamma_decay = _theta_decay_from_bars(hold_time)
-        mfe = mfe * gamma_decay
-        
-    return mfe.astype(np.float64), mae.astype(np.float64)
+    """Decision-window MFE/MAE in ATR units from label_v2 outputs."""
+    if {"decision_mfe_atr", "decision_mae_atr"}.issubset(df.columns):
+        mfe = np.clip(df["decision_mfe_atr"].fillna(0.0).values.astype(np.float64), 0.0, 5.0)
+        mae = np.clip(df["decision_mae_atr"].fillna(0.0).values.astype(np.float64), 0.0, 4.0)
+        return mfe, mae
+    raise RuntimeError(
+        "Missing `decision_mfe_atr` / `decision_mae_atr` required for L2 regression heads. "
+        "Regenerate labels with `data_tools/label_v2.py` before training."
+    )
 
 
 def _opp_regression_sample_weights(mfe_tgt: np.ndarray, regime_name: str) -> np.ndarray:

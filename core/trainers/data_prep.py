@@ -155,7 +155,7 @@ def _create_tcn_windows(feat_1m: np.ndarray, seq_len: int) -> tuple[np.ndarray, 
     return windows, end_idx
 
 
-def _nan_safe_ffill_bfill_2d(arr: np.ndarray) -> np.ndarray:
+def _nan_safe_ffill_2d(arr: np.ndarray) -> np.ndarray:
     if arr.size == 0:
         return arr
     filled = np.asarray(arr, dtype=np.float32).copy()
@@ -170,14 +170,24 @@ def _nan_safe_ffill_bfill_2d(arr: np.ndarray) -> np.ndarray:
     cols = np.broadcast_to(np.arange(filled.shape[1]), filled.shape)
     valid_last = last_valid >= 0
     filled[valid_last] = filled[last_valid[valid_last], cols[valid_last]]
-
-    mask = np.isnan(filled)
-    if mask.any():
-        next_valid = np.where(~mask, row_idx, filled.shape[0])
-        np.minimum.accumulate(next_valid[::-1], axis=0, out=next_valid[::-1])
-        valid_next = next_valid < filled.shape[0]
-        filled[valid_next] = filled[next_valid[valid_next], cols[valid_next]]
     return filled
+
+
+def _finalize_sequence_feature_block(
+    regime_probs_arr: np.ndarray,
+    embeddings: np.ndarray,
+    warm_mask: np.ndarray,
+    *,
+    cold_regime_defaults: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    regime_probs_arr = _nan_safe_ffill_2d(regime_probs_arr)
+    embeddings = _nan_safe_ffill_2d(embeddings)
+    warm = np.asarray(warm_mask, dtype=bool).ravel()
+    cold = ~warm
+    if cold.any():
+        regime_probs_arr[cold] = np.asarray(cold_regime_defaults, dtype=np.float32)
+        embeddings[cold] = 0.0
+    return regime_probs_arr.astype(np.float32), embeddings.astype(np.float32), warm.astype(np.float32)
 
 
 def ensure_breakout_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -561,14 +571,19 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
 
             regime_probs_arr[end_idx] = p_regs
             embeddings[end_idx] = embs
-
-            regime_probs_arr = _nan_safe_ffill_bfill_2d(regime_probs_arr)
-            embeddings = _nan_safe_ffill_bfill_2d(embeddings)
+            warm_mask = np.zeros(len(g), dtype=np.float32)
+            warm_mask[end_idx] = 1.0
+            regime_probs_arr, embeddings, warm_mask = _finalize_sequence_feature_block(
+                regime_probs_arr,
+                embeddings,
+                warm_mask,
+                cold_regime_defaults=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            )
 
             if np.isnan(regime_probs_arr).any():
-                raise RuntimeError(f"TCN regime probs still NaN for symbol {sym!r} after ffill/bfill.")
+                raise RuntimeError(f"TCN regime probs still NaN for symbol {sym!r} after cold-start finalize.")
             if np.isnan(embeddings).any():
-                raise RuntimeError(f"TCN embeddings still NaN for symbol {sym!r} after ffill/bfill.")
+                raise RuntimeError(f"TCN embeddings still NaN for symbol {sym!r} after cold-start finalize.")
 
             sym_df = g[["symbol", "time_key"]].copy()
             eps = 1e-9
@@ -577,6 +592,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             )
             for j, col in enumerate(TCN_REGIME_FUT_PROB_COLS):
                 sym_df[col] = regime_probs_arr[:, j]
+            sym_df["tcn_is_warm"] = warm_mask
             _add_tcn_summary_features(sym_df, validate=False)
             for j in range(bottleneck_dim):
                 sym_df[f"tcn_emb_{j}"] = embeddings[:, j]
@@ -597,7 +613,6 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             merged[tcn_cols] = (
                 merged.groupby("symbol", sort=False)[tcn_cols]
                 .ffill()
-                .bfill()
                 .astype(np.float32, copy=False)
             )
 
@@ -625,6 +640,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 )
             for j, col in enumerate(TCN_REGIME_FUT_PROB_COLS):
                 oof_df[col] = rp[:, j]
+            oof_df["tcn_is_warm"] = np.ones(len(oof_df), dtype=np.float32)
 
             eps = 1e-9
             oof_df["tcn_regime_fut_entropy"] = -np.sum(
@@ -811,14 +827,19 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
 
             regime_probs_arr[end_idx] = p_regs
             embeddings[end_idx] = embs
-
-            regime_probs_arr = pd.DataFrame(regime_probs_arr).ffill().bfill().values.astype(np.float32)
-            embeddings = pd.DataFrame(embeddings).ffill().bfill().values.astype(np.float32)
+            warm_mask = np.zeros(len(g), dtype=np.float32)
+            warm_mask[end_idx] = 1.0
+            regime_probs_arr, embeddings, warm_mask = _finalize_sequence_feature_block(
+                regime_probs_arr,
+                embeddings,
+                warm_mask,
+                cold_regime_defaults=np.array([1.0, 0.0], dtype=np.float32),
+            )
 
             if np.isnan(regime_probs_arr).any():
-                raise RuntimeError(f"Mamba regime probs still NaN for symbol {sym!r} after ffill/bfill.")
+                raise RuntimeError(f"Mamba regime probs still NaN for symbol {sym!r} after cold-start finalize.")
             if np.isnan(embeddings).any():
-                raise RuntimeError(f"Mamba embeddings still NaN for symbol {sym!r} after ffill/bfill.")
+                raise RuntimeError(f"Mamba embeddings still NaN for symbol {sym!r} after cold-start finalize.")
 
             sym_df = g[["symbol", "time_key"]].copy()
             eps = 1e-9
@@ -827,6 +848,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
             )
             for j, col in enumerate(MAMBA_REGIME_FUT_PROB_COLS):
                 sym_df[col] = regime_probs_arr[:, j]
+            sym_df["mamba_is_warm"] = warm_mask
             for j in range(bottleneck_dim):
                 sym_df[f"mamba_emb_{j}"] = embeddings[:, j]
 
@@ -849,7 +871,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
             leave=False,
         ):
             merged[c] = merged.groupby("symbol", group_keys=False)[c].transform(
-                lambda s: s.ffill().bfill()
+                lambda s: s.ffill()
             )
 
         # --- INJECT OOF CACHE TO PREVENT DATA LEAKAGE ---
@@ -876,6 +898,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
                 )
             for j, col in enumerate(MAMBA_REGIME_FUT_PROB_COLS):
                 oof_df[col] = rp[:, j]
+            oof_df["mamba_is_warm"] = np.ones(len(oof_df), dtype=np.float32)
 
             eps = 1e-9
             oof_df["mamba_regime_fut_entropy"] = -np.sum(
@@ -999,11 +1022,13 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     df = ensure_structure_context_features(df)
     feat_cols = _unique_cols(feat_cols + list(PA_CTX_FEATURES))
 
-    base_feats, hmm_feats, garch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
+    base_feats, hmm_feats, garch_feats, hsmm_feats, egarch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")
     print(f"    Base PA/OR:  {len(base_feats)}")
     print(f"    HMM-style:   {len(hmm_feats)}")
     print(f"    GARCH-style: {len(garch_feats)}")
+    print(f"    HSMM-style:  {len(hsmm_feats)}")
+    print(f"    EGARCH-style:{len(egarch_feats)}")
     print(f"    TCN-derived: {len(tcn_feats)}")
     print(f"    Mamba-derived (experimental): {len(mamba_feats)}")
     _log_tcn_feature_health(df, tcn_feats)

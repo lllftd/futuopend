@@ -13,11 +13,9 @@ from sklearn.metrics import (
     cohen_kappa_score,
     confusion_matrix,
     f1_score,
-    log_loss,
     mean_absolute_error,
     mean_squared_error,
     r2_score,
-    roc_auc_score,
 )
 import torch
 import torch.nn as nn
@@ -40,7 +38,7 @@ from core.trainers.constants import (
 from core.trainers.data_prep import _create_tcn_windows
 from core.trainers.lgbm_utils import TQDM_FILE, _lgb_round_tqdm_enabled, _lgbm_n_jobs, _options_target_config
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_arrays
-from core.trainers.val_metrics_extra import brier_binary, pearson_corr
+from core.trainers.val_metrics_extra import pearson_corr
 from core.trainers.stack_v2_common import (
     build_stack_time_splits,
     compute_transition_risk_labels,
@@ -50,13 +48,8 @@ from core.trainers.stack_v2_common import (
 from core.trainers.tcn_constants import DEVICE, SEQ_LEN
 
 
-def _sigmoid_cols() -> list[str]:
-    return [
-        "l1a_transition_risk",
-        "l1a_trend_continuation",
-        "l1a_reversal_risk",
-        "l1a_risk_flag",
-    ]
+def _bounded_scalar_cols() -> list[str]:
+    return ["l1a_transition_risk"]
 
 
 def l1a_output_columns() -> list[str]:
@@ -64,10 +57,7 @@ def l1a_output_columns() -> list[str]:
         list(L1A_REGIME_COLS)
         + [
             "l1a_transition_risk",
-            "l1a_trend_continuation",
-            "l1a_reversal_risk",
             "l1a_vol_forecast",
-            "l1a_risk_flag",
         ]
         + [f"l1a_market_embed_{idx}" for idx in range(16)]
         + ["l1a_is_warm"]
@@ -105,7 +95,7 @@ def _select_l1a_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str
         c
         for c in feat_cols
         if c.startswith("pa_")
-        and not c.startswith(("pa_hmm_", "pa_garch_"))
+        and not c.startswith(("pa_hmm_", "pa_garch_", "pa_hsmm_", "pa_egarch_"))
         and c not in preferred
     ]
     cols = [c for c in preferred + extra[:12] if c in df.columns]
@@ -127,10 +117,7 @@ def _build_l1a_targets(df: pd.DataFrame) -> dict[str, np.ndarray]:
     state = pd.to_numeric(df["state_label"], errors="coerce").fillna(4).to_numpy(dtype=np.int64)
 
     transition_risk = compute_transition_risk_labels(state, symbols, horizon=min(10, max(horizon // 2, 5)))
-    trend = np.zeros(len(df), dtype=np.float32)
-    reversal = np.zeros(len(df), dtype=np.float32)
     vol_forecast = np.zeros(len(df), dtype=np.float32)
-    risk = np.zeros(len(df), dtype=np.float32)
 
     for _, grp in df.groupby("symbol", sort=False):
         idx = grp.index.to_numpy()
@@ -145,23 +132,14 @@ def _build_l1a_targets(df: pd.DataFrame) -> dict[str, np.ndarray]:
             future_close = close_g[loc + 1 : end]
             future_high = high_g[loc + 1 : end]
             future_low = low_g[loc + 1 : end]
-            cur_close = close_g[loc]
             atr = max(float(atr_g[loc]), 1e-3)
-            future_ret = (future_close[-1] - cur_close) / atr
-            trend[row_idx] = float(future_ret > 0.15)
-            reversal[row_idx] = float(future_ret < -0.15)
             future_range = float(np.mean((future_high - future_low) / atr))
             vol_forecast[row_idx] = np.clip(future_range, 0.0, 5.0)
-            adverse = float(np.max(np.maximum(cur_close - future_low, future_high - cur_close)) / atr)
-            risk[row_idx] = float(adverse > 1.25)
 
     return {
         "regime": state,
         "transition_risk": transition_risk.astype(np.float32),
-        "trend_continuation": trend.astype(np.float32),
-        "reversal_risk": reversal.astype(np.float32),
         "vol_forecast": vol_forecast.astype(np.float32),
-        "risk_flag": risk.astype(np.float32),
     }
 
 
@@ -225,10 +203,7 @@ class L1AMarketTCN(nn.Module):
         self.seq_len = seq_len
         self.regime_head = TaskHead(self.shared_dim, 48, NUM_REGIME_CLASSES, activation="identity")
         self.transition_head = TaskHead(self.shared_dim, 24, 1, activation="identity")
-        self.trend_head = TaskHead(self.shared_dim, 24, 1, activation="identity")
-        self.reversal_head = TaskHead(self.shared_dim, 24, 1, activation="identity")
         self.vol_head = TaskHead(self.shared_dim, 32, 1, activation="identity")
-        self.risk_head = TaskHead(self.shared_dim, 24, 1, activation="identity")
         self.embed_head = EmbedHead(self.shared_dim, 16)
         self.embed_decoder = nn.Sequential(
             nn.Linear(16, 64),
@@ -246,10 +221,7 @@ class L1AMarketTCN(nn.Module):
         return {
             "regime_logits": self.regime_head(shared),
             "transition_logit": self.transition_head(shared).squeeze(-1),
-            "trend_logit": self.trend_head(shared).squeeze(-1),
-            "reversal_logit": self.reversal_head(shared).squeeze(-1),
             "vol_value": self.vol_head(shared).squeeze(-1),
-            "risk_logit": self.risk_head(shared).squeeze(-1),
             "market_embed": embed,
             "embed_recon": self.embed_decoder(embed),
             "shared_repr": shared,
@@ -281,8 +253,8 @@ def _train_epoch(
     model.train()
     total_loss = 0.0
     total_rows = 0
-    bce = nn.BCEWithLogitsLoss()
     mse = nn.MSELoss()
+    smooth_l1 = nn.SmoothL1Loss(beta=0.10)
     ce = nn.CrossEntropyLoss()
     it = loader
     if _lgb_round_tqdm_enabled():
@@ -294,32 +266,24 @@ def _train_epoch(
             mininterval=0.25,
             unit="batch",
         )
-    for xb, y_regime, y_transition, y_trend, y_reversal, y_vol, y_risk in it:
+    for xb, y_regime, y_transition, y_vol in it:
         xb = xb.to(device)
         y_regime = y_regime.to(device)
         y_transition = y_transition.to(device)
-        y_trend = y_trend.to(device)
-        y_reversal = y_reversal.to(device)
         y_vol = y_vol.to(device)
-        y_risk = y_risk.to(device)
         out = model(xb)
+        transition_score = torch.sigmoid(out["transition_logit"])
         losses = {
             "regime": ce(out["regime_logits"], y_regime),
             "vol": mse(out["vol_value"], y_vol),
             "embed_recon": mse(out["embed_recon"], out["shared_repr"].detach()),
-            "trend": bce(out["trend_logit"], y_trend),
-            "risk": bce(out["risk_logit"], y_risk),
-            "transition": bce(out["transition_logit"], y_transition),
-            "reversal": bce(out["reversal_logit"], y_reversal),
+            "transition": smooth_l1(transition_score, y_transition),
         }
         loss = (
-            0.30 * losses["regime"]
-            + 0.20 * losses["vol"]
+            0.45 * losses["regime"]
+            + 0.25 * losses["vol"]
             + 0.10 * losses["embed_recon"]
-            + 0.10 * losses["trend"]
-            + 0.10 * losses["risk"]
-            + 0.10 * losses["transition"]
-            + 0.10 * losses["reversal"]
+            + 0.20 * losses["transition"]
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -334,8 +298,8 @@ def _eval_epoch(model: L1AMarketTCN, loader: DataLoader, device: torch.device) -
     model.eval()
     total_loss = 0.0
     total_rows = 0
-    bce = nn.BCEWithLogitsLoss()
     mse = nn.MSELoss()
+    smooth_l1 = nn.SmoothL1Loss(beta=0.10)
     ce = nn.CrossEntropyLoss()
     it = loader
     if _lgb_round_tqdm_enabled():
@@ -348,57 +312,62 @@ def _eval_epoch(model: L1AMarketTCN, loader: DataLoader, device: torch.device) -
             unit="batch",
         )
     with torch.no_grad():
-        for xb, y_regime, y_transition, y_trend, y_reversal, y_vol, y_risk in it:
+        for xb, y_regime, y_transition, y_vol in it:
             xb = xb.to(device)
             y_regime = y_regime.to(device)
             y_transition = y_transition.to(device)
-            y_trend = y_trend.to(device)
-            y_reversal = y_reversal.to(device)
             y_vol = y_vol.to(device)
-            y_risk = y_risk.to(device)
             out = model(xb)
+            transition_score = torch.sigmoid(out["transition_logit"])
             loss = (
-                0.30 * ce(out["regime_logits"], y_regime)
-                + 0.20 * mse(out["vol_value"], y_vol)
+                0.45 * ce(out["regime_logits"], y_regime)
+                + 0.25 * mse(out["vol_value"], y_vol)
                 + 0.10 * mse(out["embed_recon"], out["shared_repr"].detach())
-                + 0.10 * bce(out["trend_logit"], y_trend)
-                + 0.10 * bce(out["risk_logit"], y_risk)
-                + 0.10 * bce(out["transition_logit"], y_transition)
-                + 0.10 * bce(out["reversal_logit"], y_reversal)
+                + 0.20 * smooth_l1(transition_score, y_transition)
             )
             total_loss += float(loss.item()) * len(xb)
             total_rows += len(xb)
     return total_loss / max(total_rows, 1)
 
 
-def _l1a_binary_val_block(
+def _l1a_transition_val_block(
     label: str,
     y_true: np.ndarray,
     y_score: np.ndarray,
-    *,
-    thr: float = 0.5,
 ) -> None:
     y_true = np.asarray(y_true).ravel().astype(np.float64)
     y_score = np.asarray(y_score).ravel().astype(np.float64)
-    y_score = np.clip(y_score, 1e-7, 1.0 - 1e-7)
-    y_hat = (y_score >= thr).astype(np.int32)
-    yi = np.round(y_true).astype(np.int32)
-    try:
-        auc = float(roc_auc_score(yi, y_score))
-    except ValueError:
-        auc = float("nan")
-    try:
-        ll = float(log_loss(yi, y_score))
-    except ValueError:
-        ll = float("nan")
-    acc = float(accuracy_score(yi, y_hat))
-    cm = confusion_matrix(yi, y_hat, labels=[0, 1])
-    br = brier_binary(yi.astype(np.float64), y_score)
+    mae = float(mean_absolute_error(y_true, y_score))
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_score)))
+    r2 = float(r2_score(y_true, y_score)) if len(np.unique(y_true)) > 1 else float("nan")
+    corr = pearson_corr(y_true, y_score)
     print(
-        f"  [L1a] val {label}:  n={len(yi):,}  AUC={auc:.4f}  logloss={ll:.4f}  Brier={br:.4f}  acc@{thr:g}={acc:.4f}",
+        f"  [L1a] val {label}:  n={len(y_true):,}  MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}  corr(y,p)={corr:.4f}",
         flush=True,
     )
-    print(f"    confusion TN,FP / FN,TP (rows=true 0,1):\n    {cm}", flush=True)
+    print(
+        f"    target_mean={float(np.mean(y_true)):.4f}  pred_mean={float(np.mean(y_score)):.4f}  "
+        f"target_p95={float(np.percentile(y_true, 95)):.4f}  pred_p95={float(np.percentile(y_score, 95)):.4f}",
+        flush=True,
+    )
+    if len(y_true) >= 20:
+        order = np.argsort(y_score)
+        top_n = max(1, int(0.10 * len(y_true)))
+        top_mean = float(np.mean(y_true[order[-top_n:]]))
+        base_mean = float(np.mean(y_true))
+        lift = top_mean / max(base_mean, 1e-6)
+        bot_mean = float(np.mean(y_true[order[:top_n]]))
+        print(
+            f"    top10% target_mean={top_mean:.4f}  bottom10% target_mean={bot_mean:.4f}  top10_lift={lift:.2f}x",
+            flush=True,
+        )
+        try:
+            dfq = pd.DataFrame({"pred": y_score, "target": y_true})
+            dfq["bin"] = pd.qcut(dfq["pred"], 5, duplicates="drop")
+            lift_tbl = dfq.groupby("bin", observed=True)["target"].agg(["mean", "count"])
+            print(f"    target mean by pred quintile:\n{lift_tbl}", flush=True)
+        except Exception as ex:
+            print(f"    (skip transition quintile lift table: {ex})", flush=True)
 
 
 def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.device) -> None:
@@ -409,19 +378,13 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     vol_t: list[np.ndarray] = []
     vol_p: list[np.ndarray] = []
     tr_t, tr_s = [], []
-    trend_t, trend_s = [], []
-    rev_t, rev_s = [], []
-    risk_t, risk_s = [], []
     emb_mse: list[np.ndarray] = []
     with torch.no_grad():
-        for xb, y_regime, y_transition, y_trend, y_reversal, y_vol, y_risk in val_dl:
+        for xb, y_regime, y_transition, y_vol in val_dl:
             xb = xb.to(device)
             y_regime = y_regime.to(device)
             y_transition = y_transition.to(device)
-            y_trend = y_trend.to(device)
-            y_reversal = y_reversal.to(device)
             y_vol = y_vol.to(device)
-            y_risk = y_risk.to(device)
             out = model(xb)
             y_true_r.append(y_regime.detach().cpu().numpy())
             y_pred_r.append(torch.argmax(out["regime_logits"], dim=1).detach().cpu().numpy())
@@ -429,12 +392,6 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
             vol_p.append(out["vol_value"].detach().cpu().numpy())
             tr_t.append(y_transition.detach().cpu().numpy())
             tr_s.append(torch.sigmoid(out["transition_logit"]).detach().cpu().numpy())
-            trend_t.append(y_trend.detach().cpu().numpy())
-            trend_s.append(torch.sigmoid(out["trend_logit"]).detach().cpu().numpy())
-            rev_t.append(y_reversal.detach().cpu().numpy())
-            rev_s.append(torch.sigmoid(out["reversal_logit"]).detach().cpu().numpy())
-            risk_t.append(y_risk.detach().cpu().numpy())
-            risk_s.append(torch.sigmoid(out["risk_logit"]).detach().cpu().numpy())
             emb_mse.append(
                 F.mse_loss(out["embed_recon"], out["shared_repr"].detach(), reduction="none").mean(dim=1).detach().cpu().numpy()
             )
@@ -489,10 +446,7 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
         flush=True,
     )
 
-    _l1a_binary_val_block("transition_risk", np.concatenate(tr_t), np.concatenate(tr_s))
-    _l1a_binary_val_block("trend_continuation", np.concatenate(trend_t), np.concatenate(trend_s))
-    _l1a_binary_val_block("reversal_risk", np.concatenate(rev_t), np.concatenate(rev_s))
-    _l1a_binary_val_block("risk_flag", np.concatenate(risk_t), np.concatenate(risk_s))
+    _l1a_transition_val_block("transition_risk", np.concatenate(tr_t), np.concatenate(tr_s))
     print("  [L1a] ========== end val report ==========\n", flush=True)
 
 
@@ -518,7 +472,7 @@ def materialize_l1a_outputs(
     for col in l1a_output_columns():
         outputs[col] = 0.0
     outputs[L1A_REGIME_COLS] = 1.0 / float(NUM_REGIME_CLASSES)
-    outputs[_sigmoid_cols()] = 0.5
+    outputs[_bounded_scalar_cols()] = 0.0
     outputs["l1a_vol_forecast"] = float(np.nanmedian(pd.to_numeric(df["lbl_atr"], errors="coerce").fillna(1.0)))
     outputs["l1a_is_warm"] = 0.0
     if len(end_idx) == 0:
@@ -530,7 +484,7 @@ def materialize_l1a_outputs(
     if _lgb_round_tqdm_enabled():
         dl_it = tqdm(dl, desc="[L1a] materialize outputs", file=TQDM_FILE, mininterval=0.3, unit="batch")
     regime_rows: list[np.ndarray] = []
-    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "trend", "reversal", "vol", "risk"]}
+    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol"]}
     embeds: list[np.ndarray] = []
     model.eval()
     with torch.no_grad():
@@ -539,18 +493,12 @@ def materialize_l1a_outputs(
             out = model(xb)
             regime_rows.append(torch.softmax(out["regime_logits"], dim=1).cpu().numpy())
             scalar_rows["transition"].append(torch.sigmoid(out["transition_logit"]).cpu().numpy())
-            scalar_rows["trend"].append(torch.sigmoid(out["trend_logit"]).cpu().numpy())
-            scalar_rows["reversal"].append(torch.sigmoid(out["reversal_logit"]).cpu().numpy())
             scalar_rows["vol"].append(out["vol_value"].cpu().numpy())
-            scalar_rows["risk"].append(torch.sigmoid(out["risk_logit"]).cpu().numpy())
             embeds.append(out["market_embed"].cpu().numpy())
     regime = np.concatenate(regime_rows, axis=0)
     outputs.loc[end_idx, L1A_REGIME_COLS] = regime
     outputs.loc[end_idx, "l1a_transition_risk"] = np.concatenate(scalar_rows["transition"], axis=0)
-    outputs.loc[end_idx, "l1a_trend_continuation"] = np.concatenate(scalar_rows["trend"], axis=0)
-    outputs.loc[end_idx, "l1a_reversal_risk"] = np.concatenate(scalar_rows["reversal"], axis=0)
     outputs.loc[end_idx, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, 5.0)
-    outputs.loc[end_idx, "l1a_risk_flag"] = np.concatenate(scalar_rows["risk"], axis=0)
     embed_mat = np.concatenate(embeds, axis=0)
     for idx in range(embed_mat.shape[1]):
         outputs.loc[end_idx, f"l1a_market_embed_{idx}"] = embed_mat[:, idx]
@@ -579,10 +527,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         X_t,
         torch.from_numpy(targets["regime"][end_idx].astype(np.int64)),
         torch.from_numpy(targets["transition_risk"][end_idx].astype(np.float32)),
-        torch.from_numpy(targets["trend_continuation"][end_idx].astype(np.float32)),
-        torch.from_numpy(targets["reversal_risk"][end_idx].astype(np.float32)),
         torch.from_numpy(targets["vol_forecast"][end_idx].astype(np.float32)),
-        torch.from_numpy(targets["risk_flag"][end_idx].astype(np.float32)),
     )
     train_ds = TensorDataset(*[tensor[window_train] for tensor in ds.tensors])
     val_ds = TensorDataset(*[tensor[window_val] for tensor in ds.tensors])
@@ -612,7 +557,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         flush=True,
     )
     out_cn = l1a_output_columns()
-    print(f"  [L1a] output column count: {len(out_cn)} (expect 28)", flush=True)
+    print(f"  [L1a] output column count: {len(out_cn)} (expect 25)", flush=True)
     print(f"  [L1a] output columns: {out_cn}", flush=True)
     print(f"  [L1a] seq input: seq_len={SEQ_LEN}  input_feats={len(feature_cols)}", flush=True)
     print(f"  [L1a] artifact dir: {MODEL_DIR}", flush=True)
@@ -625,11 +570,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         flush=True,
     )
     log_label_baseline("l1a_regime", targets["regime"][end_idx][window_train], task="cls")
-    log_label_baseline("l1a_transition_risk", targets["transition_risk"][end_idx][window_train], task="cls")
-    log_label_baseline("l1a_trend_continuation", targets["trend_continuation"][end_idx][window_train], task="cls")
-    log_label_baseline("l1a_reversal_risk", targets["reversal_risk"][end_idx][window_train], task="cls")
+    log_label_baseline("l1a_transition_risk", targets["transition_risk"][end_idx][window_train], task="reg")
     log_label_baseline("l1a_vol_forecast", targets["vol_forecast"][end_idx][window_train], task="reg")
-    log_label_baseline("l1a_risk_flag", targets["risk_flag"][end_idx][window_train], task="cls")
 
     model = L1AMarketTCN(len(feature_cols)).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
@@ -694,7 +636,14 @@ def load_l1a_market_encoder() -> tuple[L1AMarketTCN, dict[str, Any]]:
     feature_cols = list(meta["feature_cols"])
     model = L1AMarketTCN(len(feature_cols), seq_len=int(meta.get("seq_len", SEQ_LEN))).to(DEVICE)
     state = torch.load(os.path.join(MODEL_DIR, meta.get("model_file", L1A_MODEL_FILE)), map_location=DEVICE)
-    model.load_state_dict(state)
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "L1a checkpoint is incompatible with the current head contract. "
+            "Retrain L1a so the saved model/meta match schema "
+            f"{L1A_SCHEMA_VERSION}."
+        ) from exc
     model.eval()
     return model, meta
 
