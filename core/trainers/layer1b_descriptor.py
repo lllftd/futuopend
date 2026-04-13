@@ -171,10 +171,84 @@ def _clip01(x: np.ndarray | float) -> np.ndarray:
     return np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
 
 
-def _sigmoid_score(x: np.ndarray | float, *, center: float, scale: float) -> np.ndarray:
-    z = (np.asarray(x, dtype=np.float32) - float(center)) / max(float(scale), 1e-6)
-    z = np.clip(z, -12.0, 12.0)
-    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+def _robust_clipped_zscore(
+    x: np.ndarray,
+    *,
+    fit_mask: np.ndarray | None = None,
+    clip_z: float = 3.0,
+) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32).ravel()
+    fit = np.isfinite(arr)
+    if fit_mask is not None:
+        fit &= np.asarray(fit_mask, dtype=bool).ravel()
+    finite = arr[fit]
+    if finite.size == 0:
+        finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med)))
+    scale = max(1.4826 * mad, 0.25 * float(np.std(finite)), 1e-3)
+    z = (arr - med) / scale
+    return np.clip(z, -float(clip_z), float(clip_z)).astype(np.float32)
+
+
+def _train_only_percentile_map(
+    x: np.ndarray,
+    *,
+    fit_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32).ravel()
+    bad = ~np.isfinite(arr)
+    fit = np.isfinite(arr)
+    if fit_mask is not None:
+        fit &= np.asarray(fit_mask, dtype=bool).ravel()
+    finite = np.sort(arr[fit])
+    if finite.size == 0:
+        finite = np.sort(arr[np.isfinite(arr)])
+    if finite.size == 0:
+        return np.full_like(arr, 0.5, dtype=np.float32)
+    left = np.searchsorted(finite, arr, side="left").astype(np.float32)
+    right = np.searchsorted(finite, arr, side="right").astype(np.float32)
+    pct = 0.5 * (left + right) / max(float(finite.size), 1.0)
+    pct[bad] = 0.5
+    return np.clip(pct, 0.0, 1.0).astype(np.float32)
+
+
+def _rank_normalized_target(
+    x: np.ndarray,
+    *,
+    fit_mask: np.ndarray | None = None,
+    tail_boost: float = 0.0,
+) -> np.ndarray:
+    z = _robust_clipped_zscore(x, fit_mask=fit_mask, clip_z=3.0)
+    pct = _train_only_percentile_map(z, fit_mask=fit_mask)
+    if tail_boost > 0.0:
+        upper = np.clip((pct - 0.80) / 0.20, 0.0, 1.0)
+        pct = np.clip((1.0 - float(tail_boost)) * pct + float(tail_boost) * upper, 0.0, 1.0)
+    return pct.astype(np.float32)
+
+
+def _upper_tail_sample_weight(
+    y: np.ndarray,
+    *,
+    fit_mask: np.ndarray | None = None,
+    start_pct: float = 0.80,
+    alpha: float = 2.0,
+) -> np.ndarray:
+    arr = np.asarray(y, dtype=np.float32).ravel()
+    fit = np.isfinite(arr)
+    if fit_mask is not None:
+        fit &= np.asarray(fit_mask, dtype=bool).ravel()
+    finite = arr[fit]
+    if finite.size == 0:
+        return np.ones_like(arr, dtype=np.float32)
+    cutoff = float(np.quantile(finite, float(np.clip(start_pct, 0.5, 0.99))))
+    denom = max(1.0 - cutoff, 1e-3)
+    safe = np.where(np.isfinite(arr), arr, cutoff).astype(np.float32, copy=False)
+    tail = np.clip((safe - cutoff) / denom, 0.0, 1.0)
+    weights = 1.0 + float(alpha) * tail
+    return weights.astype(np.float32)
 
 
 def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
@@ -303,6 +377,14 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str
             "pa_vol_zscore_20",
             "pa_hmm_transition_pressure",
             "pa_vol_evr_ratio",
+            "bo_range_atr",
+            "bo_body_atr",
+            "pa_vol_rvol",
+            "pa_vol_momentum",
+            "pa_ctx_range_pressure",
+            "pa_ctx_structure_veto",
+            "pa_ctx_premise_break_long",
+            "pa_ctx_premise_break_short",
         ],
         "l1b_liquidity_score": [
             "pa_vol_rvol",
@@ -398,7 +480,11 @@ def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray
     }
 
 
-def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
+def _build_l1b_targets(
+    df: pd.DataFrame,
+    *,
+    fit_mask: np.ndarray | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
     direct_outputs = _build_l1b_direct_semantic_outputs(df)
     edge = np.clip(_decision_edge_atr_array(df), -4.0, 4.0).astype(np.float32)
     mfe, mae = _mfe_mae_atr_arrays(df)
@@ -416,29 +502,30 @@ def _build_l1b_targets(df: pd.DataFrame) -> tuple[dict[str, np.ndarray], dict[st
     early_peak_bonus = np.clip(1.0 - peak_frac, 0.0, 1.0).astype(np.float32)
     rr = mfe / np.maximum(mae, 0.10)
     pullback_raw = (
-        0.42 * _sigmoid_score(edge, center=0.10, scale=0.30)
-        + 0.22 * _sigmoid_score(rr, center=1.15, scale=0.45)
-        + 0.20 * late_peak_bonus
-        + 0.10 * _sigmoid_score(-mae, center=-0.75, scale=0.30)
-        + 0.06 * _sigmoid_score(mfe, center=0.80, scale=0.35)
-    )
+        0.52 * np.clip(edge, -1.0, 3.0)
+        + 0.18 * np.clip(rr - 1.0, -1.0, 2.0)
+        + 0.15 * late_peak_bonus
+        - 0.20 * np.clip(mae, 0.0, 3.0)
+        + 0.08 * np.clip(mfe, 0.0, 4.0)
+    ).astype(np.float32)
     failure_raw = (
-        0.45 * _sigmoid_score(-edge, center=0.05, scale=0.30)
-        + 0.23 * _sigmoid_score(mae, center=0.95, scale=0.28)
-        + 0.17 * _sigmoid_score(1.0 - rr, center=0.05, scale=0.35)
-        + 0.15 * early_peak_bonus
-    )
+        0.54 * np.clip(-edge, -1.0, 3.0)
+        + 0.24 * np.clip(mae, 0.0, 3.0)
+        + 0.14 * np.clip(1.25 - rr, -1.0, 1.5)
+        + 0.08 * early_peak_bonus
+        + 0.06 * np.clip(np.abs(edge), 0.0, 3.0)
+    ).astype(np.float32)
     shock_raw = (
-        0.30 * _sigmoid_score(mfe + mae, center=1.40, scale=0.45)
-        + 0.25 * _sigmoid_score(np.abs(edge), center=0.55, scale=0.25)
-        + 0.20 * _sigmoid_score(mae, center=0.90, scale=0.25)
+        0.32 * np.clip(mfe + mae, 0.0, 6.0)
+        + 0.24 * np.clip(np.abs(edge), 0.0, 4.0)
+        + 0.18 * np.clip(mae, 0.0, 4.0)
         + 0.15 * early_peak_bonus
-        + 0.10 * _sigmoid_score(np.abs(mfe - mae), center=0.50, scale=0.25)
-    )
+        + 0.11 * np.clip(np.abs(mfe - mae), 0.0, 4.0)
+    ).astype(np.float32)
     targets = {
-        "l1b_pullback_setup": _clip01(pullback_raw),
-        "l1b_failure_risk": _clip01(failure_raw),
-        "l1b_shock_risk": _clip01(shock_raw),
+        "l1b_pullback_setup": _rank_normalized_target(pullback_raw, fit_mask=fit_mask),
+        "l1b_failure_risk": _rank_normalized_target(failure_raw, fit_mask=fit_mask),
+        "l1b_shock_risk": _rank_normalized_target(shock_raw, fit_mask=fit_mask, tail_boost=0.25),
     }
     cross = compute_cross_asset_context(df)
     cross.index = df.index
@@ -527,7 +614,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
     cal_mask = splits.cal_mask
-    targets, direct_outputs, cross = _build_l1b_targets(work)
+    targets, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
     cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")
@@ -612,21 +699,34 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "seed": 42,
             "n_jobs": _lgbm_n_jobs(),
         }
+        rounds_head = int(rounds)
+        es_rounds_head = int(es_rounds)
+        train_weight = None
         if name == "l1b_shock_risk":
             params.update(
                 {
-                    "learning_rate": 0.02,
-                    "num_leaves": 31,
-                    "max_depth": 5,
-                    "min_child_samples": 50,
-                    "feature_fraction": 0.7,
+                    "learning_rate": 0.012,
+                    "num_leaves": 63,
+                    "max_depth": 7,
+                    "min_child_samples": 40,
+                    "feature_fraction": 0.9,
+                    "bagging_fraction": 0.85,
                 }
             )
-        dtrain = lgb.Dataset(X_head[train_mask], label=y[train_mask], feature_name=head_feature_cols, free_raw_data=False)
+            rounds_head = 500 if FAST_TRAIN_MODE else 2500
+            es_rounds_head = 80 if FAST_TRAIN_MODE else 180
+            train_weight = _upper_tail_sample_weight(y, fit_mask=train_mask, start_pct=0.80, alpha=2.5)[train_mask]
+        dtrain = lgb.Dataset(
+            X_head[train_mask],
+            label=y[train_mask],
+            weight=None if train_weight is None else train_weight.astype(np.float32, copy=False),
+            feature_name=head_feature_cols,
+            free_raw_data=False,
+        )
         dval = lgb.Dataset(X_head[val_mask], label=y[val_mask], feature_name=head_feature_cols, free_raw_data=False)
-        callbacks, cleanups = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds, f"[L1b] {name}")
+        callbacks, cleanups = _lgb_train_callbacks_with_round_tqdm(es_rounds_head, rounds_head, f"[L1b] {name}")
         try:
-            model = lgb.train(params, dtrain, num_boost_round=rounds, valid_sets=[dval], callbacks=callbacks)
+            model = lgb.train(params, dtrain, num_boost_round=rounds_head, valid_sets=[dval], callbacks=callbacks)
         finally:
             for fn in cleanups:
                 fn()
@@ -666,6 +766,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "hybrid contract: deterministic semantic descriptors from current-bar context plus "
             "forward-looking predictive heads aligned to decision-window labels"
         ),
+        "target_shaping": "train-only robust clipping plus percentile normalization; shock_risk adds upper-tail emphasis",
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
     with open(os.path.join(MODEL_DIR, L1B_META_FILE), "wb") as f:

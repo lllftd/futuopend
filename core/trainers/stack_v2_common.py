@@ -128,7 +128,11 @@ def compute_cross_asset_context(df: pd.DataFrame) -> pd.DataFrame:
     breadth = (pivot.gt(0).mean(axis=1) * 2.0 - 1.0).astype(np.float32)
     centered = pivot.sub(market_mean, axis=0)
     out = work[["symbol", "time_key"]].copy()
-    out["sector_relative_strength"] = centered.stack(dropna=False).reindex(
+    try:
+        centered_stacked = centered.stack(future_stack=True)
+    except TypeError:
+        centered_stacked = centered.stack(dropna=False)
+    out["sector_relative_strength"] = centered_stacked.reindex(
         pd.MultiIndex.from_frame(work[["time_key", "symbol"]])
     ).to_numpy(dtype=np.float32, copy=False)
     out["market_breadth"] = work["time_key"].map(breadth).astype(np.float32)
@@ -137,7 +141,8 @@ def compute_cross_asset_context(df: pd.DataFrame) -> pd.DataFrame:
         corr = pivot.rolling(20, min_periods=5).corr()
         for ts, block in corr.groupby(level=0):
             vals = block.droplevel(0).to_numpy(dtype=np.float32, copy=False)
-            corr_map[ts] = float(np.nanmean(vals)) if vals.size else 0.0
+            finite = vals[np.isfinite(vals)]
+            corr_map[ts] = float(finite.mean()) if finite.size else 0.0
     out["correlation_regime"] = work["time_key"].map(corr_map).fillna(0.0).astype(np.float32)
     return out
 
