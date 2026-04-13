@@ -57,6 +57,12 @@ L1B_MODEL_HEADS = [
     "l1b_failure_risk",
     "l1b_shock_risk",
 ]
+L1B_LATENT_HEADS = [
+    "l1b_latent_0",
+    "l1b_latent_1",
+    "l1b_latent_2",
+    "l1b_novelty_score",
+]
 L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_breakout_quality",
     "l1b_mean_reversion_setup",
@@ -67,13 +73,13 @@ L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_follow_through_score",
     "l1b_liquidity_score",
 ]
-L1B_BINARY_HEADS: tuple[str, ...] = ()
+L1B_BINARY_HEADS: tuple[str, ...] = tuple(L1B_MODEL_HEADS)
 L1B_DIRECT_CONTEXT_COLS = [
     "l1b_sector_relative_strength",
     "l1b_correlation_regime",
     "l1b_market_breadth",
 ]
-L1B_OUTPUT_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_MODEL_HEADS) + list(L1B_DIRECT_CONTEXT_COLS)
+L1B_OUTPUT_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_MODEL_HEADS) + list(L1B_LATENT_HEADS) + list(L1B_DIRECT_CONTEXT_COLS)
 
 
 @dataclass
@@ -249,6 +255,204 @@ def _upper_tail_sample_weight(
     tail = np.clip((safe - cutoff) / denom, 0.0, 1.0)
     weights = 1.0 + float(alpha) * tail
     return weights.astype(np.float32)
+
+
+def _env_float_clipped(key: str, default: float, *, lo: float, hi: float) -> float:
+    raw = os.environ.get(key, "").strip()
+    val = default if not raw else float(raw)
+    return float(np.clip(val, lo, hi))
+
+
+def _fit_train_quantile_range(values: np.ndarray, fit_mask: np.ndarray, *, q_low: float = 0.05, q_high: float = 0.95) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float32).ravel()
+    fit = np.asarray(fit_mask, dtype=bool).ravel() & np.isfinite(arr)
+    finite = arr[fit]
+    if finite.size == 0:
+        finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    lo = float(np.quantile(finite, q_low))
+    hi = float(np.quantile(finite, q_high))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-6:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _scale_by_train_quantiles(values: np.ndarray, fit_mask: np.ndarray, *, q_low: float = 0.05, q_high: float = 0.95) -> np.ndarray:
+    lo, hi = _fit_train_quantile_range(values, fit_mask, q_low=q_low, q_high=q_high)
+    arr = np.asarray(values, dtype=np.float32)
+    return np.clip((arr - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+
+
+def _build_l1b_candidate_scores(df: pd.DataFrame, direct_outputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    trend = np.maximum(_col_f32(df, "pa_ctx_setup_trend_long"), _col_f32(df, "pa_ctx_setup_trend_short"))
+    pullback = np.maximum(_col_f32(df, "pa_ctx_setup_pullback_long"), _col_f32(df, "pa_ctx_setup_pullback_short"))
+    follow = np.maximum(_col_f32(df, "pa_ctx_follow_through_long"), _col_f32(df, "pa_ctx_follow_through_short"))
+    failed = np.maximum(_col_f32(df, "pa_ctx_setup_failed_breakout_long"), _col_f32(df, "pa_ctx_setup_failed_breakout_short"))
+    premise_break = np.maximum(_col_f32(df, "pa_ctx_premise_break_long"), _col_f32(df, "pa_ctx_premise_break_short"))
+    structure_veto = _col_f32(df, "pa_ctx_structure_veto")
+    range_pressure = _col_f32(df, "pa_ctx_range_pressure")
+    inside = _clip01(_col_f32(df, "bo_inside_prior"))
+    wick = _clip01(_col_f32(df, "bo_wick_imbalance"))
+    close_ext = _clip01(_col_f32(df, "bo_close_extremity"))
+    vol_spike = _clip01(np.clip(_col_f32(df, "bo_vol_spike"), 0.0, 2.0) / 2.0)
+    atr_z = _clip01(np.clip(_col_f32(df, "bo_atr_zscore"), 0.0, 3.0) / 3.0)
+    garch_shock = _clip01(np.clip(_col_f32(df, "pa_garch_shock"), 0.0, 2.0) / 2.0)
+    downside = _clip01((np.clip(_col_f32(df, "pa_egarch_downside_vol_ratio"), 0.8, 2.0) - 0.8) / 1.2)
+    std_resid = _clip01(np.clip(np.abs(_col_f32(df, "pa_egarch_std_residual")), 0.0, 3.0) / 3.0)
+    vol_rvol = _clip01((np.clip(_col_f32(df, "pa_vol_rvol"), 0.5, 2.5) - 0.5) / 2.0)
+
+    pullback_score = _clip01(
+        0.34 * trend
+        + 0.24 * pullback
+        + 0.18 * follow
+        + 0.10 * direct_outputs["l1b_trend_strength"]
+        + 0.08 * inside
+        + 0.06 * (1.0 - 0.5 * structure_veto)
+    )
+    failure_score = _clip01(
+        0.28 * failed
+        + 0.24 * premise_break
+        + 0.18 * structure_veto
+        + 0.12 * wick
+        + 0.10 * garch_shock
+        + 0.08 * atr_z
+    )
+    shock_score = _clip01(
+        0.24 * garch_shock
+        + 0.18 * downside
+        + 0.18 * std_resid
+        + 0.15 * vol_spike
+        + 0.13 * atr_z
+        + 0.12 * vol_rvol
+    )
+    return {
+        "l1b_pullback_setup": pullback_score.astype(np.float32, copy=False),
+        "l1b_failure_risk": failure_score.astype(np.float32, copy=False),
+        "l1b_shock_risk": shock_score.astype(np.float32, copy=False),
+    }
+
+
+def _build_l1b_semantic_binary_targets(
+    raw_targets: dict[str, np.ndarray],
+    candidate_scores: dict[str, np.ndarray],
+    *,
+    train_mask: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict[str, float]]]:
+    cfg = {
+        "l1b_pullback_setup": {"cand_thr": 0.30, "pos_q": 0.65},
+        "l1b_failure_risk": {"cand_thr": 0.25, "pos_q": 0.65},
+        "l1b_shock_risk": {"cand_thr": 0.20, "pos_q": 0.70},
+    }
+    labels: dict[str, np.ndarray] = {}
+    candidate_masks: dict[str, np.ndarray] = {}
+    meta: dict[str, dict[str, float]] = {}
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    for name, raw in raw_targets.items():
+        cand_score = np.asarray(candidate_scores[name], dtype=np.float32).ravel()
+        cand_thr = float(cfg[name]["cand_thr"])
+        pos_q = float(cfg[name]["pos_q"])
+        cand_mask = cand_score >= cand_thr
+        fit = cand_mask & train & np.isfinite(np.asarray(raw, dtype=np.float32).ravel())
+        fit_vals = np.asarray(raw, dtype=np.float32).ravel()[fit]
+        if fit_vals.size < 50:
+            labels[name] = np.zeros(len(cand_score), dtype=np.float32)
+            candidate_masks[name] = cand_mask.astype(bool)
+            meta[name] = {
+                "candidate_threshold": cand_thr,
+                "positive_quantile": pos_q,
+                "raw_positive_threshold": float("nan"),
+                "candidate_train_coverage": float(np.mean(cand_mask[train])) if train.any() else 0.0,
+                "candidate_train_rows": float(fit_vals.size),
+                "positive_rate_in_candidate_train": 0.0,
+            }
+            continue
+        pos_thr = float(np.quantile(fit_vals, pos_q))
+        y = (cand_mask & (np.asarray(raw, dtype=np.float32).ravel() >= pos_thr)).astype(np.float32)
+        labels[name] = y
+        candidate_masks[name] = cand_mask.astype(bool)
+        meta[name] = {
+            "candidate_threshold": cand_thr,
+            "positive_quantile": pos_q,
+            "raw_positive_threshold": pos_thr,
+            "candidate_train_coverage": float(np.mean(cand_mask[train])) if train.any() else 0.0,
+            "candidate_train_rows": float(fit_vals.size),
+            "positive_rate_in_candidate_train": float(np.mean(y[fit])) if fit.any() else 0.0,
+        }
+    return labels, candidate_masks, meta
+
+
+def _fit_l1b_latent_block(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    train_mask: np.ndarray,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    latent_cols = list(feature_cols)
+    X = df[latent_cols].to_numpy(dtype=np.float32, copy=False)
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    X_train = X[train]
+    mean = np.mean(X_train, axis=0).astype(np.float32)
+    scale = np.std(X_train, axis=0).astype(np.float32)
+    scale = np.where(scale > 1e-6, scale, 1.0).astype(np.float32)
+    Xz = ((X - mean) / scale).astype(np.float32)
+    Xz_train = Xz[train]
+    cov = np.cov(Xz_train, rowvar=False).astype(np.float64)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = np.clip(eigvals[order], 0.0, None)
+    eigvecs = eigvecs[:, order]
+    n_comp = min(3, eigvecs.shape[1])
+    comps = eigvecs[:, :n_comp].astype(np.float32)
+    emb = Xz @ comps
+    recon = emb @ comps.T
+    resid = np.mean((Xz - recon) ** 2, axis=1).astype(np.float32)
+    novelty_lo, novelty_hi = _fit_train_quantile_range(resid, train_mask, q_low=0.05, q_high=0.95)
+    novelty = np.clip((resid - novelty_lo) / max(novelty_hi - novelty_lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    total_var = float(np.sum(eigvals)) if eigvals.size else 0.0
+    explained = (eigvals[:n_comp] / max(total_var, 1e-8)).astype(np.float32)
+    out = pd.DataFrame(index=df.index)
+    for i in range(n_comp):
+        out[f"l1b_latent_{i}"] = emb[:, i].astype(np.float32, copy=False)
+    for i in range(n_comp, len(L1B_LATENT_HEADS) - 1):
+        out[f"l1b_latent_{i}"] = np.zeros(len(df), dtype=np.float32)
+    out["l1b_novelty_score"] = novelty.astype(np.float32, copy=False)
+    meta = {
+        "feature_cols": latent_cols,
+        "mean": mean,
+        "scale": scale,
+        "components": comps,
+        "explained_variance_ratio": explained,
+        "novelty_lo": float(novelty_lo),
+        "novelty_hi": float(novelty_hi),
+    }
+    return out, meta
+
+
+def _apply_l1b_latent_block(df: pd.DataFrame, latent_meta: dict[str, Any]) -> pd.DataFrame:
+    feature_cols = list(latent_meta.get("feature_cols") or [])
+    work = df.copy()
+    for col in feature_cols:
+        if col not in work.columns:
+            work[col] = 0.0
+    X = work[feature_cols].to_numpy(dtype=np.float32, copy=False)
+    mean = np.asarray(latent_meta.get("mean"), dtype=np.float32)
+    scale = np.asarray(latent_meta.get("scale"), dtype=np.float32)
+    comps = np.asarray(latent_meta.get("components"), dtype=np.float32)
+    Xz = ((X - mean) / np.where(scale > 1e-6, scale, 1.0)).astype(np.float32)
+    emb = Xz @ comps
+    recon = emb @ comps.T
+    resid = np.mean((Xz - recon) ** 2, axis=1).astype(np.float32)
+    novelty_lo = float(latent_meta.get("novelty_lo", 0.0))
+    novelty_hi = float(latent_meta.get("novelty_hi", 1.0))
+    novelty = np.clip((resid - novelty_lo) / max(novelty_hi - novelty_lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    out = pd.DataFrame(index=work.index)
+    for i in range(comps.shape[1]):
+        out[f"l1b_latent_{i}"] = emb[:, i].astype(np.float32, copy=False)
+    for i in range(comps.shape[1], len(L1B_LATENT_HEADS) - 1):
+        out[f"l1b_latent_{i}"] = np.zeros(len(work), dtype=np.float32)
+    out["l1b_novelty_score"] = novelty.astype(np.float32, copy=False)
+    return out
 
 
 def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
@@ -484,7 +688,15 @@ def _build_l1b_targets(
     df: pd.DataFrame,
     *,
     fit_mask: np.ndarray | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray], pd.DataFrame]:
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, dict[str, float]],
+    dict[str, np.ndarray],
+    pd.DataFrame,
+]:
     direct_outputs = _build_l1b_direct_semantic_outputs(df)
     edge = np.clip(_decision_edge_atr_array(df), -4.0, 4.0).astype(np.float32)
     mfe, mae = _mfe_mae_atr_arrays(df)
@@ -527,11 +739,13 @@ def _build_l1b_targets(
         "l1b_failure_risk": failure_raw,
         "l1b_shock_risk": shock_raw,
     }
-    targets = {
-        "l1b_pullback_setup": _rank_normalized_target(pullback_raw, fit_mask=fit_mask),
-        "l1b_failure_risk": _rank_normalized_target(failure_raw, fit_mask=fit_mask),
-        "l1b_shock_risk": _rank_normalized_target(shock_raw, fit_mask=fit_mask, tail_boost=0.25),
-    }
+    fit = np.asarray(fit_mask if fit_mask is not None else np.ones(len(df), dtype=bool), dtype=bool)
+    candidate_scores = _build_l1b_candidate_scores(df, direct_outputs)
+    targets, candidate_masks, target_meta = _build_l1b_semantic_binary_targets(
+        raw_targets,
+        candidate_scores,
+        train_mask=fit,
+    )
     cross = compute_cross_asset_context(df)
     cross.index = df.index
     cross = cross.rename(
@@ -541,7 +755,7 @@ def _build_l1b_targets(
             "market_breadth": "l1b_market_breadth",
         }
     )
-    return raw_targets, targets, direct_outputs, cross
+    return raw_targets, targets, candidate_scores, candidate_masks, target_meta, direct_outputs, cross
 
 
 def _compute_l1b_deterministic_outputs(
@@ -672,6 +886,30 @@ def _log_l1b_target_diagnostics(
         )
 
 
+def _log_l1b_candidate_diagnostics(
+    head: str,
+    candidate_score: np.ndarray,
+    candidate_mask: np.ndarray,
+    labels: np.ndarray,
+    *,
+    train_mask: np.ndarray,
+) -> None:
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    cand = np.asarray(candidate_mask, dtype=bool).ravel()
+    score = np.asarray(candidate_score, dtype=np.float32).ravel()
+    y = np.asarray(labels, dtype=np.float32).ravel()
+    cand_train = cand & train
+    coverage = float(np.mean(cand_train)) if train.any() else 0.0
+    pos_rate = float(np.mean(y[cand_train])) if cand_train.any() else 0.0
+    score_pcts = np.percentile(score[train], [5, 25, 50, 75, 95]).tolist() if train.any() else [0.0] * 5
+    print(f"  [L1b] candidate diagnostic — {head} [train]", flush=True)
+    print(
+        f"    coverage={coverage:.3f}  candidate_rows={int(np.sum(cand_train)):,}  "
+        f"positive_rate_in_candidate={pos_rate:.3f}  score_pcts={np.round(score_pcts, 4).tolist()}",
+        flush=True,
+    )
+
+
 def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTrainingBundle:
     work = df.copy()
     feature_cols = _select_l1b_feature_cols(work, feat_cols)
@@ -680,7 +918,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
     cal_mask = splits.cal_mask
-    raw_targets, targets, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
+    raw_targets, targets, candidate_scores, candidate_masks, target_meta, direct_outputs, cross = _build_l1b_targets(work, fit_mask=train_mask)
     cross_context_reliable = _l1b_cross_context_reliable(work)
 
     log_layer_banner("[L1b] Tabular market descriptor")
@@ -722,9 +960,17 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         ],
         axis=1,
     )
+    latent_outputs, latent_meta = _fit_l1b_latent_block(work, feature_cols, train_mask=train_mask)
+    outputs = pd.concat([outputs, latent_outputs.reset_index(drop=True)], axis=1)
     print(f"  [L1b] model heads: {L1B_MODEL_HEADS}", flush=True)
+    print(f"  [L1b] latent heads: {L1B_LATENT_HEADS}", flush=True)
     print(f"  [L1b] direct semantic heads: {L1B_DIRECT_SEMANTIC_COLS}", flush=True)
     print(f"  [L1b] direct context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
+    print(
+        f"  [L1b] latent explained_variance_ratio={np.round(np.asarray(latent_meta['explained_variance_ratio'], dtype=np.float32), 4).tolist()}  "
+        f"novelty_mean={float(np.mean(latent_outputs['l1b_novelty_score'])):.4f}",
+        flush=True,
+    )
     if not cross_context_reliable:
         print(
             "  [L1b] cross-asset context deemed unreliable (need at least 2 aligned symbols/200 rows); direct context heads will be zeroed.",
@@ -740,8 +986,13 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         disable=not _lgb_round_tqdm_enabled(),
     ):
         binary = name in L1B_BINARY_HEADS
-        log_label_baseline(name, y[train_mask], task="cls" if binary else "reg")
+        cand_mask = np.asarray(candidate_masks[name], dtype=bool)
+        train_rows = train_mask & cand_mask
+        val_rows = val_mask & cand_mask
+        cal_rows = cal_mask & cand_mask
+        log_label_baseline(name, y[train_rows], task="cls" if binary else "reg")
         _log_l1b_target_diagnostics(name, raw_targets[name], y, train_mask=train_mask)
+        _log_l1b_candidate_diagnostics(name, candidate_scores[name], cand_mask, y, train_mask=train_mask)
         head_feature_cols, used_fallback = _l1b_head_feature_cols(name, feature_cols)
         X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
         print(f"  [L1b] {name}: input_dim={len(head_feature_cols)}", flush=True)
@@ -750,6 +1001,21 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
                 f"  [L1b] {name}: head-specific feature subset was sparse; augmented with safe fallback features.",
                 flush=True,
             )
+        if (
+            int(train_rows.sum()) < 200
+            or int(val_rows.sum()) < 50
+            or len(np.unique(y[train_rows])) < 2
+            or len(np.unique(y[val_rows])) < 2
+        ):
+            const = float(np.mean(y[train_rows])) if int(train_rows.sum()) else 0.0
+            print(
+                f"  [L1b] {name}: skip model (train_rows={int(train_rows.sum())}, val_rows={int(val_rows.sum())}, "
+                f"train_classes={len(np.unique(y[train_rows]))}, val_classes={len(np.unique(y[val_rows]))}) -> constant prior={const:.4f}",
+                flush=True,
+            )
+            outputs[name] = np.asarray(candidate_scores[name], dtype=np.float32) * const
+            constant_output_values[name] = const
+            continue
         params = {
             "objective": "binary" if binary else "regression",
             "metric": "binary_logloss" if binary else "l2",
@@ -765,10 +1031,11 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "verbosity": -1,
             "seed": 42,
             "n_jobs": _lgbm_n_jobs(),
+            "is_unbalance": bool(binary),
         }
         rounds_head = int(rounds)
         es_rounds_head = int(es_rounds)
-        train_weight = None
+        train_weight = (0.5 + np.asarray(candidate_scores[name], dtype=np.float32))[train_rows]
         if name == "l1b_shock_risk":
             params.update(
                 {
@@ -782,15 +1049,16 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             )
             rounds_head = 500 if FAST_TRAIN_MODE else 2500
             es_rounds_head = 80 if FAST_TRAIN_MODE else 180
-            train_weight = _upper_tail_sample_weight(y, fit_mask=train_mask, start_pct=0.80, alpha=2.5)[train_mask]
+            pos_boost = np.where(y[train_rows] > 0.5, 1.75, 1.0).astype(np.float32)
+            train_weight = train_weight.astype(np.float32, copy=False) * pos_boost
         dtrain = lgb.Dataset(
-            X_head[train_mask],
-            label=y[train_mask],
+            X_head[train_rows],
+            label=y[train_rows],
             weight=None if train_weight is None else train_weight.astype(np.float32, copy=False),
             feature_name=head_feature_cols,
             free_raw_data=False,
         )
-        dval = lgb.Dataset(X_head[val_mask], label=y[val_mask], feature_name=head_feature_cols, free_raw_data=False)
+        dval = lgb.Dataset(X_head[val_rows], label=y[val_rows], feature_name=head_feature_cols, free_raw_data=False)
         callbacks, cleanups = _lgb_train_callbacks_with_round_tqdm(es_rounds_head, rounds_head, f"[L1b] {name}")
         try:
             model = lgb.train(params, dtrain, num_boost_round=rounds_head, valid_sets=[dval], callbacks=callbacks)
@@ -798,10 +1066,11 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             for fn in cleanups:
                 fn()
         model_map[name] = model
-        pred_full = model.predict(X_head).astype(np.float32)
-        _l1b_val_report(name, y[val_mask], pred_full[val_mask])
-        if cal_mask.sum() != val_mask.sum():
-            _l1b_val_report(f"{name} [cal_full]", y[cal_mask], pred_full[cal_mask])
+        pred_model = model.predict(X_head).astype(np.float32)
+        pred_full = np.asarray(candidate_scores[name], dtype=np.float32) * pred_model
+        _l1b_val_report(name, y[val_rows], pred_full[val_rows])
+        if cal_rows.sum() != val_rows.sum():
+            _l1b_val_report(f"{name} [cal_full]", y[cal_rows], pred_full[cal_rows])
         outputs[name] = pred_full
 
     if model_map:
@@ -822,18 +1091,21 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "feature_cols": feature_cols,
         "output_cols": L1B_OUTPUT_COLS,
         "model_output_cols": sorted(model_map),
+        "latent_output_cols": list(L1B_LATENT_HEADS),
         "direct_output_cols": sorted(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deterministic_output_cols": list(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deprecated_output_cols": [],
         "constant_output_values": constant_output_values,
         "model_files": model_files,
         "head_feature_cols": {name: _l1b_head_feature_cols(name, feature_cols)[0] for name in model_map},
+        "semantic_candidate_meta": target_meta,
         "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": (
-            "hybrid contract: deterministic semantic descriptors from current-bar context plus "
-            "forward-looking predictive heads aligned to decision-window labels"
+            "hybrid contract: deterministic semantic descriptors from current-bar context, "
+            "candidate-aware semantic classification heads, and train-only latent context heads"
         ),
-        "target_shaping": "train-only robust clipping plus percentile normalization; shock_risk adds upper-tail emphasis",
+        "target_shaping": "candidate-aware binary labels from raw weak targets; outputs are candidate-weighted probabilities",
+        "latent_head_meta": latent_meta,
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
     with open(os.path.join(MODEL_DIR, L1B_META_FILE), "wb") as f:
@@ -867,6 +1139,7 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
             work[col] = 0.0
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     direct_outputs = _build_l1b_direct_semantic_outputs(work)
+    candidate_scores = _build_l1b_candidate_scores(work, direct_outputs)
     cross = compute_cross_asset_context(work)
     cross.index = work.index
     cross = cross.rename(
@@ -887,8 +1160,11 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
         ],
         axis=1,
     )
+    latent_meta = meta.get("latent_head_meta") or {}
+    if latent_meta:
+        outputs = pd.concat([outputs, _apply_l1b_latent_block(work, latent_meta).reset_index(drop=True)], axis=1)
     for name, value in (meta.get("constant_output_values") or {}).items():
-        outputs[name] = np.full(len(work), float(value), dtype=np.float32)
+        outputs[name] = np.asarray(candidate_scores.get(name, np.ones(len(work), dtype=np.float32)), dtype=np.float32) * float(value)
     head_feature_cols_map = meta.get("head_feature_cols") or {}
     for name, model in models.items():
         head_feature_cols = list(head_feature_cols_map.get(name) or feature_cols)
@@ -896,7 +1172,8 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
             if col not in work.columns:
                 work[col] = 0.0
         X_head = work[head_feature_cols].to_numpy(dtype=np.float32, copy=False)
-        outputs[name] = model.predict(X_head).astype(np.float32)
+        pred = model.predict(X_head).astype(np.float32)
+        outputs[name] = np.asarray(candidate_scores.get(name, np.ones(len(work), dtype=np.float32)), dtype=np.float32) * pred
     for col in meta.get("output_cols", L1B_OUTPUT_COLS):
         if col not in outputs.columns:
             outputs[col] = 0.0
