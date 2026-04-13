@@ -181,6 +181,35 @@ def _l2_direction_margin_to_prob(direction_margin: np.ndarray, *, temperature: f
     return (1.0 / (1.0 + np.exp(-z))).astype(np.float64)
 
 
+def _l2_recenter_direction_prob(dir_p: np.ndarray, *, center: float | np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(dir_p, dtype=np.float64).ravel(), 1e-6, 1.0 - 1e-6)
+    c = np.asarray(center, dtype=np.float64)
+    if c.ndim == 0:
+        c = np.full(len(p), float(c), dtype=np.float64)
+    else:
+        c = np.broadcast_to(c.reshape(-1), p.shape)
+    c = np.clip(c, 1e-3, 1.0 - 1e-3)
+    logits = np.log(p / (1.0 - p)) - np.log(c / (1.0 - c))
+    return (1.0 / (1.0 + np.exp(-np.clip(logits, -12.0, 12.0)))).astype(np.float64)
+
+
+def _l2_direction_sample_weights(y_dir: np.ndarray) -> np.ndarray:
+    y = np.asarray(y_dir, dtype=np.int64).ravel()
+    active = y >= 0
+    w = np.ones(len(y), dtype=np.float32)
+    if not active.any():
+        return w
+    y_act = y[active]
+    n_short = max(int(np.sum(y_act == 0)), 1)
+    n_long = max(int(np.sum(y_act == 1)), 1)
+    total = n_short + n_long
+    short_w = float(np.clip(total / (2.0 * n_short), 0.75, 3.0))
+    long_w = float(np.clip(total / (2.0 * n_long), 0.75, 3.0))
+    w[active & (y == 0)] = short_w
+    w[active & (y == 1)] = long_w
+    return w
+
+
 def _split_mask_for_tuning_and_report(
     time_key: pd.Series | np.ndarray,
     base_mask: np.ndarray,
@@ -247,6 +276,7 @@ def _l2_predict_gate_dir_probs(
     trade_threshold: float,
     direction_head_type: str = "probability",
     direction_temperature: float | np.ndarray = 0.35,
+    direction_center: float | np.ndarray = 0.5,
     gate_calibrator: IsotonicRegression | None = None,
     gate_raw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -264,14 +294,22 @@ def _l2_predict_gate_dir_probs(
             temp_arr = np.full(len(X), float(temp_arr), dtype=np.float64)
         else:
             temp_arr = np.broadcast_to(temp_arr.reshape(-1), (len(X),))
+        center_arr = np.asarray(direction_center, dtype=np.float64)
+        if center_arr.ndim == 0:
+            center_arr = np.full(len(X), float(center_arr), dtype=np.float64)
+        else:
+            center_arr = np.broadcast_to(center_arr.reshape(-1), (len(X),))
         m = gate_p >= thr_arr
         if m.any():
             raw = direction_model.predict(X[m]).astype(np.float64)
             if direction_head_type == "signed_edge_regression":
-                dir_p[m] = _l2_direction_margin_to_prob(raw, temperature=1.0)
-                dir_p[m] = (1.0 / (1.0 + np.exp(-np.clip(raw / np.maximum(temp_arr[m], 1e-3), -12.0, 12.0)))).astype(np.float64)
+                z = np.clip(raw / np.maximum(temp_arr[m], 1e-3), -12.0, 12.0)
+                dir_p[m] = _l2_recenter_direction_prob(
+                    1.0 / (1.0 + np.exp(-z)),
+                    center=center_arr[m],
+                )
             else:
-                dir_p[m] = raw
+                dir_p[m] = _l2_recenter_direction_prob(raw, center=center_arr[m])
     decision_probs = _l2_compose_probs_from_gate_dir(gate_p, dir_p)
     return gate_p.astype(np.float32), dir_p.astype(np.float32), decision_probs
 
@@ -326,6 +364,7 @@ def _log_l2_two_stage_val_diagnostics(
     y_dir: np.ndarray,
     y_decision: np.ndarray,
     trade_threshold: float,
+    direction_center: float | np.ndarray = 0.5,
 ) -> None:
     y_gate = np.asarray(y_gate, dtype=np.int64).ravel()
     y_decision = np.asarray(y_decision, dtype=np.int64).ravel()
@@ -362,6 +401,12 @@ def _log_l2_two_stage_val_diagnostics(
         print("\n  [L2] val — direction (deploy path: gated active bars)", flush=True)
         yda = y_dir[gated].astype(np.int32)
         dpa = dir_p[gated]
+        center_arr = np.asarray(direction_center, dtype=np.float64)
+        if center_arr.ndim == 0:
+            center_arr = np.full(len(dir_p), float(center_arr), dtype=np.float64)
+        else:
+            center_arr = np.broadcast_to(center_arr.reshape(-1), dir_p.shape)
+        center_g = center_arr[gated]
         try:
             auc_d = float(roc_auc_score(yda, dpa))
         except ValueError:
@@ -375,6 +420,12 @@ def _log_l2_two_stage_val_diagnostics(
         print(
             "    direction classification_report:\n"
             + classification_report(yda, pred_d, target_names=["short", "long"], digits=4, zero_division=0),
+            flush=True,
+        )
+        near_center = float(np.mean(np.abs(dpa - 0.5) <= 0.05))
+        print(
+            f"    direction center mean={float(np.mean(center_g)):.4f}  prob_pcts={np.round(np.percentile(dpa, [5, 25, 50, 75, 95]), 4).tolist()}  "
+            f"near_center(|p-0.5|<=0.05)={near_center:.3f}",
             flush=True,
         )
     elif act.sum() >= 20:
@@ -403,6 +454,9 @@ def _log_l2_extended_val_metrics(
     mfe_pred: np.ndarray,
     y_mae: np.ndarray,
     mae_pred: np.ndarray,
+    expected_edge_pred: np.ndarray | None = None,
+    true_edge: np.ndarray | None = None,
+    test_mask: np.ndarray | None = None,
 ) -> None:
     """Extra val diagnostics: multiclass Brier/ECE, lift, L1 entropy↔L2 conf, regression tails & degen."""
     vm = np.asarray(val_mask, dtype=bool)
@@ -497,6 +551,21 @@ def _log_l2_extended_val_metrics(
     ent = -np.sum(R * np.log(R), axis=1)
     c_l1_l2 = pearson_corr(ent, conf)
     print(f"    corr(L1 regime entropy, L2 max prob)={c_l1_l2:.4f}", flush=True)
+    if expected_edge_pred is not None and true_edge is not None:
+        e_pred = np.asarray(expected_edge_pred, dtype=np.float64).ravel()
+        e_true = np.asarray(true_edge, dtype=np.float64).ravel()
+        corr_all = pearson_corr(e_pred[vm], e_true[vm])
+        active = vm & (y_decision != 1)
+        corr_active = pearson_corr(e_pred[active], e_true[active]) if active.any() else float("nan")
+        sign_acc = float(np.mean(np.sign(e_pred[active]) == np.sign(e_true[active]))) if active.any() else float("nan")
+        print(
+            f"    expected_edge: corr_all={corr_all:.4f}  corr_active={corr_active:.4f}  sign_acc_active={sign_acc:.4f}",
+            flush=True,
+        )
+        if test_mask is not None and np.asarray(test_mask, dtype=bool).any():
+            tm = np.asarray(test_mask, dtype=bool).ravel()
+            corr_test = pearson_corr(e_pred[tm], e_true[tm])
+            print(f"    expected_edge holdout corr={corr_test:.4f}", flush=True)
 
     av = vm & (y_decision != 1)
     if av.sum() >= 5:
@@ -548,6 +617,7 @@ def _log_l2_l1b_ablation(
     trade_threshold: float,
     direction_head_type: str,
     direction_temperature: float,
+    direction_center: float | np.ndarray,
     gate_calibrator: IsotonicRegression | None,
 ) -> None:
     l1b_idx = [i for i, c in enumerate(feature_cols) if c.startswith("l1b_")]
@@ -600,6 +670,7 @@ def _log_l2_l1b_ablation(
             trade_threshold=trade_threshold,
             direction_head_type=direction_head_type,
             direction_temperature=direction_temperature,
+            direction_center=direction_center,
             gate_calibrator=gate_calibrator,
         )
         return _eval_probs(gate_p, dir_p, probs)
@@ -704,7 +775,7 @@ def _session_context(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _l2_target_trade_rate() -> float:
-    return float(np.clip(float(os.environ.get("L2_TARGET_TRADE_RATE", "0.10")), 0.08, 0.12))
+    return float(np.clip(float(os.environ.get("L2_TARGET_TRADE_RATE", "0.11")), 0.08, 0.14))
 
 
 def _l2_decision_edge_tau() -> float:
@@ -776,13 +847,17 @@ def _l2_policy_state_keys(frame: pd.DataFrame, *, vol_quantiles: list[float]) ->
     return _state_keys_from_regime_vol(regime_probs, vol_values, vol_quantiles=vol_quantiles)
 
 
-def _l2_conditional_policy_arrays(meta: dict[str, Any], frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _l2_conditional_policy_arrays(
+    meta: dict[str, Any],
+    frame: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     vol_quantiles = [float(x) for x in (meta.get("policy_state_vol_quantiles") or [])]
     state_keys = _l2_policy_state_keys(frame, vol_quantiles=vol_quantiles)
     by_state = meta.get("conditional_policy_by_state") or {}
     n = len(frame)
     thr = np.full(n, float(meta.get("trade_threshold", 0.35)), dtype=np.float32)
     temp = np.full(n, float(meta.get("direction_temperature", 0.35)), dtype=np.float32)
+    center = np.full(n, float(meta.get("direction_center", 0.5)), dtype=np.float32)
     reward = np.full(n, float(meta.get("expected_edge_reward_mult", 1.0)), dtype=np.float32)
     risk = np.full(n, float(meta.get("expected_edge_risk_mult", 1.0)), dtype=np.float32)
     for key, params in by_state.items():
@@ -791,9 +866,10 @@ def _l2_conditional_policy_arrays(meta: dict[str, Any], frame: pd.DataFrame) -> 
             continue
         thr[m] = float(params.get("trade_threshold", thr[m][0]))
         temp[m] = float(params.get("direction_temperature", temp[m][0]))
+        center[m] = float(params.get("direction_center", center[m][0]))
         reward[m] = float(params.get("expected_edge_reward_mult", reward[m][0]))
         risk[m] = float(params.get("expected_edge_risk_mult", risk[m][0]))
-    return state_keys, thr, temp, reward, risk
+    return state_keys, thr, temp, center, reward, risk
 
 
 def _conditional_tau_from_state(
@@ -803,7 +879,7 @@ def _conditional_tau_from_state(
 ) -> tuple[float, list[float], dict[str, float], np.ndarray]:
     base_tau = _l2_decision_edge_tau()
     target_trade = _l2_target_trade_rate()
-    tau_quantile = float(np.clip(1.0 - 2.0 * target_trade, 0.55, 0.90))
+    tau_quantile = float(np.clip(1.0 - 2.0 * target_trade, 0.50, 0.88))
     vol_quantiles = _policy_vol_quantiles(frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False), fit_mask=train_mask)
     state_keys = _l2_policy_state_keys(frame, vol_quantiles=vol_quantiles)
     edge_abs = np.abs(np.asarray(edge, dtype=np.float64).ravel())
@@ -839,6 +915,7 @@ def _l2_expected_edge_proxy(
     *,
     reward_mult: float,
     risk_mult: float,
+    active_floor: float | np.ndarray = 0.0,
 ) -> np.ndarray:
     gate = np.asarray(gate_p, dtype=np.float64).ravel()
     direction = np.asarray(dir_p, dtype=np.float64).ravel()
@@ -856,8 +933,14 @@ def _l2_expected_edge_proxy(
         risk = np.full(len(gate), float(risk), dtype=np.float64)
     else:
         risk = np.broadcast_to(risk.reshape(-1), gate.shape)
+    edge_floor = np.asarray(active_floor, dtype=np.float64)
+    if edge_floor.ndim == 0:
+        edge_floor = np.full(len(gate), float(edge_floor), dtype=np.float64)
+    else:
+        edge_floor = np.broadcast_to(edge_floor.reshape(-1), gate.shape)
     payoff = reward * mfe - risk * mae
-    edge = gate * size * signed_dir * payoff
+    active_strength = np.clip((gate - edge_floor) / np.maximum(1.0 - edge_floor, 1e-3), 0.0, 1.0)
+    edge = active_strength * size * signed_dir * payoff
     return np.clip(edge, -5.0, 5.0).astype(np.float32)
 
 
@@ -910,6 +993,10 @@ def _l2_search_policy_params(
         dir_raw = np.asarray(dir_raw, dtype=np.float64).ravel()[valid]
     reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [1.0], lo=0.10, hi=3.0)
     risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [1.0], lo=0.10, hi=3.0)
+    if reward_mults == [1.0]:
+        reward_mults = _env_float_candidates("L2_EXPECTED_EDGE_REWARD_GRID", [0.85, 1.0, 1.15], lo=0.10, hi=3.0)
+    if risk_mults == [1.0]:
+        risk_mults = _env_float_candidates("L2_EXPECTED_EDGE_RISK_GRID", [0.90, 1.0, 1.20], lo=0.10, hi=3.0)
     trade_rate_tol = _env_float_clipped("L2_POLICY_TRADE_RATE_TOLERANCE", 0.015, lo=0.0, hi=0.08)
     score_corr_active_w = _env_float_clipped("L2_POLICY_SCORE_CORR_ACTIVE_W", 0.95, lo=0.0, hi=5.0)
     score_corr_all_w = _env_float_clipped("L2_POLICY_SCORE_CORR_ALL_W", 0.55, lo=0.0, hi=5.0)
@@ -919,110 +1006,125 @@ def _l2_search_policy_params(
     score_trade_pen_hard_w = _env_float_clipped("L2_POLICY_SCORE_TRADE_PEN_HARD_W", 4.50, lo=0.0, hi=20.0)
     score_balance_pen_w = _env_float_clipped("L2_POLICY_SCORE_BALANCE_PEN_W", 0.55, lo=0.0, hi=10.0)
     score_short_bias_pen_w = _env_float_clipped("L2_POLICY_SCORE_SHORT_BIAS_PEN_W", 0.35, lo=0.0, hi=10.0)
+    score_long_recall_w = _env_float_clipped("L2_POLICY_SCORE_LONG_RECALL_W", 0.45, lo=0.0, hi=10.0)
+    score_short_recall_w = _env_float_clipped("L2_POLICY_SCORE_SHORT_RECALL_W", 0.10, lo=0.0, hi=10.0)
     true_active = truth != 1
     true_long_share = float(np.mean(truth[true_active] == 0)) if true_active.any() else 0.5
+    direction_centers = [0.5]
+    if dir_raw is not None:
+        direction_centers = _env_float_candidates(
+            "L2_DIRECTION_CENTER_GRID",
+            [max(0.30, true_long_share - 0.10), true_long_share, min(0.70, true_long_share + 0.10)],
+            lo=0.20,
+            hi=0.80,
+        )
     best: dict[str, float] | None = None
     best_score = -1e18
     print("\n  [L2] policy search on val_tune", flush=True)
     print(
         f"    target_rates={np.round(target_rates, 4).tolist()}  temps={np.round(temps, 4).tolist()}  "
+        f"direction_centers={np.round(direction_centers, 4).tolist()}  "
         f"reward_mults={np.round(reward_mults, 4).tolist()}  risk_mults={np.round(risk_mults, 4).tolist()}  "
         f"trade_rate_tol={trade_rate_tol:.4f}",
         flush=True,
     )
     for temp in temps:
-        dir_p = np.full(len(gate), 0.5, dtype=np.float64)
+        dir_p_base = np.full(len(gate), 0.5, dtype=np.float64)
         if dir_raw is not None:
-            dir_p = _l2_direction_margin_to_prob(dir_raw, temperature=temp)
-        for target_rate in target_rates:
-            thr = float(np.quantile(gate, 1.0 - target_rate))
-            decision_probs = _l2_compose_probs_from_gate_dir(gate, dir_p)
-            pred, _ = _l2_hard_decode_outputs(
-                gate_p=gate.astype(np.float32),
-                dir_p=dir_p.astype(np.float32),
-                decision_probs=decision_probs,
-                trade_threshold=thr,
-            )
-            trade_rate = float(np.mean(pred != 1))
-            f1m = float(f1_score(truth, pred, average="macro", zero_division=0))
-            active_pred = pred != 1
-            long_share = float(np.mean(pred[active_pred] == 0)) if active_pred.any() else true_long_share
-            exp_edge = _l2_expected_edge_proxy(
-                gate,
-                dir_p,
-                size,
-                mfe,
-                mae,
-                reward_mult=1.0,
-                risk_mult=1.0,
-            )
-            for reward_mult in reward_mults:
-                for risk_mult in risk_mults:
-                    exp_edge = _l2_expected_edge_proxy(
-                        gate,
-                        dir_p,
-                        size,
-                        mfe,
-                        mae,
-                        reward_mult=reward_mult,
-                        risk_mult=risk_mult,
-                    )
-                    corr_all = pearson_corr(exp_edge, edge)
-                    corr_active = pearson_corr(exp_edge[active_pred], edge[active_pred]) if active_pred.any() else float("nan")
-                    sign_acc = (
-                        float(np.mean(np.sign(exp_edge[active_pred]) == np.sign(edge[active_pred])))
-                        if active_pred.any()
-                        else 0.0
-                    )
-                    trade_gap = abs(trade_rate - target_rate)
-                    trade_pen = trade_gap
-                    trade_pen_hard = max(0.0, trade_gap - trade_rate_tol)
-                    balance_pen = abs(long_share - true_long_share)
-                    short_bias_pen = max(0.0, true_long_share - long_share)
-                    score = (
-                        score_corr_active_w * float(np.nan_to_num(corr_active, nan=-1.0))
-                        + score_corr_all_w * float(np.nan_to_num(corr_all, nan=-1.0))
-                        + score_f1_w * f1m
-                        + score_sign_acc_w * sign_acc
-                        - score_trade_pen_w * trade_pen
-                        - score_trade_pen_hard_w * trade_pen_hard
-                        - score_balance_pen_w * balance_pen
-                        - score_short_bias_pen_w * short_bias_pen
-                    )
-                    if score > best_score:
-                        best_score = score
-                        best = {
-                            "trade_threshold": thr,
-                            "target_trade_rate": float(target_rate),
-                            "direction_temperature": float(temp),
-                            "expected_edge_reward_mult": float(reward_mult),
-                            "expected_edge_risk_mult": float(risk_mult),
-                            "score": float(score),
-                            "trade_rate": float(trade_rate),
-                            "long_share_active": float(long_share),
-                            "corr_all": float(np.nan_to_num(corr_all, nan=0.0)),
-                            "corr_active": float(np.nan_to_num(corr_active, nan=0.0)),
-                            "f1_macro": float(f1m),
-                            "sign_acc_active": float(sign_acc),
-                            "trade_rate_tol": float(trade_rate_tol),
-                            "trade_gap": float(trade_gap),
-                            "trade_pen_hard": float(trade_pen_hard),
-                            "balance_pen": float(balance_pen),
-                            "short_bias_pen": float(short_bias_pen),
-                            "score_corr_active_w": float(score_corr_active_w),
-                            "score_corr_all_w": float(score_corr_all_w),
-                            "score_f1_w": float(score_f1_w),
-                            "score_sign_acc_w": float(score_sign_acc_w),
-                            "score_trade_pen_w": float(score_trade_pen_w),
-                            "score_trade_pen_hard_w": float(score_trade_pen_hard_w),
-                            "score_balance_pen_w": float(score_balance_pen_w),
-                            "score_short_bias_pen_w": float(score_short_bias_pen_w),
-                        }
+            dir_p_base = _l2_direction_margin_to_prob(dir_raw, temperature=temp)
+        for direction_center in direction_centers:
+            dir_p = _l2_recenter_direction_prob(dir_p_base, center=direction_center)
+            for target_rate in target_rates:
+                thr = float(np.quantile(gate, 1.0 - target_rate))
+                decision_probs = _l2_compose_probs_from_gate_dir(gate, dir_p)
+                pred, _ = _l2_hard_decode_outputs(
+                    gate_p=gate.astype(np.float32),
+                    dir_p=dir_p.astype(np.float32),
+                    decision_probs=decision_probs,
+                    trade_threshold=thr,
+                )
+                trade_rate = float(np.mean(pred != 1))
+                f1m = float(f1_score(truth, pred, average="macro", zero_division=0))
+                active_pred = pred != 1
+                long_share = float(np.mean(pred[active_pred] == 0)) if active_pred.any() else true_long_share
+                long_recall = float(np.mean(pred[truth == 0] == 0)) if np.any(truth == 0) else 0.0
+                short_recall = float(np.mean(pred[truth == 2] == 2)) if np.any(truth == 2) else 0.0
+                for reward_mult in reward_mults:
+                    for risk_mult in risk_mults:
+                        exp_edge = _l2_expected_edge_proxy(
+                            gate,
+                            dir_p,
+                            size,
+                            mfe,
+                            mae,
+                            reward_mult=reward_mult,
+                            risk_mult=risk_mult,
+                            active_floor=thr,
+                        )
+                        corr_all = pearson_corr(exp_edge, edge)
+                        corr_active = pearson_corr(exp_edge[active_pred], edge[active_pred]) if active_pred.any() else float("nan")
+                        sign_acc = (
+                            float(np.mean(np.sign(exp_edge[active_pred]) == np.sign(edge[active_pred])))
+                            if active_pred.any()
+                            else 0.0
+                        )
+                        trade_gap = abs(trade_rate - target_rate)
+                        trade_pen = trade_gap
+                        trade_pen_hard = max(0.0, trade_gap - trade_rate_tol)
+                        balance_pen = abs(long_share - true_long_share)
+                        short_bias_pen = max(0.0, true_long_share - long_share)
+                        score = (
+                            score_corr_active_w * float(np.nan_to_num(corr_active, nan=-1.0))
+                            + score_corr_all_w * float(np.nan_to_num(corr_all, nan=-1.0))
+                            + score_f1_w * f1m
+                            + score_sign_acc_w * sign_acc
+                            + score_long_recall_w * long_recall
+                            + score_short_recall_w * short_recall
+                            - score_trade_pen_w * trade_pen
+                            - score_trade_pen_hard_w * trade_pen_hard
+                            - score_balance_pen_w * balance_pen
+                            - score_short_bias_pen_w * short_bias_pen
+                        )
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                "trade_threshold": thr,
+                                "target_trade_rate": float(target_rate),
+                                "direction_temperature": float(temp),
+                                "direction_center": float(direction_center),
+                                "expected_edge_reward_mult": float(reward_mult),
+                                "expected_edge_risk_mult": float(risk_mult),
+                                "score": float(score),
+                                "trade_rate": float(trade_rate),
+                                "long_share_active": float(long_share),
+                                "long_recall": float(long_recall),
+                                "short_recall": float(short_recall),
+                                "corr_all": float(np.nan_to_num(corr_all, nan=0.0)),
+                                "corr_active": float(np.nan_to_num(corr_active, nan=0.0)),
+                                "f1_macro": float(f1m),
+                                "sign_acc_active": float(sign_acc),
+                                "trade_rate_tol": float(trade_rate_tol),
+                                "trade_gap": float(trade_gap),
+                                "trade_pen_hard": float(trade_pen_hard),
+                                "balance_pen": float(balance_pen),
+                                "short_bias_pen": float(short_bias_pen),
+                                "score_corr_active_w": float(score_corr_active_w),
+                                "score_corr_all_w": float(score_corr_all_w),
+                                "score_f1_w": float(score_f1_w),
+                                "score_sign_acc_w": float(score_sign_acc_w),
+                                "score_trade_pen_w": float(score_trade_pen_w),
+                                "score_trade_pen_hard_w": float(score_trade_pen_hard_w),
+                                "score_balance_pen_w": float(score_balance_pen_w),
+                                "score_short_bias_pen_w": float(score_short_bias_pen_w),
+                                "score_long_recall_w": float(score_long_recall_w),
+                                "score_short_recall_w": float(score_short_recall_w),
+                            }
     if best is None:
         best = {
             "trade_threshold": 0.35,
             "target_trade_rate": target,
             "direction_temperature": base_temp,
+            "direction_center": 0.5,
             "expected_edge_reward_mult": 1.0,
             "expected_edge_risk_mult": 1.0,
             "score": float("nan"),
@@ -1036,10 +1138,11 @@ def _l2_search_policy_params(
         }
     print(
         f"  [L2] selected policy: thr={best['trade_threshold']:.4f}  target_trade_rate={best['target_trade_rate']:.3f}  "
-        f"temp={best['direction_temperature']:.3f}  reward_mult={best['expected_edge_reward_mult']:.3f}  "
+        f"temp={best['direction_temperature']:.3f}  center={best['direction_center']:.3f}  reward_mult={best['expected_edge_reward_mult']:.3f}  "
         f"risk_mult={best['expected_edge_risk_mult']:.3f}  realized_trade_rate={best['trade_rate']:.3f}  "
         f"trade_gap={best.get('trade_gap', float('nan')):.3f}  "
-        f"corr_active={best['corr_active']:.4f}  F1_macro={best['f1_macro']:.4f}",
+        f"corr_active={best['corr_active']:.4f}  F1_macro={best['f1_macro']:.4f}  "
+        f"long_recall={best.get('long_recall', float('nan')):.4f}",
         flush=True,
     )
     return best
@@ -1446,11 +1549,18 @@ def train_l2_trade_decision(
         mt = train_mask & (y_dir >= 0)
         mv = val_mask & (y_dir >= 0)
         if int(mt.sum()) >= 100:
+            w_dir = _l2_direction_sample_weights(y_dir[mt])
             cbs, cl = _lgb_train_callbacks_with_round_tqdm(direction_es_rounds, rounds, "[L2] direction")
             try:
                 direction_model = lgb.train(
                     direction_params,
-                    lgb.Dataset(X[mt], label=y_dir_margin[mt], feature_name=feature_cols, free_raw_data=False),
+                    lgb.Dataset(
+                        X[mt],
+                        label=y_dir_margin[mt],
+                        weight=w_dir.astype(np.float32),
+                        feature_name=feature_cols,
+                        free_raw_data=False,
+                    ),
                     num_boost_round=rounds,
                     valid_sets=[
                         lgb.Dataset(X[mv], label=y_dir_margin[mv], feature_name=feature_cols, free_raw_data=False)
@@ -1537,6 +1647,7 @@ def train_l2_trade_decision(
     )
     trade_threshold = float(policy["trade_threshold"])
     direction_temperature = float(policy["direction_temperature"])
+    direction_center = float(policy.get("direction_center", 0.5))
     expected_edge_reward_mult = float(policy["expected_edge_reward_mult"])
     expected_edge_risk_mult = float(policy["expected_edge_risk_mult"])
     gate_thr_after_search = float(trade_threshold)
@@ -1551,10 +1662,11 @@ def train_l2_trade_decision(
             f"(bump={bump:.2f}, cap={cap:.2f}); composed long/short split is degenerate at d=0.5",
             flush=True,
         )
-    _, trade_threshold_arr_all, direction_temperature_arr_all, reward_arr_all, risk_arr_all = _l2_conditional_policy_arrays(
+    _, trade_threshold_arr_all, direction_temperature_arr_all, direction_center_arr_all, reward_arr_all, risk_arr_all = _l2_conditional_policy_arrays(
         {
             "trade_threshold": trade_threshold,
             "direction_temperature": direction_temperature,
+            "direction_center": direction_center,
             "expected_edge_reward_mult": expected_edge_reward_mult,
             "expected_edge_risk_mult": expected_edge_risk_mult,
             "policy_state_vol_quantiles": policy_vol_quantiles,
@@ -1569,6 +1681,7 @@ def train_l2_trade_decision(
         trade_threshold=trade_threshold_arr_all[val_report_mask],
         direction_head_type="signed_edge_regression",
         direction_temperature=direction_temperature_arr_all[val_report_mask],
+        direction_center=direction_center_arr_all[val_report_mask],
         gate_calibrator=gate_calibrator,
     )
     _log_l2_two_stage_val_diagnostics(
@@ -1578,6 +1691,7 @@ def train_l2_trade_decision(
         y_dir[val_report_mask],
         y_decision[val_report_mask],
         trade_threshold_arr_all[val_report_mask],
+        direction_center_arr_all[val_report_mask],
     )
     gate_p_all, dir_p_all, decision_probs = _l2_predict_gate_dir_probs(
         gate_model,
@@ -1586,8 +1700,19 @@ def train_l2_trade_decision(
         trade_threshold=trade_threshold_arr_all,
         direction_head_type="signed_edge_regression",
         direction_temperature=direction_temperature_arr_all,
+        direction_center=direction_center_arr_all,
         gate_calibrator=gate_calibrator,
         gate_raw=gate_raw_all,
+    )
+    expected_edge_all = _l2_expected_edge_proxy(
+        gate_p_all,
+        dir_p_all,
+        size_pred,
+        mfe_pred,
+        mae_pred,
+        reward_mult=reward_arr_all,
+        risk_mult=risk_arr_all,
+        active_floor=trade_threshold_arr_all,
     )
     hard_decision_class, decision_confidence = _l2_hard_decode_outputs(
         gate_p=gate_p_all,
@@ -1607,6 +1732,9 @@ def train_l2_trade_decision(
         mfe_pred,
         y_mae,
         mae_pred,
+        expected_edge_pred=expected_edge_all,
+        true_edge=edge,
+        test_mask=test_mask,
     )
     _log_l2_l1b_ablation(
         X,
@@ -1618,6 +1746,7 @@ def train_l2_trade_decision(
         trade_threshold=trade_threshold_arr_all,
         direction_head_type="signed_edge_regression",
         direction_temperature=direction_temperature_arr_all,
+        direction_center=direction_center_arr_all,
         gate_calibrator=gate_calibrator,
     )
     outputs = df[["symbol", "time_key"]].copy()
@@ -1633,15 +1762,7 @@ def train_l2_trade_decision(
     for idx in range(NUM_REGIME_CLASSES):
         outputs[f"l2_entry_regime_{idx}"] = entry_regime[:, idx]
     outputs["l2_entry_vol"] = frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
-    outputs["l2_expected_edge"] = _l2_expected_edge_proxy(
-        gate_p_all,
-        dir_p_all,
-        size_pred,
-        mfe_pred,
-        mae_pred,
-        reward_mult=reward_arr_all,
-        risk_mult=risk_arr_all,
-    )
+    outputs["l2_expected_edge"] = expected_edge_all
     outputs["l2_rr_proxy"] = outputs["l2_pred_mfe"] / np.maximum(outputs["l2_pred_mae"], 0.05)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -1679,12 +1800,13 @@ def train_l2_trade_decision(
         "direction_available": direction_model is not None,
         "direction_head_type": "signed_edge_regression" if direction_model is not None else "none",
         "direction_temperature": direction_temperature,
+        "direction_center": direction_center,
         "confidence_semantics": "hard-decode aligned; neutral uses 1-gate, active uses max(gate, composed class prob)",
-        "decision_class_semantics": "hard two-stage decode with state-conditioned thresholds: gate_p>=trade_threshold(state) triggers trade, then dir_p>=0.5 picks long else short",
+        "decision_class_semantics": "hard two-stage decode with state-conditioned thresholds: gate_p>=trade_threshold(state) triggers trade, then recentered dir_p>=0.5 picks long else short",
         "size_semantics": "risk_adjusted_position_fraction",
         "expected_edge_reward_mult": expected_edge_reward_mult,
         "expected_edge_risk_mult": expected_edge_risk_mult,
-        "expected_edge_semantics": "gate * size * signed_dir * (reward_mult * pred_mfe - risk_mult * pred_mae)",
+        "expected_edge_semantics": "normalized max(gate-trade_threshold,0) * size * signed_dir * (reward_mult * pred_mfe - risk_mult * pred_mae)",
         "l2_aux_head_target_prep": {
             "mfe": mfe_head_prep,
             "mae": mae_head_prep,
@@ -1700,6 +1822,8 @@ def train_l2_trade_decision(
             "trade_pen_hard": float(policy.get("score_trade_pen_hard_w", 4.50)),
             "balance_pen": float(policy.get("score_balance_pen_w", 0.55)),
             "short_bias_pen": float(policy.get("score_short_bias_pen_w", 0.35)),
+            "long_recall": float(policy.get("score_long_recall_w", 0.45)),
+            "short_recall": float(policy.get("score_short_recall_w", 0.10)),
         },
         "model_files": model_files,
         "output_cache_file": L2_OUTPUT_CACHE_FILE,
@@ -1793,7 +1917,7 @@ def infer_l2_trade_decision(
     X = frame[target_cols].to_numpy(dtype=np.float32, copy=False)
     mode = meta.get("decision_mode", "multiclass")
     if mode == "two_stage":
-        _, thr_arr, temp_arr, reward_arr, risk_arr = _l2_conditional_policy_arrays(meta, frame)
+        _, thr_arr, temp_arr, center_arr, reward_arr, risk_arr = _l2_conditional_policy_arrays(meta, frame)
         gate_m = models["gate"]
         dir_m = models.get("direction")
         gate_calibrator = models.get("gate_calibrator")
@@ -1804,12 +1928,14 @@ def infer_l2_trade_decision(
             trade_threshold=thr_arr,
             direction_head_type=str(meta.get("direction_head_type", "probability")),
             direction_temperature=temp_arr,
+            direction_center=center_arr,
             gate_calibrator=gate_calibrator,
         )
     elif "decision" in models:
         gate_p = np.max(models["decision"].predict(X).astype(np.float32), axis=1)
         dir_p = np.full(len(X), 0.5, dtype=np.float32)
         decision_probs = models["decision"].predict(X).astype(np.float32)
+        thr_arr = np.zeros(len(X), dtype=np.float32)
         reward_arr = np.full(len(X), float(meta.get("expected_edge_reward_mult", 1.0)), dtype=np.float32)
         risk_arr = np.full(len(X), float(meta.get("expected_edge_risk_mult", 1.0)), dtype=np.float32)
     else:
@@ -1849,6 +1975,7 @@ def infer_l2_trade_decision(
         mae_pred,
         reward_mult=reward_arr,
         risk_mult=risk_arr,
+        active_floor=thr_arr,
     )
     outputs["l2_rr_proxy"] = outputs["l2_pred_mfe"] / np.maximum(outputs["l2_pred_mae"], 0.05)
     return outputs

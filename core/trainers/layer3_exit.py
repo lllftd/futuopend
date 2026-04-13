@@ -101,12 +101,16 @@ def _l3_policy_dataset_fingerprint(
         "env": {
             "STACK_DECISION_EDGE_TAU": os.environ.get("STACK_DECISION_EDGE_TAU", ""),
             "L3_EXIT_EPSILON_ATR": os.environ.get("L3_EXIT_EPSILON_ATR", ""),
+            "L3_EXIT_LOSS_BUFFER_ATR": os.environ.get("L3_EXIT_LOSS_BUFFER_ATR", ""),
+            "L3_EXIT_LIVE_EDGE_FLOOR": os.environ.get("L3_EXIT_LIVE_EDGE_FLOOR", ""),
+            "L3_CONTINUATION_EDGE_MULT": os.environ.get("L3_CONTINUATION_EDGE_MULT", ""),
             "L3_TARGET_HORIZON_BARS": os.environ.get("L3_TARGET_HORIZON_BARS", ""),
             "L3_ALLOW_TRUTH_FALLBACK": os.environ.get("L3_ALLOW_TRUTH_FALLBACK", ""),
             "L3_ENTRY_MIN_CONFIDENCE_GRID": os.environ.get("L3_ENTRY_MIN_CONFIDENCE_GRID", ""),
             "L3_ENTRY_MIN_SIZE_GRID": os.environ.get("L3_ENTRY_MIN_SIZE_GRID", ""),
             "L3_ENTRY_POLICY_MIN_STATE_ROWS": os.environ.get("L3_ENTRY_POLICY_MIN_STATE_ROWS", ""),
             "L3_HORIZON_MIN_STATE_ROWS": os.environ.get("L3_HORIZON_MIN_STATE_ROWS", ""),
+            "L3_TRAJ_GRU": os.environ.get("L3_TRAJ_GRU", ""),
         },
         "df_hash": _hash_frame_columns(df, ["symbol", "time_key", "open", "high", "low", "close", "lbl_atr"]),
         "l1a_hash": _hash_frame_columns(l1a_outputs, ["symbol", "time_key", *L1A_REGIME_COLS, "l1a_vol_forecast"]),
@@ -457,6 +461,21 @@ def _l3_exit_epsilon_atr() -> float:
     return float(max(0.0, float(os.environ.get("L3_EXIT_EPSILON_ATR", "0.03"))))
 
 
+def _l3_exit_loss_buffer_atr() -> float:
+    return float(max(0.0, float(os.environ.get("L3_EXIT_LOSS_BUFFER_ATR", "0.08"))))
+
+
+def _l3_exit_live_edge_floor() -> float:
+    return float(os.environ.get("L3_EXIT_LIVE_EDGE_FLOOR", "0.02"))
+
+
+def _l3_continuation_score(future_gain_left: np.ndarray, live_edge: np.ndarray) -> np.ndarray:
+    future = np.asarray(future_gain_left, dtype=np.float64).ravel()
+    edge = np.asarray(live_edge, dtype=np.float64).ravel()
+    edge_mult = float(os.environ.get("L3_CONTINUATION_EDGE_MULT", "0.20"))
+    return (future + edge_mult * np.maximum(edge, 0.0)).astype(np.float32)
+
+
 def _l3_target_horizon_bars(max_hold: int) -> int:
     cfg = _options_target_config()
     raw = int(os.environ.get("L3_TARGET_HORIZON_BARS", str(cfg["decision_horizon_bars"])))
@@ -605,7 +624,7 @@ def _l3_search_exit_policy(
     prob_default = np.quantile(prob, max(0.05, 1.0 - float(np.mean(y)))) if len(prob) else 0.55
     prob_candidates = _env_float_candidates(
         "L3_EXIT_PROB_THRESHOLD_GRID",
-        [0.50, float(prob_default), 0.65, 0.75],
+        [0.50, float(prob_default), 0.65, 0.75, 0.85, 0.90],
         lo=0.05,
         hi=0.95,
     )
@@ -616,6 +635,9 @@ def _l3_search_exit_policy(
         hi=2.0,
     )
     target_exit_rate = float(np.mean(y))
+    target_exit_rate = float(np.clip(target_exit_rate, 0.55, 0.88))
+    max_exit_rate = _env_float_clipped("L3_EXIT_POLICY_MAX_EXIT_RATE", 0.90, lo=0.50, hi=0.99)
+    min_hold_recall = _env_float_clipped("L3_EXIT_POLICY_MIN_HOLD_RECALL", 0.20, lo=0.0, hi=0.95)
     best: dict[str, float] | None = None
     best_score = -1e18
     print("\n  [L3] exit policy search on val_tune", flush=True)
@@ -639,7 +661,23 @@ def _l3_search_exit_policy(
             acc = float(accuracy_score(y, pred))
             exit_rate = float(np.mean(pred))
             rate_pen = abs(exit_rate - target_exit_rate)
-            score = 1.00 * f1 + 0.35 * acc - 0.25 * rate_pen
+            hold_mask = y == 0
+            pred_hold = pred == 0
+            hold_recall = float(np.mean(pred[hold_mask] == 0)) if hold_mask.any() else 0.0
+            hold_precision = float(np.mean(y[pred_hold] == 0)) if pred_hold.any() else 0.0
+            exit_recall = float(np.mean(pred[y == 1] == 1)) if np.any(y == 1) else 0.0
+            exit_rate_high_pen = max(0.0, exit_rate - max_exit_rate)
+            hold_recall_pen = max(0.0, min_hold_recall - hold_recall)
+            score = (
+                0.70 * f1
+                + 0.20 * acc
+                + 0.75 * hold_recall
+                + 0.25 * hold_precision
+                + 0.10 * exit_recall
+                - 0.30 * rate_pen
+                - 1.50 * exit_rate_high_pen
+                - 1.25 * hold_recall_pen
+            )
             if score > best_score:
                 best_score = score
                 best = {
@@ -650,6 +688,11 @@ def _l3_search_exit_policy(
                     "acc": float(acc),
                     "exit_rate": float(exit_rate),
                     "target_exit_rate": float(target_exit_rate),
+                    "max_exit_rate": float(max_exit_rate),
+                    "min_hold_recall": float(min_hold_recall),
+                    "hold_recall": float(hold_recall),
+                    "hold_precision": float(hold_precision),
+                    "exit_recall": float(exit_recall),
                     "value_policy_mode": mode,
                     "value_tie_margin": tie_margin,
                 }
@@ -664,7 +707,8 @@ def _l3_search_exit_policy(
     print(
         f"  [L3] selected exit policy: mode={best['value_policy_mode']}  p_exit>={best['exit_prob_threshold']:.4f}  "
         f"value_left<={best['value_left_threshold']:.4f}  F1={best.get('f1', float('nan')):.4f}  acc={best.get('acc', float('nan')):.4f}  "
-        f"exit_rate={best.get('exit_rate', float('nan')):.3f}",
+        f"exit_rate={best.get('exit_rate', float('nan')):.3f}  hold_recall={best.get('hold_recall', float('nan')):.4f}  "
+        f"hold_precision={best.get('hold_precision', float('nan')):.4f}",
         flush=True,
     )
     return best
@@ -726,7 +770,7 @@ def _choose_l3_value_policy_mode(
             r2 = float("nan")
     else:
         r2 = float("nan")
-    mode = "tie_break" if std_pred >= 0.05 and corr >= 0.05 and (np.isnan(r2) or r2 >= -0.01) else "prob_only"
+    mode = "tie_break" if std_pred >= 0.02 and corr >= 0.03 and (np.isnan(r2) or r2 >= -0.05) else "prob_only"
     print(
         f"  [L3] value-policy mode selector: corr={corr:.4f}  r2={r2:.4f}  pred_std={std_pred:.6f}  -> {mode}",
         flush=True,
@@ -1100,7 +1144,14 @@ def _build_l3_policy_dataset(
         ).astype(np.float32, copy=False)
         terminal_unreal = float(unreal_seg[-1])
         future_gain_left = (terminal_unreal - unreal_seg).astype(np.float32, copy=False)
-        exit_block = ((np.arange(n_steps) == (n_steps - 1)) | (future_gain_left <= exit_epsilon_atr)).astype(np.int32, copy=False)
+        continuation_score = _l3_continuation_score(future_gain_left, live_edge_seg)
+        last_step = np.arange(n_steps) == (n_steps - 1)
+        late_hold_start = max(2, int(np.ceil(target_horizon * 0.75)))
+        weak_continuation = continuation_score <= exit_epsilon_atr
+        clearly_spent = future_gain_left <= -_l3_exit_loss_buffer_atr()
+        live_edge_faded = live_edge_seg <= _l3_exit_live_edge_floor()
+        late_flat = (holds >= late_hold_start) & (future_gain_left <= 0.0)
+        exit_block = (last_step | clearly_spent | (weak_continuation & live_edge_faded) | late_flat).astype(np.int32, copy=False)
         rows_x_blocks.append(feat_block)
         rows_exit_blocks.append(exit_block)
         rows_value_blocks.append(future_gain_left)
@@ -1247,12 +1298,18 @@ def _log_l3_val_extended(
     acc = float(accuracy_score(yv, yhat))
     f1 = float(f1_score(yv, yhat, zero_division=0))
     cm = confusion_matrix(yv, yhat, labels=[0, 1])
+    hold_recall = float(np.mean(yhat[yv == 0] == 0)) if np.any(yv == 0) else float("nan")
+    hold_precision = float(np.mean(yv[yhat == 0] == 0)) if np.any(yhat == 0) else float("nan")
+    exit_rate = float(np.mean(yhat))
     print("\n  [L3] val — exit (extended)", flush=True)
     print(
-        f"    AUC={auc:.4f}  log_loss={ll:.4f}  Brier={br:.4f}  ECE={ece:.4f}  acc@0.5={acc:.4f}  F1={f1:.4f}",
+        f"    AUC={auc:.4f}  log_loss={ll:.4f}  Brier={br:.4f}  ECE={ece:.4f}  acc@0.5={acc:.4f}  F1={f1:.4f}  "
+        f"exit_rate={exit_rate:.3f}  hold_recall={hold_recall:.4f}  hold_precision={hold_precision:.4f}",
         flush=True,
     )
     print(f"    confusion [[TN FP][FN TP]]:\n    {cm}", flush=True)
+    if np.isfinite(hold_recall) and hold_recall < 0.20:
+        print(f"    WARNING: hold recall still very low ({hold_recall:.3f})", flush=True)
 
     ih = feature_cols.index("l3_hold_bars")
     hold_vm = np.asarray(X[vm, ih], dtype=np.int64)
@@ -1357,7 +1414,7 @@ def _log_l3_val_extended(
 
 def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_outputs: pd.DataFrame) -> L3TrainingBundle:
     traj_cfg = L3TrajectoryConfig()
-    want_traj = os.environ.get("L3_TRAJ_GRU", "1").strip().lower() in {"1", "true", "yes"}
+    want_traj = os.environ.get("L3_TRAJ_GRU", "0").strip().lower() in {"1", "true", "yes"}
     X, y_exit, y_value, t_state, feature_cols, rows_entry, traj_seq, traj_len, rows_from_model, dataset_policy = _load_or_build_l3_policy_dataset(
         df,
         l1a_outputs,
@@ -1437,7 +1494,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         flush=True,
     )
     print(
-        "  [L3] target semantics: continuation value to a fixed deadline (non-oracle), not optimal future exit.",
+        "  [L3] target semantics: hold means meaningful continuation remains to a fixed deadline; "
+        "exit fires on spent continuation, late-flat paths, or terminal bar.",
         flush=True,
     )
     print(f"  [L3] will write: {artifact_path(L3_EXIT_FILE)} | {artifact_path(L3_VALUE_FILE)} | {artifact_path(L3_META_FILE)}", flush=True)
@@ -1490,7 +1548,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             flush=True,
         )
     else:
-        if not os.environ.get("L3_TRAJ_GRU", "1").strip().lower() in {"1", "true", "yes"}:
+        if not os.environ.get("L3_TRAJ_GRU", "0").strip().lower() in {"1", "true", "yes"}:
             print("  [L3] hybrid disabled (L3_TRAJ_GRU=0); LightGBM on static features only.", flush=True)
         else:
             print(
@@ -1676,13 +1734,16 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_target_horizon_bars": int(dataset_policy.get("l3_target_horizon_bars", _l3_target_horizon_bars(30))),
         "l3_target_horizon_bars_by_state": dataset_policy.get("l3_target_horizon_bars_by_state", {}),
         "l3_exit_epsilon_atr": _l3_exit_epsilon_atr(),
+        "l3_exit_loss_buffer_atr": _l3_exit_loss_buffer_atr(),
+        "l3_exit_live_edge_floor": _l3_exit_live_edge_floor(),
         "l3_exit_prob_threshold": float(exit_policy["exit_prob_threshold"]),
         "l3_value_left_threshold": float(exit_policy["value_left_threshold"]),
         "l3_value_policy_mode": str(exit_policy.get("value_policy_mode", value_policy_mode)),
         "l3_value_tie_margin": float(exit_policy.get("value_tie_margin", value_tie_margin)),
         "l3_exit_policy_search": exit_policy,
         "l3_exit_policy_by_state": exit_policy_by_state,
-        "l3_target_semantics": "continuation_value_to_fixed_deadline",
+        "l3_target_semantics": "fixed_deadline_continuation_with_meaningful_hold_class",
+        "l3_gru_default_enabled": False,
         "l3_exit_class_weights": {
             "hold": float(hold_neg_w),
             "exit": float(exit_pos_w),
