@@ -471,7 +471,7 @@ def _l2_hard_decision_from_gate_dir(
     trade = gate_p >= thr_arr
     margin = float(np.clip(direction_abstain_margin, 0.0, 0.49))
     dir_conf = np.abs((2.0 * dir_p) - 1.0)
-    abstain = dir_conf < margin
+    abstain = dir_conf <= margin
     long_mask = trade & (~abstain) & (dir_p >= 0.5)
     short_mask = trade & (~abstain) & (dir_p < 0.5)
     out[long_mask] = 0
@@ -523,13 +523,20 @@ def _search_l2_direction_abstain_margin(
     if target <= 1e-6:
         return 0.0
     margin = float(np.quantile(conf, target))
-    realized = float(np.mean(conf < margin))
+    realized = float(np.mean(conf <= margin))
+    tie_ratio = 1.0 - (float(np.unique(conf).size) / float(max(conf.size, 1)))
+    at_margin_share = float(np.mean(conf == margin))
     print("\n  [L2] direction abstain-margin search on active trades", flush=True)
     for rate in [0.05, target, min(0.25, max(target, 0.05) + 0.10)]:
         cand = float(np.quantile(conf, float(np.clip(rate, 0.0, 0.5))))
-        cand_rate = float(np.mean(conf < cand))
+        cand_rate = float(np.mean(conf <= cand))
         mark = "  *" if abs(rate - target) < 1e-9 else ""
         print(f"    target_abstain_rate={rate:.3f}  margin={cand:.4f}  realized={cand_rate:.3f}{mark}", flush=True)
+    print(
+        f"    direction_conf stats: pcts={np.round(np.percentile(conf, [0, 5, 25, 50, 75, 95, 100]), 4).tolist()}  "
+        f"tie_ratio={tie_ratio:.4f}  at_margin_share={at_margin_share:.4f}",
+        flush=True,
+    )
     print(
         f"  [L2] selected direction_abstain_margin={margin:.4f}  target_abstain_rate={target:.3f}  realized={realized:.3f}",
         flush=True,
@@ -612,7 +619,7 @@ def _log_l2_two_stage_val_diagnostics(
         short_precision = float(np.mean(y_dir[active][pred_short_mask] == 0)) if pred_short_mask.any() else float("nan")
         print(
             f"    direction AUC(active)={auc_dir:.4f}  Brier(active)={brier_dir:.4f}  ECE(active)={ece_dir:.4f}  "
-            f"p(long) pcts={np.round(np.percentile(direction[active], [5, 25, 50, 75, 95]), 4).tolist()}",
+            f"p(long) pcts(true-active)={np.round(np.percentile(direction[active], [5, 25, 50, 75, 95]), 4).tolist()}",
             flush=True,
         )
         print(
@@ -640,6 +647,18 @@ def _log_l2_two_stage_val_diagnostics(
     )
     active_trade = trade >= float(trade_threshold)
     if np.any(active_trade):
+        pred_dir = direction[active_trade]
+        pred_conf = np.abs((2.0 * pred_dir) - 1.0)
+        pred_tie_ratio = 1.0 - (float(np.unique(pred_conf).size) / float(max(pred_conf.size, 1)))
+        margin = float(np.clip(direction_abstain_margin, 0.0, 0.49))
+        pred_abstain_hit = float(np.mean(pred_conf <= margin))
+        print(
+            f"    direction p(long) pcts(pred-trade-active)={np.round(np.percentile(pred_dir, [5, 25, 50, 75, 95]), 4).tolist()}  "
+            f"conf pcts(pred-trade-active)={np.round(np.percentile(pred_conf, [0, 5, 25, 50, 75, 95, 100]), 4).tolist()}  "
+            f"conf_min={float(np.min(pred_conf)):.4f}  tie_ratio={pred_tie_ratio:.4f}  "
+            f"abstain_hit(<=margin)={pred_abstain_hit:.4f}",
+            flush=True,
+        )
         active_pred = pred_hard[active_trade]
         abstain_rate = float(np.mean(active_pred == 1))
         directional = active_pred != 1
