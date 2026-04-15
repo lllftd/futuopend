@@ -2279,28 +2279,12 @@ def _l2_fusion_feature_frame(
     for col in (
         "l1a_regime_entropy",
         "l1a_regime_top2_gap",
-        "l1a_dir_bull_minus_bear",
-        "l1a_dir_confidence",
-        "l1a_dir_normalized",
-        "l1a_bull_convergence",
-        "l1a_bear_convergence",
-        "l1a_dir_x_vol",
-        "l1a_dir_x_stability",
+        "l1a_transition_risk",
         "l1a_vol_trend",
         "l1a_time_in_regime",
+        "l1a_state_persistence",
         "l1b_edge_pred",
         "l1b_dq_pred",
-        "l1b_trend_direction",
-        "l1b_breakout_direction",
-        "l1b_mean_reversion_direction",
-        "l1b_failed_breakout_direction",
-        "l1b_follow_through_direction",
-        "l1b_weighted_direction",
-        "l1_dir_agreement",
-        "l1_dir_product",
-        "l1_dir_mean",
-        "l1_dir_x_gate",
-        "l1_dir_conf_x_gate",
         "l1b_cluster_top1",
         "l1b_cluster_top2_gap",
         "l1b_novelty_score",
@@ -2312,10 +2296,15 @@ def _l2_fusion_feature_frame(
         "l1c_direction_prob",
         "l1c_direction_score",
         "l1c_confidence",
+        "l1c_direction_strength",
         "l1c_is_warm",
         "l1c_weighted_dir",
         "l1c_dir_x_vol",
-        "l1c_x_l1a_dir",
+        "l1c_dir_x_state_persistence",
+        "l1c_strength_x_conf",
+        "l2_dir_x_edge_opportunity",
+        "l2_dir_conf_x_edge_mag",
+        "l2_dq_x_edge",
         "l2_session_progress",
         "l2_is_opening_hour",
     ):
@@ -2451,21 +2440,18 @@ def _l2_hierarchical_direction_prob(
     bear_mass = regime_probs[:, 2] + regime_probs[:, 3]
     range_mass = regime_probs[:, 4] + regime_probs[:, 5]
     trend_bias = np.clip(bull_mass - bear_mass, -1.0, 1.0)
-    if "l1a_dir_normalized" in frame.columns:
-        trend_bias = 0.70 * trend_bias + 0.30 * pd.to_numeric(
-            frame["l1a_dir_normalized"], errors="coerce"
-        ).fillna(0.0).to_numpy(dtype=np.float64)
-    if "l1b_weighted_direction" in frame.columns:
-        trend_bias = trend_bias + 0.25 * pd.to_numeric(
-            frame["l1b_weighted_direction"], errors="coerce"
-        ).fillna(0.0).to_numpy(dtype=np.float64)
+    state_persistence = pd.to_numeric(frame.get("l1a_state_persistence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    trend_bias = trend_bias * np.clip(0.50 + 0.50 * state_persistence, 0.1, 1.0)
     trend_bias = np.clip(trend_bias, -1.0, 1.0)
     entropy = -np.sum(np.clip(regime_probs, 1e-12, 1.0) * np.log(np.clip(regime_probs, 1e-12, 1.0)), axis=1)
     entropy_norm = np.clip(entropy / np.log(max(regime_probs.shape[1], 2)), 0.0, 1.0)
+    l1c_score = pd.to_numeric(frame.get("l1c_direction_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    l1c_conf = pd.to_numeric(frame.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    l1c_logit = np.log(np.clip((l1c_score + 1.0) * 0.5, 1e-4, 1.0 - 1e-4) / np.clip((1.0 - l1c_score) * 0.5, 1e-4, 1.0 - 1e-4))
 
     triple_logit = np.log(triple_dir / (1.0 - triple_dir))
     signed_logit = np.log(signed_dir / (1.0 - signed_dir))
-    raw_logit = 0.90 * triple_logit + 0.35 * signed_logit + 1.10 * trend_bias
+    raw_logit = 0.75 * triple_logit + 0.25 * signed_logit + 1.20 * l1c_conf * l1c_logit + 0.55 * trend_bias
     uncertainty = np.clip(0.65 * range_mass + 0.35 * entropy_norm, 0.0, 1.0)
     shrunk_logit = raw_logit * np.clip(1.0 - 0.65 * uncertainty, 0.20, 1.0)
     dir_p = _sigmoid(shrunk_logit)
@@ -2755,6 +2741,56 @@ def _residual_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _l2_state_input_cols(merged: pd.DataFrame) -> list[str]:
+    cols = list(L1A_REGIME_COLS)
+    cols.extend(
+        [
+            "l1a_transition_risk",
+            "l1a_vol_forecast",
+            "l1a_vol_trend",
+            "l1a_time_in_regime",
+            "l1a_state_persistence",
+            "l1a_is_warm",
+        ]
+    )
+    cols.extend([c for c in merged.columns if c.startswith("l1a_market_embed_")])
+    return [c for c in cols if c in merged.columns]
+
+
+def _l2_condition_input_cols(merged: pd.DataFrame) -> list[str]:
+    allow = [
+        "l1b_edge_pred",
+        "l1b_dq_pred",
+        "l1b_novelty_score",
+        "l1b_regime_change_score",
+        "l1b_breakout_quality",
+        "l1b_mean_reversion_setup",
+        "l1b_trend_strength",
+        "l1b_range_reversal_setup",
+        "l1b_failed_breakout_setup",
+        "l1b_setup_alignment",
+        "l1b_follow_through_score",
+        "l1b_liquidity_score",
+    ]
+    allow.extend([c for c in merged.columns if c.startswith("l1b_cluster_prob_")])
+    return [c for c in allow if c in merged.columns]
+
+
+def _l2_direction_input_cols(merged: pd.DataFrame) -> list[str]:
+    allow = [
+        "l1c_direction_prob",
+        "l1c_direction_score",
+        "l1c_confidence",
+        "l1c_direction_strength",
+        "l1c_is_warm",
+    ]
+    return [c for c in allow if c in merged.columns]
+
+
+def _l2_residual_input_cols(residual: pd.DataFrame) -> list[str]:
+    return [c for c in residual.columns if c not in {"symbol", "time_key"}]
+
+
 def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=merged.index)
     n_m = len(merged)
@@ -2790,70 +2826,39 @@ def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
     novelty = pd.to_numeric(merged.get("l1b_novelty_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     regime_change = pd.to_numeric(merged.get("l1b_regime_change_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     vol = pd.to_numeric(merged.get("l1a_vol_forecast", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    persistence = pd.to_numeric(merged.get("l1a_state_persistence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     out["l1b_novelty_x_vol"] = (novelty * vol).astype(np.float32)
     out["l1b_regime_change_x_entropy"] = (regime_change * out["l1a_regime_entropy"].to_numpy(dtype=np.float32, copy=False)).astype(np.float32)
     out["l1b_unsup_pressure"] = (out["l1b_cluster_top2_gap"].to_numpy(dtype=np.float32, copy=False) - novelty).astype(np.float32)
-    if "l1c_direction_score" in merged.columns or "l1c_direction_pred" in merged.columns:
+    if "l1c_direction_score" in merged.columns:
         l1c_d = pd.to_numeric(
-            merged.get("l1c_direction_score", merged.get("l1c_direction_pred", 0.0)),
+            merged.get("l1c_direction_score", 0.0),
             errors="coerce",
         ).fillna(0.0).to_numpy(dtype=np.float32, copy=False)
         l1c_c = pd.to_numeric(merged.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+        l1c_s = pd.to_numeric(merged.get("l1c_direction_strength", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
         out["l1c_weighted_dir"] = (l1c_d * l1c_c).astype(np.float32)
-        if "l1a_vol_forecast" in merged.columns:
-            vol = pd.to_numeric(merged["l1a_vol_forecast"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-            out["l1c_dir_x_vol"] = (l1c_d * vol).astype(np.float32)
-        else:
-            out["l1c_dir_x_vol"] = np.zeros(n_m, dtype=np.float32)
-        if "l1a_dir_normalized" in merged.columns:
-            l1a_dn = pd.to_numeric(merged["l1a_dir_normalized"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-            out["l1c_x_l1a_dir"] = (l1c_d * l1a_dn).astype(np.float32)
-        else:
-            out["l1c_x_l1a_dir"] = np.zeros(n_m, dtype=np.float32)
+        out["l1c_dir_x_vol"] = (l1c_d * vol).astype(np.float32)
+        out["l1c_dir_x_state_persistence"] = (l1c_d * persistence).astype(np.float32)
+        out["l1c_strength_x_conf"] = (l1c_s * l1c_c).astype(np.float32)
     else:
         out["l1c_weighted_dir"] = np.zeros(n_m, dtype=np.float32)
         out["l1c_dir_x_vol"] = np.zeros(n_m, dtype=np.float32)
-        out["l1c_x_l1a_dir"] = np.zeros(n_m, dtype=np.float32)
-
-    l1a_dir = pd.to_numeric(merged.get("l1a_dir_normalized", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    l1a_dir_conf = pd.to_numeric(merged.get("l1a_dir_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    l1b_dir = pd.to_numeric(merged.get("l1b_weighted_direction", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    gate_strength = out["l1b_cluster_top2_gap"].to_numpy(dtype=np.float32, copy=False)
-    l1a_active = np.abs(l1a_dir) >= 1e-4
-    l1b_active = np.abs(l1b_dir) >= 1e-4
-    out["l1_dir_agreement"] = (l1a_active & l1b_active & (np.sign(l1a_dir) == np.sign(l1b_dir))).astype(np.float32)
-    out["l1_dir_product"] = (l1a_dir * l1b_dir).astype(np.float32)
-    out["l1_dir_mean"] = (0.5 * (l1a_dir + l1b_dir)).astype(np.float32)
-    out["l1_dir_x_gate"] = (out["l1_dir_mean"].to_numpy(dtype=np.float32, copy=False) * gate_strength).astype(np.float32)
-    out["l1_dir_conf_x_gate"] = (l1a_dir_conf * gate_strength).astype(np.float32)
-    if "l1b_edge_pred" in merged.columns:
-        l1a_ds = pd.to_numeric(merged.get("l1a_dir_normalized", 0.0), errors="coerce").fillna(0.0).to_numpy(
-            dtype=np.float32, copy=False
-        )
-        l1b_edge = pd.to_numeric(merged["l1b_edge_pred"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-        l1a_ds_active = np.abs(l1a_ds) >= 1e-4
-        l1b_edge_active = np.abs(l1b_edge) >= 1e-4
-        out["l1a_l1b_edge_agree"] = (
-            l1a_ds_active & l1b_edge_active & (np.sign(l1a_ds) == np.sign(l1b_edge))
-        ).astype(np.float32)
-        out["l1a_l1b_edge_product"] = (l1a_ds * l1b_edge).astype(np.float32)
-    else:
-        out["l1a_l1b_edge_agree"] = np.zeros(n_m, dtype=np.float32)
-        out["l1a_l1b_edge_product"] = np.zeros(n_m, dtype=np.float32)
+        out["l1c_dir_x_state_persistence"] = np.zeros(n_m, dtype=np.float32)
+        out["l1c_strength_x_conf"] = np.zeros(n_m, dtype=np.float32)
 
     l1b_edge_f = pd.to_numeric(merged.get("l1b_edge_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    l1b_dq_f = pd.to_numeric(merged.get("l1b_dq_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     vol_f = pd.to_numeric(merged.get("l1a_vol_forecast", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     out["l2_vol_adjusted_l1b_edge"] = (l1b_edge_f / np.maximum(vol_f, 1e-4)).astype(np.float32)
+    l1c_dir_f = pd.to_numeric(merged.get("l1c_direction_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    l1c_conf_f = pd.to_numeric(merged.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    out["l2_dir_x_edge_opportunity"] = (l1c_dir_f * l1b_edge_f).astype(np.float32)
+    out["l2_dir_conf_x_edge_mag"] = (l1c_conf_f * np.abs(l1b_edge_f)).astype(np.float32)
+    out["l2_dq_x_edge"] = (l1b_dq_f * l1b_edge_f).astype(np.float32)
 
-    l1c_dir_f = pd.to_numeric(
-        merged.get("l1c_direction_score", merged.get("l1c_direction_pred", 0.0)),
-        errors="coerce",
-    ).fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    s_a = np.sign(np.where(np.abs(l1a_dir) < 1e-6, 0.0, l1a_dir))
-    s_c = np.sign(np.where(np.abs(l1c_dir_f) < 1e-6, 0.0, l1c_dir_f))
-    out["l2_l1a_l1c_sign_agree"] = (s_a * s_c).astype(np.float32)
-    out["l2_signal_strength_mean_abs"] = ((np.abs(l1a_dir) + np.abs(l1c_dir_f) + np.abs(l1b_edge_f)) / 3.0).astype(np.float32)
-    sig_stack = np.column_stack([l1a_dir.astype(np.float64), l1c_dir_f.astype(np.float64), l1b_edge_f.astype(np.float64)])
+    out["l2_signal_strength_mean_abs"] = ((np.abs(l1c_dir_f) + np.abs(l1b_edge_f)) / 2.0).astype(np.float32)
+    sig_stack = np.column_stack([l1c_dir_f.astype(np.float64), l1b_edge_f.astype(np.float64), l1b_dq_f.astype(np.float64)])
     out["l2_signal_spread_var"] = np.var(sig_stack, axis=1).astype(np.float32)
 
     if len(regime_cols) >= NUM_REGIME_CLASSES:
@@ -2889,17 +2894,22 @@ def _build_l2_frame(
     residual = _residual_feature_frame(df)
     derived = _derived_l2_feature_frame(merged)
     merged = pd.concat([merged.reset_index(drop=True), residual.reset_index(drop=True), derived.reset_index(drop=True)], axis=1)
-    feature_cols = [
-        c
-        for c in merged.columns
-        if c not in {"symbol", "time_key"}
-    ]
+    group_map = {
+        "state": _l2_state_input_cols(merged),
+        "condition": _l2_condition_input_cols(merged),
+        "direction": _l2_direction_input_cols(merged),
+        "residual": _l2_residual_input_cols(residual),
+        "derived": [c for c in derived.columns if c in merged.columns],
+    }
+    feature_cols = list(dict.fromkeys([c for cols in group_map.values() for c in cols if c not in {"symbol", "time_key"}]))
     for c in feature_cols:
         s = pd.to_numeric(merged[c], errors="coerce")
         if c in _L2_REGIME_INTERACTION_NAN_COLS:
             merged[c] = s.astype(np.float32)
         else:
             merged[c] = s.fillna(0.0).astype(np.float32)
+    for group_name, cols in group_map.items():
+        print(f"  [L2] input group {group_name}: {len(cols)} cols", flush=True)
     return merged, feature_cols
 
 
@@ -3654,6 +3664,12 @@ def train_l2_trade_decision(
         "l2_l1b_dropout_seed": int(l1b_do_seed),
         "l2_use_l1b_latent_features": bool(use_l1b_latent_feats),
         "feature_cols": feature_cols,
+        "feature_group_counts": {
+            "state": len(l1a_cols),
+            "condition": len(l1b_cols),
+            "direction": len(l1c_cols),
+            "residual_other": len(res_cols),
+        },
         "output_cols": L2_OUTPUT_COLS,
         "decision_mode": "live_hierarchical_gate_edge",
         "decision_tau": tau_global,
@@ -3666,11 +3682,17 @@ def train_l2_trade_decision(
         "live_trade_threshold": float(live_trade_threshold),
         "edge_temperature": float(ensemble_policy["edge_temperature"]),
         "direction_available": True,
-        "direction_head_type": "hierarchical_trade_then_direction",
+        "direction_head_type": "hierarchical_trade_then_direction_with_l1c_primary",
         "confidence_semantics": "probability-aligned; confidence equals the chosen class probability under the live trade-score plus direction decode",
-        "decision_class_semantics": "first derive live trade probability from Platt-calibrated trade score built from calibrated trade gate and fused expected edge; once active, choose long vs short from the trained direction fusion model",
+        "decision_class_semantics": "first derive live trade probability from Platt-calibrated trade score built from calibrated trade gate and fused expected edge; once active, choose long vs short from the trained direction fusion model with L1c as the primary sign-bearing input",
         "size_semantics": "risk_adjusted_position_fraction",
-        "expected_edge_semantics": "ridge-style fusion of triple-gate expected edge and signed-edge branch prediction, evaluated through gate-edge policy",
+        "expected_edge_semantics": "ridge-style fusion of triple-gate expected edge and signed-edge branch prediction, evaluated through gate-edge policy under explicit state/condition/direction input grouping",
+        "feature_contract_semantics": {
+            "state": "L1a contributes regime, volatility, persistence, and embedding context only",
+            "condition": "L1b contributes tradeability, quality, novelty, and cluster context only",
+            "direction": "L1c is the only directional owner consumed by L2",
+            "residual_other": "PA state and session context features remain as local execution context",
+        },
         "pa_state_features": list(PA_STATE_FEATURES),
         "pa_policy_semantics": "PA state buckets expand conditional policy keys, active label geometry, and direction weighting inside the fixed live Layer2 path",
         "pa_internal_semantics": {

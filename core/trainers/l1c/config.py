@@ -14,6 +14,9 @@ class L1cConfig:
     num_heads: int = 4
     num_layers: int = 2
     ff_dim: int = 96
+    conv_kernel_size: int = 5
+    conv_hidden_dim: int = 48
+    conv_dropout: float = 0.20
 
     attn_dropout: float = 0.25
     ff_dropout: float = 0.28
@@ -30,6 +33,7 @@ class L1cConfig:
 
     # Binary direction BCE: targets smoothed toward 0.5 (e.g. 0→0.05, 1→0.95).
     label_smoothing: float = 0.05
+    strength_aux_weight: float = 0.10
 
     # LR schedule: CosineAnnealingWarmRestarts (T_0, T_mult); set T0=0 to disable (plateau only).
     cosine_t0: int = 5

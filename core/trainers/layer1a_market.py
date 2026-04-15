@@ -53,7 +53,7 @@ from core.trainers.tcn_constants import DEVICE, SEQ_LEN
 
 
 def _bounded_scalar_cols() -> list[str]:
-    return ["l1a_transition_risk"]
+    return ["l1a_transition_risk", "l1a_state_persistence"]
 
 
 def _l1a_direction_cols() -> list[str]:
@@ -81,6 +81,7 @@ def l1a_output_columns_with_embed_dim(embed_dim: int) -> list[str]:
             "l1a_vol_forecast",
             "l1a_vol_trend",
             "l1a_time_in_regime",
+            "l1a_state_persistence",
         ]
         + _l1a_direction_cols()
         + [f"l1a_market_embed_{idx}" for idx in range(d)]
@@ -414,6 +415,41 @@ class EmbedHead(nn.Module):
         return self.projector(shared_repr)
 
 
+class StateStructureDecoder(nn.Module):
+    """Refine regime logits with persistence/transition structure from shared state context."""
+
+    def __init__(self, shared_dim: int, num_classes: int, *, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.context = nn.Sequential(
+            nn.Linear(shared_dim + num_classes + 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.delta_head = nn.Linear(hidden_dim, num_classes)
+        self.persistence_head = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        shared_repr: torch.Tensor,
+        base_regime_logits: torch.Tensor,
+        transition_logit: torch.Tensor,
+        vol_trend_value: torch.Tensor,
+        time_in_regime_value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        transition_prob = torch.sigmoid(transition_logit).unsqueeze(-1)
+        time_ir = time_in_regime_value.unsqueeze(-1)
+        vol_trend = torch.tanh(vol_trend_value).unsqueeze(-1)
+        x = torch.cat([shared_repr, base_regime_logits, transition_prob, vol_trend, time_ir], dim=1)
+        h = self.context(x)
+        persistence_logit = self.persistence_head(h).squeeze(-1)
+        persistence_gate = torch.sigmoid(persistence_logit).unsqueeze(-1)
+        refined_logits = base_regime_logits + persistence_gate * self.delta_head(h)
+        return refined_logits, persistence_logit
+
+
 class L1AMarketTCN(nn.Module):
     def __init__(
         self,
@@ -460,11 +496,17 @@ class L1AMarketTCN(nn.Module):
         hd_small = max(hd // 2, 16)
         ed = int(embed_dim) if embed_dim is not None else _l1a_embed_dim()
         self.embed_dim = ed
-        self.regime_head = TaskHead(self.shared_dim, hd, NUM_REGIME_CLASSES, activation="identity", dropout=hd_drop)
+        self.base_regime_head = TaskHead(self.shared_dim, hd, NUM_REGIME_CLASSES, activation="identity", dropout=hd_drop)
         self.transition_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
         self.vol_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
         self.vol_trend_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
         self.time_in_regime_head = TaskHead(self.shared_dim, hd_small, 1, activation="sigmoid", dropout=hd_drop)
+        self.state_structure_decoder = StateStructureDecoder(
+            self.shared_dim,
+            NUM_REGIME_CLASSES,
+            hidden_dim=hd,
+            dropout=hd_drop,
+        )
         self.embed_head = EmbedHead(self.shared_dim, ed)
         self.embed_decoder = nn.Sequential(
             nn.Linear(ed, 64),
@@ -482,13 +524,26 @@ class L1AMarketTCN(nn.Module):
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         shared = self.shared_repr(x)
         embed = self.embed_head(shared)
-        regime_logits = self.regime_head(shared)
+        base_regime_logits = self.base_regime_head(shared)
+        transition_logit = self.transition_head(shared).squeeze(-1)
+        vol_value = self.vol_head(shared).squeeze(-1)
+        vol_trend_value = self.vol_trend_head(shared).squeeze(-1)
+        time_in_regime_value = self.time_in_regime_head(shared).squeeze(-1)
+        regime_logits, state_persistence_logit = self.state_structure_decoder(
+            shared,
+            base_regime_logits,
+            transition_logit,
+            vol_trend_value,
+            time_in_regime_value,
+        )
         return {
             "regime_logits": regime_logits,
-            "transition_logit": self.transition_head(shared).squeeze(-1),
-            "vol_value": self.vol_head(shared).squeeze(-1),
-            "vol_trend_value": self.vol_trend_head(shared).squeeze(-1),
-            "time_in_regime_value": self.time_in_regime_head(shared).squeeze(-1),
+            "base_regime_logits": base_regime_logits,
+            "transition_logit": transition_logit,
+            "vol_value": vol_value,
+            "vol_trend_value": vol_trend_value,
+            "time_in_regime_value": time_in_regime_value,
+            "state_persistence_logit": state_persistence_logit,
             "market_embed": embed,
             "embed_recon": self.embed_decoder(embed),
             "shared_repr": shared,
@@ -525,6 +580,7 @@ def _train_epoch(
     total_loss = 0.0
     total_rows = 0
     mse = nn.MSELoss()
+    bce = nn.BCEWithLogitsLoss()
     it = loader
     if _lgb_round_tqdm_enabled():
         it = tqdm(
@@ -545,19 +601,23 @@ def _train_epoch(
         out = model(xb)
         losses = {
             "regime": regime_loss(out["regime_logits"], y_regime),
+            "regime_aux": regime_loss(out["base_regime_logits"], y_regime),
             "vol": mse(out["vol_value"], y_vol),
             "vol_trend": mse(out["vol_trend_value"], y_vol_trend),
             "time_in_regime": mse(out["time_in_regime_value"], y_time_ir),
             "embed_recon": mse(out["embed_recon"], out["shared_repr"].detach()),
             "transition": transition_loss(out["transition_logit"], y_transition),
+            "state_persistence": bce(out["state_persistence_logit"], 1.0 - y_transition),
         }
         loss = (
             loss_weights["regime"] * losses["regime"]
+            + 0.20 * loss_weights["regime"] * losses["regime_aux"]
             + loss_weights["vol"] * losses["vol"]
             + loss_weights["vol_trend"] * losses["vol_trend"]
             + loss_weights["time_in_regime"] * losses["time_in_regime"]
             + loss_weights["embed_recon"] * losses["embed_recon"]
             + loss_weights["transition"] * losses["transition"]
+            + 0.35 * loss_weights["transition"] * losses["state_persistence"]
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -581,6 +641,7 @@ def _eval_epoch(
     total_loss = 0.0
     total_rows = 0
     mse = nn.MSELoss()
+    bce = nn.BCEWithLogitsLoss()
     it = loader
     if _lgb_round_tqdm_enabled():
         it = tqdm(
@@ -602,11 +663,13 @@ def _eval_epoch(
             out = model(xb)
             loss = (
                 loss_weights["regime"] * regime_loss(out["regime_logits"], y_regime)
+                + 0.20 * loss_weights["regime"] * regime_loss(out["base_regime_logits"], y_regime)
                 + loss_weights["vol"] * mse(out["vol_value"], y_vol)
                 + loss_weights["vol_trend"] * mse(out["vol_trend_value"], y_vol_trend)
                 + loss_weights["time_in_regime"] * mse(out["time_in_regime_value"], y_time_ir)
                 + loss_weights["embed_recon"] * mse(out["embed_recon"], out["shared_repr"].detach())
                 + loss_weights["transition"] * transition_loss(out["transition_logit"], y_transition)
+                + 0.35 * loss_weights["transition"] * bce(out["state_persistence_logit"], 1.0 - y_transition)
             )
             total_loss += float(loss.item()) * len(xb)
             total_rows += len(xb)
@@ -674,6 +737,7 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     tir_t: list[np.ndarray] = []
     tir_p: list[np.ndarray] = []
     tr_t, tr_s = [], []
+    persist_s: list[np.ndarray] = []
     emb_mse: list[np.ndarray] = []
     with torch.no_grad():
         for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in val_dl:
@@ -696,6 +760,7 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
             tir_p.append(out["time_in_regime_value"].detach().cpu().numpy())
             tr_t.append(y_transition.detach().cpu().numpy())
             tr_s.append(torch.sigmoid(out["transition_logit"]).detach().cpu().numpy())
+            persist_s.append(torch.sigmoid(out["state_persistence_logit"]).detach().cpu().numpy())
             emb_mse.append(
                 F.mse_loss(out["embed_recon"], out["shared_repr"].detach(), reduction="none").mean(dim=1).detach().cpu().numpy()
             )
@@ -734,6 +799,7 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     mae_tir = float(mean_absolute_error(tirt, tirpr))
     corr_tir = pearson_corr(tirt, tirpr)
     emb_mean = float(np.mean(np.concatenate(emb_mse)))
+    persist_mean = float(np.mean(np.concatenate(persist_s))) if persist_s else float("nan")
 
     print(f"\n  [L1a] ========== val ({label}) effectiveness report ==========", flush=True)
     print(
@@ -772,6 +838,10 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     )
     print(
         f"  [L1a] time_in_regime head:  MAE={mae_tir:.4f}  corr(y,p)={corr_tir:.4f}",
+        flush=True,
+    )
+    print(
+        f"  [L1a] state persistence head:  mean(persist)={persist_mean:.4f}  mean(stay_target)={float(1.0 - np.mean(np.concatenate(tr_t))):.4f}",
         flush=True,
     )
     print(
@@ -829,7 +899,7 @@ def materialize_l1a_outputs(
     if _lgb_round_tqdm_enabled():
         dl_it = tqdm(dl, desc="[L1a] materialize outputs", file=TQDM_FILE, mininterval=0.3, unit="batch")
     regime_rows: list[np.ndarray] = []
-    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol", "vol_trend", "time_ir"]}
+    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol", "vol_trend", "time_ir", "persistence"]}
     embeds: list[np.ndarray] = []
     model.eval()
     with torch.no_grad():
@@ -845,6 +915,7 @@ def materialize_l1a_outputs(
                 np.clip(out["vol_trend_value"].detach().cpu().numpy(), clip_lo, clip_hi)
             )
             scalar_rows["time_ir"].append(out["time_in_regime_value"].detach().cpu().numpy())
+            scalar_rows["persistence"].append(torch.sigmoid(out["state_persistence_logit"]).cpu().numpy())
             embeds.append(out["market_embed"].cpu().numpy())
     regime = np.concatenate(regime_rows, axis=0)
     outputs.loc[end_idx, L1A_REGIME_COLS] = regime
@@ -853,6 +924,9 @@ def materialize_l1a_outputs(
     outputs.loc[end_idx, "l1a_vol_trend"] = np.concatenate(scalar_rows["vol_trend"], axis=0)
     outputs.loc[end_idx, "l1a_time_in_regime"] = np.clip(
         np.concatenate(scalar_rows["time_ir"], axis=0), 0.0, 1.0
+    )
+    outputs.loc[end_idx, "l1a_state_persistence"] = np.clip(
+        np.concatenate(scalar_rows["persistence"], axis=0), 0.0, 1.0
     )
     direction_features = _derive_l1a_direction_features(
         outputs.loc[end_idx, L1A_REGIME_COLS].to_numpy(dtype=np.float32, copy=False),
@@ -1060,10 +1134,12 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "direction_target_semantics": (
             "l1a_dir_* (bull/bear geometry) from regime probabilities + transition/vol; no placeholder sign probs."
         ),
+        "state_structure_semantics": "state_structure_decoder refines regime logits from shared state, transition risk, vol trend, and time-in-regime context; l1a_state_persistence estimates stay probability",
         "l1a_vol_trend_target": f"per-symbol range_norm[t]-range_norm[t-{os.environ.get('L1A_VOL_TREND_LAG', '5')}], clipped",
         "l1a_time_in_regime_target": f"min(run_length,cap)/cap from state_label runs; cap={os.environ.get('L1A_TIME_IN_REGIME_CAP', '120')}",
         "embed_dim": int(embed_dim),
         "l1a_direction_arch": "regime_derived_only",
+        "l1a_state_arch": "tcn_plus_state_structure_decoder",
         "loss_weights": loss_weights,
         "tcn_channels": list(ch),
         "tcn_dropout": float(td),

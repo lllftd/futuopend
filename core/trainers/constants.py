@@ -76,9 +76,9 @@ PA_STATE_FEATURES = [
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 
 # New dual-view stack schema versions
-L1A_SCHEMA_VERSION = "1.15.0"
-L1B_SCHEMA_VERSION = "1.11.0"
-L2_SCHEMA_VERSION = "1.22.0"
+L1A_SCHEMA_VERSION = "1.16.0"
+L1B_SCHEMA_VERSION = "1.13.0"
+L2_SCHEMA_VERSION = "1.24.0"
 L3_SCHEMA_VERSION = "1.11.0"
 
 # New artifact names
@@ -94,7 +94,7 @@ L1B_OUTPUT_CACHE_FILE = "l1b_outputs.pkl"
 L1B_EDGE_PRED_FILE = "l1b_edge_pred.txt"
 L1B_DQ_PRED_FILE = "l1b_dq_pred.txt"
 
-L1C_SCHEMA_VERSION = "1.2.0"
+L1C_SCHEMA_VERSION = "1.3.0"
 L1C_MODEL_FILE = "l1c_direction.pt"
 L1C_META_FILE = "l1c_direction_meta.pkl"
 L1C_OUTPUT_CACHE_FILE = "l1c_outputs.pkl"

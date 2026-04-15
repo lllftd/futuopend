@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from core.trainers.l1c.config import L1cConfig
 
@@ -54,8 +55,28 @@ class AttentionBlock(nn.Module):
         return x
 
 
+class LocalPatternBranch(nn.Module):
+    """Short-horizon convolutional extractor for directional micro-patterns."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, *, kernel_size: int, dropout: float):
+        super().__init__()
+        pad = max(int(kernel_size) // 2, 1)
+        self.net = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim, kernel_size=kernel_size, padding=pad),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=max(3, kernel_size - 2), padding=max((max(3, kernel_size - 2)) // 2, 1)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x.transpose(1, 2))
+        return F.adaptive_avg_pool1d(h, 1).squeeze(-1)
+
+
 class L1cDirectionModel(nn.Module):
-    """Causal Transformer with a single logits head: P(future return > 0)."""
+    """Dual-branch directional model: causal context + local-pattern extractor."""
 
     def __init__(self, config: L1cConfig):
         super().__init__()
@@ -67,6 +88,12 @@ class L1cDirectionModel(nn.Module):
             nn.Linear(d_in, config.embed_dim),
             nn.LayerNorm(config.embed_dim),
             nn.Dropout(config.embed_dropout),
+        )
+        self.local_branch = LocalPatternBranch(
+            d_in,
+            int(config.conv_hidden_dim),
+            kernel_size=max(3, int(config.conv_kernel_size)),
+            dropout=float(config.conv_dropout),
         )
         self.pos_enc = TemporalPositionEncoding(config.embed_dim, max_len=config.seq_len + 8)
         self.layer_drop = float(config.layer_drop)
@@ -83,7 +110,19 @@ class L1cDirectionModel(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(config.embed_dim)
+        fusion_dim = config.embed_dim + int(config.conv_hidden_dim)
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_dim, config.embed_dim),
+            nn.GELU(),
+            nn.Dropout(config.ff_dropout),
+        )
         self.direction_logits = nn.Sequential(
+            nn.Linear(config.embed_dim, max(32, config.embed_dim // 2)),
+            nn.GELU(),
+            nn.Dropout(config.ff_dropout),
+            nn.Linear(max(32, config.embed_dim // 2), 1),
+        )
+        self.direction_strength = nn.Sequential(
             nn.Linear(config.embed_dim, max(32, config.embed_dim // 2)),
             nn.GELU(),
             nn.Dropout(config.ff_dropout),
@@ -103,6 +142,7 @@ class L1cDirectionModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _b, t, _ = x.shape
+        local_repr = self.local_branch(x)
         h = self.input_proj(x)
         h = self.pos_enc(h)
         mask = self.causal_mask[:t, :t]
@@ -112,4 +152,11 @@ class L1cDirectionModel(nn.Module):
             h = block(h, attn_mask=mask)
         h = self.final_norm(h)
         h_last = h[:, -1, :]
-        return self.direction_logits(h_last)
+        fused = self.fusion(torch.cat([h_last, local_repr], dim=1))
+        return {
+            "direction_logits": self.direction_logits(fused),
+            "direction_strength": self.direction_strength(fused),
+            "context_repr": h_last,
+            "local_repr": local_repr,
+            "fused_repr": fused,
+        }

@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import trange
@@ -36,7 +37,7 @@ def l1c_output_columns() -> list[str]:
         "l1c_direction_prob",
         "l1c_direction_score",
         "l1c_confidence",
-        "l1c_direction_pred",
+        "l1c_direction_strength",
         "l1c_is_warm",
     ]
 
@@ -77,6 +78,17 @@ def _sample_weights_from_abs_return(abs_ret: np.ndarray) -> np.ndarray:
     return (ranks / float(max(n, 1))).astype(np.float32)
 
 
+def _l1c_forward_dict(model: L1cDirectionModel, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    out = model(x)
+    if isinstance(out, dict):
+        return out
+    logits = out
+    return {
+        "direction_logits": logits,
+        "direction_strength": logits.new_zeros(logits.shape),
+    }
+
+
 def _print_l1c_binary_label_stats(y_bin: np.ndarray, y_ret: np.ndarray, *, prefix: str) -> None:
     y_bin = np.asarray(y_bin, dtype=np.float64).ravel()
     y_ret = np.asarray(y_ret, dtype=np.float64).ravel()
@@ -107,7 +119,7 @@ def _first_epoch_diagnostic(
         for b_idx, batch in enumerate(train_loader):
             x = batch[0].to(device)
             y = batch[1].numpy().ravel()
-            logits = model(x)
+            logits = _l1c_forward_dict(model, x)["direction_logits"]
             p = torch.sigmoid(logits.view(-1)).cpu().numpy()
             probs.append(p)
             trues.append(y)
@@ -262,20 +274,23 @@ def materialize_l1c_outputs(
     ds = TensorDataset(torch.from_numpy(windows.astype(np.float32, copy=False)))
     dl = DataLoader(ds, batch_size=1024, shuffle=False)
     logit_chunks: list[np.ndarray] = []
+    strength_chunks: list[np.ndarray] = []
     model.eval()
     with torch.no_grad():
         for (xb,) in dl:
             xb = xb.to(device)
-            lg = model(xb)
-            logit_chunks.append(lg.cpu().numpy().astype(np.float32))
+            out = _l1c_forward_dict(model, xb)
+            logit_chunks.append(out["direction_logits"].cpu().numpy().astype(np.float32))
+            strength_chunks.append(torch.relu(out["direction_strength"]).cpu().numpy().astype(np.float32))
     logits = np.concatenate(logit_chunks, axis=0).ravel()
+    strength = np.concatenate(strength_chunks, axis=0).ravel() if strength_chunks else np.zeros_like(logits)
     prob = (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
     score = (2.0 * prob - 1.0).astype(np.float32)
     conf = np.abs(score).astype(np.float32)
     outputs.loc[end_idx, "l1c_direction_prob"] = prob
     outputs.loc[end_idx, "l1c_direction_score"] = score
     outputs.loc[end_idx, "l1c_confidence"] = conf
-    outputs.loc[end_idx, "l1c_direction_pred"] = score
+    outputs.loc[end_idx, "l1c_direction_strength"] = strength.astype(np.float32)
     outputs.loc[end_idx, "l1c_is_warm"] = np.float32(1.0)
     return outputs
 
@@ -334,10 +349,17 @@ def _train_one_epoch(
         xb = batch[0].to(device)
         yb = batch[1].to(device)
         wb = batch[2].to(device)
+        yr = batch[3].to(device)
         xb = _l1c_augment_batch(xb, training=True, seq_len=seq_len)
         optimizer.zero_grad()
-        logits = model(xb)
+        out = _l1c_forward_dict(model, xb)
+        logits = out["direction_logits"]
         loss, _parts = criterion(logits, yb, wb)
+        strength_tgt = torch.asinh(torch.abs(yr.view(-1)) * 100.0)
+        strength_pred = torch.relu(out["direction_strength"].view(-1))
+        strength_loss = F.smooth_l1_loss(strength_pred, strength_tgt, reduction="none")
+        strength_loss = (strength_loss * wb.view(-1)).sum() / torch.clamp(wb.sum(), min=1e-6)
+        loss = loss + float(getattr(model.config, "strength_aux_weight", 0.10)) * strength_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(os.environ.get("L1C_MAX_GRAD_NORM", "1.0")))
         optimizer.step()
@@ -360,8 +382,15 @@ def _eval_loss(
             xb = batch[0].to(device)
             yb = batch[1].to(device)
             wb = batch[2].to(device)
-            logits = model(xb)
+            yr = batch[3].to(device)
+            out = _l1c_forward_dict(model, xb)
+            logits = out["direction_logits"]
             loss, _ = criterion(logits, yb, wb)
+            strength_tgt = torch.asinh(torch.abs(yr.view(-1)) * 100.0)
+            strength_pred = torch.relu(out["direction_strength"].view(-1))
+            strength_loss = F.smooth_l1_loss(strength_pred, strength_tgt, reduction="none")
+            strength_loss = (strength_loss * wb.view(-1)).sum() / torch.clamp(wb.sum(), min=1e-6)
+            loss = loss + float(getattr(model.config, "strength_aux_weight", 0.10)) * strength_loss
             total += float(loss.cpu()) * xb.size(0)
             n += xb.size(0)
     return total / max(n, 1)
@@ -376,6 +405,9 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         ("L1C_NUM_LAYERS", "num_layers"),
         ("L1C_EMBED_DIM", "embed_dim"),
         ("L1C_FF_DIM", "ff_dim"),
+        ("L1C_CONV_KERNEL", "conv_kernel_size"),
+        ("L1C_CONV_HIDDEN", "conv_hidden_dim"),
+        ("L1C_CONV_DROPOUT", "conv_dropout"),
         ("L1C_ATTN_DROPOUT", "attn_dropout"),
         ("L1C_FF_DROPOUT", "ff_dropout"),
         ("L1C_EMBED_DROPOUT", "embed_dropout"),
@@ -383,13 +415,25 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         ("L1C_PATIENCE", "patience"),
         ("L1C_MAX_EPOCHS", "max_epochs"),
         ("L1C_LABEL_SMOOTHING", "label_smoothing"),
+        ("L1C_STRENGTH_AUX_WEIGHT", "strength_aux_weight"),
         ("L1C_COS_T0", "cosine_t0"),
         ("L1C_COS_T_MULT", "cosine_t_mult"),
     ):
         raw = os.environ.get(_env, "").strip()
         if raw and _attr in L1cConfig.__dataclass_fields__:
             field_type = L1cConfig.__dataclass_fields__[_attr].type
-            if _attr in ("num_heads", "num_layers", "embed_dim", "ff_dim", "patience", "max_epochs", "cosine_t0", "cosine_t_mult"):
+            if _attr in (
+                "num_heads",
+                "num_layers",
+                "embed_dim",
+                "ff_dim",
+                "conv_kernel_size",
+                "conv_hidden_dim",
+                "patience",
+                "max_epochs",
+                "cosine_t0",
+                "cosine_t_mult",
+            ):
                 setattr(config, _attr, int(float(raw)))
             else:
                 setattr(config, _attr, float(raw))
@@ -536,6 +580,7 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
             f"per-symbol 1[(close[t+H]-close[t])/close[t] > 0] at H={horizon}; "
             f"weighted BCE on logits; label_smoothing={float(config.label_smoothing):.4f}"
         ),
+        "direction_aux_semantics": "dual-branch model with local CNN branch; auxiliary head predicts asinh(|future_ret|*100)",
         "val_metrics": val_metrics,
     }
     with open(os.path.join(MODEL_DIR, L1C_META_FILE), "wb") as f:

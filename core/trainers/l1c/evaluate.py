@@ -50,7 +50,8 @@ def evaluate_l1c(
             xb = batch[0].to(device)
             yb = batch[1].cpu().numpy().ravel()
             yr = batch[3].cpu().numpy().ravel()
-            logits = model(xb)
+            out = model(xb)
+            logits = out["direction_logits"] if isinstance(out, dict) else out
             pr = torch.sigmoid(logits.view(-1)).cpu().numpy()
             probs_l.append(pr.astype(np.float64))
             y_bin_l.append(yb.astype(np.float64))
