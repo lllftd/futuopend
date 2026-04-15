@@ -76,18 +76,15 @@ PA_STATE_FEATURES = [
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 
 # New dual-view stack schema versions
-L1A_SCHEMA_VERSION = "1.16.0"
-L1B_SCHEMA_VERSION = "1.13.0"
-L2_SCHEMA_VERSION = "1.24.0"
-L3_SCHEMA_VERSION = "1.11.0"
+L1A_SCHEMA_VERSION = "1.17.0"
+L1B_SCHEMA_VERSION = "1.14.0"
+L2_SCHEMA_VERSION = "1.28.0"
+L3_SCHEMA_VERSION = "1.13.0"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"
 L1A_META_FILE = "l1a_market_tcn_meta.pkl"
 L1A_OUTPUT_CACHE_FILE = "l1a_outputs.pkl"
-
-# L1a l1a_dir_*: regime-geometry from regime probs + transition/vol; not a learned return head.
-L1A_DIR_STRENGTH_SCALE = 1.0
 
 L1B_META_FILE = "l1b_descriptor_meta.pkl"
 L1B_OUTPUT_CACHE_FILE = "l1b_outputs.pkl"
@@ -99,11 +96,10 @@ L1C_MODEL_FILE = "l1c_direction.pt"
 L1C_META_FILE = "l1c_direction_meta.pkl"
 L1C_OUTPUT_CACHE_FILE = "l1c_outputs.pkl"
 
-L2_DECISION_FILE = "l2_decision.txt"
 L2_GATE_FILE = "l2_trade_gate.txt"
 L2_DIRECTION_FILE = "l2_direction.txt"
-L2_SIGNED_EDGE_FILE = "l2_signed_edge.txt"
-L2_SIZE_FILE = "l2_size.txt"
+L2_TRADE_GATE_CALIBRATOR_FILE = "l2_trade_gate_calibrator.pkl"
+L2_DIRECTION_CALIBRATOR_FILE = "l2_direction_calibrator.pkl"
 L2_MFE_FILE = "l2_mfe.txt"
 L2_MAE_FILE = "l2_mae.txt"
 L2_META_FILE = "l2_decision_meta.pkl"

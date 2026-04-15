@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from core.trainers.val_metrics_extra import pearson_corr
+from core.trainers.val_metrics_extra import brier_binary, ece_binary, pearson_corr
 
 
 def _safe_spearman(a: np.ndarray, b: np.ndarray) -> float:
@@ -33,6 +33,101 @@ def _binary_f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if prec + rec <= 0:
         return 0.0
     return float(2.0 * prec * rec / (prec + rec))
+
+
+def _binary_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.int64).ravel()
+    y_pred = np.asarray(y_pred, dtype=np.int64).ravel()
+    if y_true.size == 0 or y_pred.size == 0:
+        return float("nan")
+    return float(np.mean(y_true == y_pred))
+
+
+def _coverage_accuracy_table(
+    prob: np.ndarray,
+    y_int: np.ndarray,
+    *,
+    thresholds: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25),
+) -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    pred_int = (np.asarray(prob, dtype=np.float64).ravel() >= 0.5).astype(np.int64)
+    y = np.asarray(y_int, dtype=np.int64).ravel()
+    p = np.asarray(prob, dtype=np.float64).ravel()
+    conf = np.abs(p - 0.5)
+    n = len(p)
+    for thr in thresholds:
+        mask = conf > float(thr)
+        cnt = int(np.sum(mask))
+        rows.append(
+            {
+                "threshold": float(thr),
+                "n": cnt,
+                "coverage": float(cnt / n) if n > 0 else float("nan"),
+                "accuracy": _binary_accuracy(y[mask], pred_int[mask]) if cnt > 0 else float("nan"),
+                "mean_confidence": float(np.mean(conf[mask])) if cnt > 0 else float("nan"),
+                "mean_prob": float(np.mean(p[mask])) if cnt > 0 else float("nan"),
+                "up_rate": float(np.mean(y[mask])) if cnt > 0 else float("nan"),
+            }
+        )
+    return rows
+
+
+def _probability_bin_table(prob: np.ndarray, y_int: np.ndarray, *, n_bins: int = 10) -> list[dict[str, float]]:
+    p = np.asarray(prob, dtype=np.float64).ravel()
+    y = np.asarray(y_int, dtype=np.int64).ravel()
+    if p.size == 0:
+        return []
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    rows: list[dict[str, float]] = []
+    for idx in range(n_bins):
+        lo = float(edges[idx])
+        hi = float(edges[idx + 1])
+        if idx < n_bins - 1:
+            mask = (p >= lo) & (p < hi)
+        else:
+            mask = (p >= lo) & (p <= hi)
+        cnt = int(np.sum(mask))
+        rows.append(
+            {
+                "lo": lo,
+                "hi": hi,
+                "n": cnt,
+                "coverage": float(cnt / p.size),
+                "mean_prob": float(np.mean(p[mask])) if cnt > 0 else float("nan"),
+                "up_rate": float(np.mean(y[mask])) if cnt > 0 else float("nan"),
+                "accuracy": _binary_accuracy(y[mask], (p[mask] >= 0.5).astype(np.int64)) if cnt > 0 else float("nan"),
+            }
+        )
+    return rows
+
+
+def _quintile_summary(prob: np.ndarray, y_int: np.ndarray) -> list[dict[str, float]]:
+    p = np.asarray(prob, dtype=np.float64).ravel()
+    y = np.asarray(y_int, dtype=np.int64).ravel()
+    if p.size == 0:
+        return []
+    order = np.argsort(p, kind="mergesort")
+    p_s = p[order]
+    y_s = y[order]
+    n = len(p_s)
+    rows: list[dict[str, float]] = []
+    for q in range(5):
+        lo = int(np.floor(q * n / 5))
+        hi = int(np.floor((q + 1) * n / 5))
+        if hi <= lo:
+            continue
+        pq = p_s[lo:hi]
+        yq = y_s[lo:hi]
+        rows.append(
+            {
+                "quintile": int(q + 1),
+                "n": int(len(pq)),
+                "mean_prob": float(np.mean(pq)),
+                "up_rate": float(np.mean(yq)),
+                "accuracy": _binary_accuracy(yq, (pq >= 0.5).astype(np.int64)),
+            }
+        )
+    return rows
 
 
 def evaluate_l1c(
@@ -73,6 +168,8 @@ def evaluate_l1c(
     spear_pb = _safe_spearman(prob, y_bin)
     spear_ret = _safe_spearman(prob, y_ret)
     spear_score_ret = _safe_spearman(score, y_ret)
+    brier = brier_binary(y_int.astype(np.float64), prob)
+    ece = ece_binary(y_int.astype(np.float64), prob)
 
     try:
         from sklearn.metrics import roc_auc_score
@@ -84,20 +181,33 @@ def evaluate_l1c(
     abs_ret = np.abs(y_ret)
     med = float(np.median(abs_ret)) if abs_ret.size else 0.0
     strong = abs_ret > med
-    acc_strong = float(np.mean(pred_int[strong] == y_int[strong])) if np.any(strong) else float("nan")
+    strong_n = int(np.sum(strong))
+    acc_strong = float(np.mean(pred_int[strong] == y_int[strong])) if strong_n > 0 else float("nan")
     confident = np.abs(prob - 0.5) > 0.2
-    acc_conf = float(np.mean(pred_int[confident] == y_int[confident])) if np.any(confident) else float("nan")
+    conf_n = int(np.sum(confident))
+    acc_conf = float(np.mean(pred_int[confident] == y_int[confident])) if conf_n > 0 else float("nan")
+    conf_table = _coverage_accuracy_table(prob, y_int)
+    prob_bin_table = _probability_bin_table(prob, y_int, n_bins=10)
+    quintiles = _quintile_summary(prob, y_int)
 
     return {
         "binary_accuracy": acc,
         "binary_f1": float(f1) if np.isfinite(f1) else float("nan"),
         "auc_up": auc,
+        "brier": float(brier) if np.isfinite(brier) else float("nan"),
+        "ece": float(ece) if np.isfinite(ece) else float("nan"),
         "pearson_prob_label": float(np.nan_to_num(pear, nan=0.0)),
         "spearman_prob_label": float(spear_pb) if np.isfinite(spear_pb) else float("nan"),
         "spearman_prob_raw_return": float(spear_ret) if np.isfinite(spear_ret) else float("nan"),
         "spearman_score_raw_return": float(spear_score_ret) if np.isfinite(spear_score_ret) else float("nan"),
         "acc_abs_ret_gt_median": acc_strong,
+        "n_abs_ret_gt_median": strong_n,
         "acc_prob_confident": acc_conf,
+        "n_prob_confident": conf_n,
+        "coverage_prob_confident": float(conf_n / len(prob)) if len(prob) > 0 else float("nan"),
+        "confidence_threshold_table": conf_table,
+        "probability_bin_table": prob_bin_table,
+        "probability_quintiles": quintiles,
         "n": int(len(prob)),
     }
 
@@ -105,7 +215,8 @@ def evaluate_l1c(
 def print_l1c_eval_report(metrics: dict[str, Any]) -> None:
     print(
         f"  [L1c] val binary_acc={metrics.get('binary_accuracy', float('nan')):.4f}  "
-        f"binary_f1={metrics.get('binary_f1', float('nan')):.4f}  auc={metrics.get('auc_up', float('nan')):.4f}",
+        f"binary_f1={metrics.get('binary_f1', float('nan')):.4f}  auc={metrics.get('auc_up', float('nan')):.4f}  "
+        f"Brier={metrics.get('brier', float('nan')):.4f}  ECE={metrics.get('ece', float('nan')):.4f}",
         flush=True,
     )
     print(
@@ -116,6 +227,39 @@ def print_l1c_eval_report(metrics: dict[str, Any]) -> None:
     )
     print(
         f"  [L1c] val subsets: acc(|ret|>median)={metrics.get('acc_abs_ret_gt_median', float('nan')):.4f}  "
-        f"acc(|p-0.5|>0.2)={metrics.get('acc_prob_confident', float('nan')):.4f}",
+        f"n={metrics.get('n_abs_ret_gt_median', 0):,}  "
+        f"acc(|p-0.5|>0.2)={metrics.get('acc_prob_confident', float('nan')):.4f}  "
+        f"n={metrics.get('n_prob_confident', 0):,}  coverage={metrics.get('coverage_prob_confident', float('nan')):.2%}",
         flush=True,
     )
+    conf_rows = metrics.get("confidence_threshold_table") or []
+    if conf_rows:
+        print("  [L1c] confidence coverage/accuracy:", flush=True)
+        for row in conf_rows:
+            print(
+                f"    |p-0.5|>{row['threshold']:.2f}: n={int(row['n']):,}  coverage={row['coverage']:.2%}  "
+                f"acc={row['accuracy']:.4f}  mean|p-0.5|={row['mean_confidence']:.4f}",
+                flush=True,
+            )
+    quint_rows = metrics.get("probability_quintiles") or []
+    if quint_rows:
+        print("  [L1c] probability quintiles (monotonicity check):", flush=True)
+        for row in quint_rows:
+            print(
+                f"    Q{int(row['quintile'])}: n={int(row['n']):,}  mean_prob={row['mean_prob']:.4f}  "
+                f"up_rate={row['up_rate']:.4f}  acc={row['accuracy']:.4f}",
+                flush=True,
+            )
+    bin_rows = metrics.get("probability_bin_table") or []
+    if bin_rows:
+        print("  [L1c] reliability by probability bin:", flush=True)
+        for row in bin_rows:
+            mean_prob = row["mean_prob"]
+            up_rate = row["up_rate"]
+            mean_prob_s = f"{mean_prob:.4f}" if np.isfinite(mean_prob) else "nan"
+            up_rate_s = f"{up_rate:.4f}" if np.isfinite(up_rate) else "nan"
+            print(
+                f"    [{row['lo']:.1f},{row['hi']:.1f}{']' if row['hi'] >= 1.0 else ')'}: "
+                f"n={int(row['n']):,}  coverage={row['coverage']:.2%}  mean_prob={mean_prob_s}  up_rate={up_rate_s}",
+                flush=True,
+            )

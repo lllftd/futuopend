@@ -14,19 +14,19 @@ from core.trainers.constants import (
     PREPARED_DATASET_CACHE_FILE,
 )
 from core.trainers.data_prep import prepare_dataset as prepare_lgbm_data
-from core.trainers.layer1a_market import (
+from core.trainers.l1a import (
     infer_l1a_market_encoder,
     load_l1a_market_encoder,
     train_l1a_market_encoder,
 )
-from core.trainers.layer1b_descriptor import (
+from core.trainers.l1b import (
     infer_l1b_market_descriptor,
     load_l1b_market_descriptor,
     train_l1b_market_descriptor,
 )
-from core.trainers.layer2_decision import infer_l2_trade_decision, load_l2_trade_decision, train_l2_trade_decision
-from core.trainers.l1c.train import train_l1c_direction
-from core.trainers.layer3_exit import train_l3_exit_manager
+from core.trainers.l2 import infer_l2_trade_decision, load_l2_trade_decision, train_l2_trade_decision
+from core.trainers.l1c import train_l1c_direction
+from core.trainers.l3 import train_l3_exit_manager
 from core.trainers.lgbm_utils import configure_compute_threads, _lgbm_n_jobs
 from core.trainers.stack_v2_common import load_output_cache, save_output_cache
 

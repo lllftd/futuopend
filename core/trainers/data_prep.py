@@ -624,7 +624,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 oof = pickle.load(f)
             if "regime_probs" not in oof:
                 raise RuntimeError(
-                    f"{oof_path} is missing 'regime_probs' (transition). Retrain TCN: train_tcn_pa_state.py"
+                    f"{oof_path} is missing 'regime_probs' (transition). Retrain Layer 1 via ./scripts/run_train.sh layer1"
                 )
 
             oof_df = pd.DataFrame({
@@ -650,7 +650,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             if oem.shape[1] != bottleneck_dim:
                 raise RuntimeError(
                     f"tcn_oof_cache.pkl embed width {oem.shape[1]} != bottleneck_dim {bottleneck_dim} "
-                    f"from tcn_meta.pkl. Retrain TCN: backtests/train_tcn_pa_state.py"
+                    f"from tcn_meta.pkl. Retrain Layer 1 via ./scripts/run_train.sh layer1"
                 )
             for j in range(bottleneck_dim):
                 oof_df[f"tcn_emb_{j}"] = oem[:, j]
@@ -697,8 +697,8 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
 def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -> pd.DataFrame:
     """
     Real Mamba forward only — no uniform-prior placeholders.
-    Requires ``mamba_meta.pkl`` + the same weight file basename as ``train_pipeline`` /
-    ``tcn_constants.STATE_CLASSIFIER_FILE`` (not legacy ``tcn_transition_classifier.pt``).
+    Requires ``mamba_meta.pkl`` and ``mamba_state_classifier_6c.pt`` from the current
+    Layer 1 training flow.
     """
     meta_path = os.path.join(MODEL_DIR, "mamba_meta.pkl")
     model_path = os.path.join(MODEL_DIR, "mamba_state_classifier_6c.pt")
@@ -879,7 +879,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
                 oof = pickle.load(f)
             if "regime_probs" not in oof:
                 raise RuntimeError(
-                    f"{oof_path} is missing 'regime_probs' (transition). Retrain TCN: layer1_mamba.py"
+                    f"{oof_path} is missing 'regime_probs' (transition). Retrain Layer 1 via ./scripts/run_train.sh layer1"
                 )
 
             oof_df = pd.DataFrame({
@@ -891,7 +891,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
                 raise RuntimeError(
                     f"{oof_path} regime_probs has width {rp.shape[1]} but MAMBA_REGIME_FUT_PROB_COLS "
                     f"expects {len(MAMBA_REGIME_FUT_PROB_COLS)} (e.g. old 6-class cache vs binary transition). "
-                    f"Delete {oof_path} and re-train Layer 1 (TCN)."
+                    f"Delete {oof_path} and re-train Layer 1."
                 )
             for j, col in enumerate(MAMBA_REGIME_FUT_PROB_COLS):
                 oof_df[col] = rp[:, j]
@@ -905,7 +905,7 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
             if oem.shape[1] != bottleneck_dim:
                 raise RuntimeError(
                     f"mamba_oof_cache.pkl embed width {oem.shape[1]} != bottleneck_dim {bottleneck_dim} "
-                    f"from mamba_meta.pkl. Retrain TCN: backtests/layer1_mamba.py"
+                    f"from mamba_meta.pkl. Retrain Layer 1 via ./scripts/run_train.sh layer1"
                 )
             for j in range(bottleneck_dim):
                 oof_df[f"mamba_emb_{j}"] = oem[:, j]

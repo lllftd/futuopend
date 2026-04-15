@@ -27,12 +27,13 @@ from core.trainers.constants import (
     PA_STATE_FEATURES,
 )
 from core.trainers.data_prep import ensure_breakout_features, ensure_structure_context_features
-from core.trainers.layer1a_market import infer_l1a_market_encoder, load_l1a_market_encoder
-from core.trainers.layer1b_descriptor import infer_l1b_market_descriptor, load_l1b_market_descriptor
-from core.trainers.layer2_decision import infer_l2_trade_decision, load_l2_trade_decision
+from core.trainers.l1a import infer_l1a_market_encoder, load_l1a_market_encoder
+from core.trainers.l1b import infer_l1b_market_descriptor, load_l1b_market_descriptor
+from core.trainers.l2 import infer_l2_trade_decision, load_l2_trade_decision
 from core.trainers.stack_v2_common import load_output_cache
-from core.trainers.layer3_exit import (
+from core.trainers.l3 import (
     L3ExitInferenceState,
+    L3TrajRollingState,
     l3_entry_policy_params,
     l3_entry_side_from_l2,
     l3_exit_decision_live,
@@ -41,8 +42,8 @@ from core.trainers.layer3_exit import (
     l3_load_cox_bundle,
     load_l3_exit_manager,
     load_l3_trajectory_encoder_for_infer,
+    l3_single_trajectory_embedding,
 )
-from core.trainers.l3_trajectory_hybrid import L3TrajRollingState, l3_single_trajectory_embedding
 from core.trainers.lgbm_utils import _live_trade_state_from_bar, _net_edge_atr_from_state
 from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 
@@ -141,17 +142,11 @@ def _build_l3_feature_vector(
     )
     dec_conf_e = float(l2_out.loc[entry_idx, "l2_decision_confidence"])
     signal_conf_decay = float(l2_out.loc[idx, "l2_decision_confidence"]) - dec_conf_e
-    dir_e = (
-        float(pd.to_numeric(l1a_out.loc[entry_idx, "l1a_dir_normalized"], errors="coerce") or 0.0)
-        if "l1a_dir_normalized" in l1a_out.columns
-        else 0.0
-    )
-    dir_c = (
-        float(pd.to_numeric(l1a_out.loc[idx, "l1a_dir_normalized"], errors="coerce") or 0.0)
-        if "l1a_dir_normalized" in l1a_out.columns
-        else 0.0
-    )
-    signal_direction_agree = float(np.sign(dir_c) == np.sign(dir_e))
+    cls_e = int(l2_out.loc[entry_idx, "l2_decision_class"])
+    cls_c = int(l2_out.loc[idx, "l2_decision_class"])
+    dir_e = 1.0 if cls_e == 0 else (-1.0 if cls_e == 2 else 0.0)
+    dir_c = 1.0 if cls_c == 0 else (-1.0 if cls_c == 2 else 0.0)
+    signal_direction_agree = float(dir_c == dir_e and dir_e != 0.0)
     rid_e = int(np.argmax(entry_regime.astype(np.float64)))
     regime_changed = float(int(np.argmax(current_regime.astype(np.float64)) != rid_e))
     if "l2_decision_neutral" in l2_out.columns:

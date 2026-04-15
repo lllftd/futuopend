@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 
 from backtests.train_pipeline import _prepare_or_load_lgbm_dataset, setup_logger
-from core.trainers.l1c.train import train_l1c_direction
+from core.trainers.l1c import train_l1c_direction
 from core.trainers.lgbm_utils import configure_compute_threads
 
 

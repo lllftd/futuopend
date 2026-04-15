@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import pickle
+import time
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -139,7 +141,13 @@ def _first_epoch_diagnostic(
     if pr.std() < 0.01:
         print("  [L1c] WARNING: pred_prob std < 0.01 — outputs nearly constant", flush=True)
     acc = np.mean((pr >= 0.5) == (t > 0.5))
+    confident = np.abs(pr - 0.5) > 0.2
     print(f"  batch subset accuracy vs0.5 threshold: {acc:.4f}", flush=True)
+    print(
+        f"  batch subset |p-0.5|>0.2 coverage: {float(np.mean(confident)):.2%}  "
+        f"n={int(np.sum(confident)):,}",
+        flush=True,
+    )
     print("  " + "=" * 50 + "\n", flush=True)
 
 
@@ -397,6 +405,9 @@ def _eval_loss(
 
 
 def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
+    train_started_at = datetime.now().astimezone()
+    train_started_perf = time.perf_counter()
+    print(f"  [L1c] training started at {train_started_at.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
     config = L1cConfig()
     for _env, _attr in (
         ("L1C_LAYER_DROP", "layer_drop"),
@@ -414,6 +425,7 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         ("L1C_LR", "lr"),
         ("L1C_PATIENCE", "patience"),
         ("L1C_MAX_EPOCHS", "max_epochs"),
+        ("L1C_EARLY_STOP_MIN_DELTA", "early_stop_min_delta"),
         ("L1C_LABEL_SMOOTHING", "label_smoothing"),
         ("L1C_STRENGTH_AUX_WEIGHT", "strength_aux_weight"),
         ("L1C_COS_T0", "cosine_t0"),
@@ -518,6 +530,13 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
     stale = 0
     max_epochs = int(config.max_epochs)
     patience = int(config.patience)
+    min_delta = float(config.early_stop_min_delta)
+    print(
+        f"  [L1c] train_config: batch_size={config.batch_size}  lr={float(config.lr):g}  "
+        f"weight_decay={float(config.weight_decay):g}  max_epochs={max_epochs}  patience={patience}  "
+        f"min_delta={min_delta:g}  label_smoothing={float(config.label_smoothing):.4f}",
+        flush=True,
+    )
     epoch_bar = trange(
         max_epochs,
         desc="[L1c] epochs",
@@ -536,7 +555,7 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         if hasattr(epoch_bar, "set_postfix"):
             epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
         print(f"  [L1c] epoch={_ep + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
-        if va_loss < best_val:
+        if va_loss < (best_val - min_delta):
             best_val = va_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             stale = 0
@@ -581,6 +600,11 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
             f"weighted BCE on logits; label_smoothing={float(config.label_smoothing):.4f}"
         ),
         "direction_aux_semantics": "dual-branch model with local CNN branch; auxiliary head predicts asinh(|future_ret|*100)",
+        "early_stopping": {
+            "max_epochs": int(max_epochs),
+            "patience": int(patience),
+            "min_delta": float(min_delta),
+        },
         "val_metrics": val_metrics,
     }
     with open(os.path.join(MODEL_DIR, L1C_META_FILE), "wb") as f:
@@ -589,3 +613,10 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
     print(f"  [L1c] model saved -> {os.path.join(MODEL_DIR, L1C_MODEL_FILE)}", flush=True)
     print(f"  [L1c] meta saved  -> {os.path.join(MODEL_DIR, L1C_META_FILE)}", flush=True)
     print(f"  [L1c] cache saved -> {cache_path}", flush=True)
+    train_finished_at = datetime.now().astimezone()
+    elapsed_sec = max(0.0, time.perf_counter() - train_started_perf)
+    print(
+        f"  [L1c] training finished at {train_finished_at.strftime('%Y-%m-%d %H:%M:%S %z')}  "
+        f"elapsed={elapsed_sec:.1f}s",
+        flush=True,
+    )

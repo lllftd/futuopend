@@ -8,7 +8,7 @@ from backtests.train_pipeline import (
     _prepare_or_load_lgbm_dataset,
     setup_logger,
 )
-from core.trainers.layer1b_descriptor import train_l1b_market_descriptor
+from core.trainers.l1b import train_l1b_market_descriptor
 from core.trainers.lgbm_utils import configure_compute_threads
 
 

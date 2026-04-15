@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import pickle
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -56,18 +58,6 @@ def _bounded_scalar_cols() -> list[str]:
     return ["l1a_transition_risk", "l1a_state_persistence"]
 
 
-def _l1a_direction_cols() -> list[str]:
-    return [
-        "l1a_dir_bull_minus_bear",
-        "l1a_dir_confidence",
-        "l1a_dir_normalized",
-        "l1a_bull_convergence",
-        "l1a_bear_convergence",
-        "l1a_dir_x_vol",
-        "l1a_dir_x_stability",
-    ]
-
-
 def _l1a_embed_dim() -> int:
     return max(4, int(os.environ.get("L1A_EMBED_DIM", "8")))
 
@@ -83,7 +73,6 @@ def l1a_output_columns_with_embed_dim(embed_dim: int) -> list[str]:
             "l1a_time_in_regime",
             "l1a_state_persistence",
         ]
-        + _l1a_direction_cols()
         + [f"l1a_market_embed_{idx}" for idx in range(d)]
         + ["l1a_is_warm"]
     )
@@ -91,35 +80,6 @@ def l1a_output_columns_with_embed_dim(embed_dim: int) -> list[str]:
 
 def l1a_output_columns() -> list[str]:
     return l1a_output_columns_with_embed_dim(_l1a_embed_dim())
-
-
-def _derive_l1a_direction_features(
-    regime_probs: np.ndarray,
-    transition_risk: np.ndarray,
-    vol_forecast: np.ndarray,
-) -> dict[str, np.ndarray]:
-    regime = np.asarray(regime_probs, dtype=np.float32)
-    if regime.ndim != 2 or regime.shape[1] != NUM_REGIME_CLASSES:
-        raise ValueError(
-            f"L1a direction features expect regime_probs shape (n, {NUM_REGIME_CLASSES}), got {regime.shape!r}."
-        )
-    transition = np.clip(np.asarray(transition_risk, dtype=np.float32).ravel(), 0.0, 1.0)
-    vol = np.clip(np.asarray(vol_forecast, dtype=np.float32).ravel(), 0.0, 5.0)
-    bull = regime[:, 0] + regime[:, 1]
-    bear = regime[:, 2] + regime[:, 3]
-    range_mass = regime[:, 4] + regime[:, 5]
-    directional_mass = np.maximum(bull + bear, 1e-6)
-    dir_signal = np.clip(bull - bear, -1.0, 1.0)
-    dir_conf = np.clip(1.0 - range_mass, 0.0, 1.0)
-    return {
-        "l1a_dir_bull_minus_bear": dir_signal.astype(np.float32, copy=False),
-        "l1a_dir_confidence": dir_conf.astype(np.float32, copy=False),
-        "l1a_dir_normalized": np.clip(dir_signal / directional_mass, -1.0, 1.0).astype(np.float32, copy=False),
-        "l1a_bull_convergence": np.clip(regime[:, 0] - regime[:, 1], -1.0, 1.0).astype(np.float32, copy=False),
-        "l1a_bear_convergence": np.clip(regime[:, 2] - regime[:, 3], -1.0, 1.0).astype(np.float32, copy=False),
-        "l1a_dir_x_vol": np.clip(dir_signal * vol, -5.0, 5.0).astype(np.float32, copy=False),
-        "l1a_dir_x_stability": np.clip(dir_signal * (1.0 - transition), -1.0, 1.0).astype(np.float32, copy=False),
-    }
 
 
 def _l1a_readout_type() -> str:
@@ -156,12 +116,12 @@ def _l1a_head_dropout() -> float:
 
 
 def _l1a_loss_weights() -> dict[str, float]:
-    embed = float(os.environ.get("L1A_EMBED_RECON_WEIGHT", "0.22"))
+    embed = float(os.environ.get("L1A_EMBED_RECON_WEIGHT", "0.10"))
     transition = float(os.environ.get("L1A_TRANSITION_WEIGHT", "0.10"))
-    vol = float(os.environ.get("L1A_VOL_WEIGHT", "0.22"))
+    vol = float(os.environ.get("L1A_VOL_WEIGHT", "0.25"))
     regime = float(os.environ.get("L1A_REGIME_WEIGHT", "0.36"))
     vol_trend = float(os.environ.get("L1A_VOL_TREND_WEIGHT", "0.07"))
-    time_ir = float(os.environ.get("L1A_TIME_IN_REGIME_WEIGHT", "0.07"))
+    time_ir = float(os.environ.get("L1A_TIME_IN_REGIME_WEIGHT", "0.12"))
     total = max(regime + vol + transition + embed + vol_trend + time_ir, 1e-8)
     return {
         "regime": regime / total,
@@ -285,6 +245,27 @@ def _time_in_regime_fraction(state: np.ndarray, symbols: np.ndarray, cap: int) -
                 run += 1
             out[idx[j]] = float(min(run, cap)) / float(cap)
     return out
+
+
+def _l1a_time_in_regime_transform() -> str:
+    transform = (os.environ.get("L1A_TIME_IN_REGIME_TRANSFORM", "sqrt").strip().lower() or "sqrt")
+    if transform not in {"none", "sqrt"}:
+        transform = "sqrt"
+    return transform
+
+
+def _transform_time_in_regime_target(values: np.ndarray) -> np.ndarray:
+    arr = np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+    if _l1a_time_in_regime_transform() == "sqrt":
+        arr = np.sqrt(arr)
+    return arr.astype(np.float32, copy=False)
+
+
+def _inverse_time_in_regime_target(values: np.ndarray) -> np.ndarray:
+    arr = np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+    if _l1a_time_in_regime_transform() == "sqrt":
+        arr = np.square(arr)
+    return np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 def _select_l1a_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str]:
@@ -734,8 +715,8 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     vol_p: list[np.ndarray] = []
     vt_t: list[np.ndarray] = []
     vt_p: list[np.ndarray] = []
-    tir_t: list[np.ndarray] = []
-    tir_p: list[np.ndarray] = []
+    tir_t_fit: list[np.ndarray] = []
+    tir_p_fit: list[np.ndarray] = []
     tr_t, tr_s = [], []
     persist_s: list[np.ndarray] = []
     emb_mse: list[np.ndarray] = []
@@ -756,8 +737,8 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
             vol_p.append(out["vol_value"].detach().cpu().numpy())
             vt_t.append(y_vol_trend.detach().cpu().numpy())
             vt_p.append(out["vol_trend_value"].detach().cpu().numpy())
-            tir_t.append(y_time_ir.detach().cpu().numpy())
-            tir_p.append(out["time_in_regime_value"].detach().cpu().numpy())
+            tir_t_fit.append(y_time_ir.detach().cpu().numpy())
+            tir_p_fit.append(out["time_in_regime_value"].detach().cpu().numpy())
             tr_t.append(y_transition.detach().cpu().numpy())
             tr_s.append(torch.sigmoid(out["transition_logit"]).detach().cpu().numpy())
             persist_s.append(torch.sigmoid(out["state_persistence_logit"]).detach().cpu().numpy())
@@ -794,12 +775,26 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     vtp = np.concatenate(vt_p)
     mae_vt = float(mean_absolute_error(vtt, vtp))
     corr_vt = pearson_corr(vtt, vtp)
-    tirt = np.concatenate(tir_t)
-    tirpr = np.concatenate(tir_p)
+    tirt = _inverse_time_in_regime_target(np.concatenate(tir_t_fit))
+    tirpr = _inverse_time_in_regime_target(np.concatenate(tir_p_fit))
     mae_tir = float(mean_absolute_error(tirt, tirpr))
     corr_tir = pearson_corr(tirt, tirpr)
     emb_mean = float(np.mean(np.concatenate(emb_mse)))
-    persist_mean = float(np.mean(np.concatenate(persist_s))) if persist_s else float("nan")
+    persist_pred = np.concatenate(persist_s) if persist_s else np.array([], dtype=np.float32)
+    stay_target = 1.0 - np.concatenate(tr_t)
+    persist_mean = float(np.mean(persist_pred)) if persist_pred.size else float("nan")
+    persist_std = float(np.std(persist_pred)) if persist_pred.size else float("nan")
+    persist_corr = pearson_corr(stay_target, persist_pred)
+    persist_q = (
+        np.percentile(persist_pred, [10, 50, 90]).astype(np.float32)
+        if persist_pred.size
+        else np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+    )
+    persist_by_regime = []
+    for idx, name in enumerate(REGIME_NOW_PROB_COLS):
+        mask = yt == idx
+        mean_val = float(np.mean(persist_pred[mask])) if mask.any() else float("nan")
+        persist_by_regime.append(f"{name}={mean_val:.3f}")
 
     print(f"\n  [L1a] ========== val ({label}) effectiveness report ==========", flush=True)
     print(
@@ -841,11 +836,20 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
         flush=True,
     )
     print(
-        f"  [L1a] state persistence head:  mean(persist)={persist_mean:.4f}  mean(stay_target)={float(1.0 - np.mean(np.concatenate(tr_t))):.4f}",
+        f"  [L1a] state persistence head:  mean(persist)={persist_mean:.4f}  std(persist)={persist_std:.4f}  "
+        f"mean(stay_target)={float(np.mean(stay_target)):.4f}  corr(stay,persist)={persist_corr:.4f}",
         flush=True,
     )
     print(
-        "  [L1a] l1a_dir_* at inference: regime-geometry only (no placeholder class probs / strength column).",
+        f"  [L1a] persistence quantiles:  p10={float(persist_q[0]):.4f}  p50={float(persist_q[1]):.4f}  p90={float(persist_q[2]):.4f}",
+        flush=True,
+    )
+    print(
+        f"  [L1a] persistence mean by true regime: {', '.join(persist_by_regime)}",
+        flush=True,
+    )
+    print(
+        f"  [L1a] time_in_regime target transform: {_l1a_time_in_regime_transform()} (metrics/output reported in raw [0,1] space)",
         flush=True,
     )
 
@@ -923,18 +927,11 @@ def materialize_l1a_outputs(
     outputs.loc[end_idx, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, 5.0)
     outputs.loc[end_idx, "l1a_vol_trend"] = np.concatenate(scalar_rows["vol_trend"], axis=0)
     outputs.loc[end_idx, "l1a_time_in_regime"] = np.clip(
-        np.concatenate(scalar_rows["time_ir"], axis=0), 0.0, 1.0
+        _inverse_time_in_regime_target(np.concatenate(scalar_rows["time_ir"], axis=0)), 0.0, 1.0
     )
     outputs.loc[end_idx, "l1a_state_persistence"] = np.clip(
         np.concatenate(scalar_rows["persistence"], axis=0), 0.0, 1.0
     )
-    direction_features = _derive_l1a_direction_features(
-        outputs.loc[end_idx, L1A_REGIME_COLS].to_numpy(dtype=np.float32, copy=False),
-        outputs.loc[end_idx, "l1a_transition_risk"].to_numpy(dtype=np.float32, copy=False),
-        outputs.loc[end_idx, "l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False),
-    )
-    for col, values in direction_features.items():
-        outputs.loc[end_idx, col] = values
     embed_mat = np.concatenate(embeds, axis=0)
     if embed_mat.shape[1] != ed:
         raise RuntimeError(
@@ -947,6 +944,9 @@ def materialize_l1a_outputs(
 
 
 def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrainingBundle:
+    train_started_at = datetime.now().astimezone()
+    train_started_perf = time.perf_counter()
+    print(f"  [L1a] training started at {train_started_at.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
     work = df.copy(deep=False)
     feature_cols = _select_l1a_feature_cols(work, feat_cols)
     splits = build_stack_time_splits(work["time_key"])
@@ -966,13 +966,14 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         raise RuntimeError("L1a: calibration window is empty for diagnostics.")
 
     X_t = torch.from_numpy(windows.astype(np.float32, copy=False))
+    time_ir_fit = _transform_time_in_regime_target(targets["time_in_regime"])
     ds = TensorDataset(
         X_t,
         torch.from_numpy(targets["regime"][end_idx].astype(np.int64)),
         torch.from_numpy(targets["transition_risk"][end_idx].astype(np.float32)),
         torch.from_numpy(targets["vol_forecast"][end_idx].astype(np.float32)),
         torch.from_numpy(targets["vol_trend"][end_idx].astype(np.float32)),
-        torch.from_numpy(targets["time_in_regime"][end_idx].astype(np.float32)),
+        torch.from_numpy(time_ir_fit[end_idx].astype(np.float32)),
     )
     train_ds = TensorDataset(*[tensor[window_train] for tensor in ds.tensors])
     val_ds = TensorDataset(*[tensor[window_val] for tensor in ds.tensors])
@@ -1057,8 +1058,9 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     T0 = max(1, int(os.environ.get("L1A_COS_T0", "5")))
     Tm = max(1, int(os.environ.get("L1A_COS_T_MULT", "2")))
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
-    max_epochs = 8 if FAST_TRAIN_MODE else 24
-    patience = 4 if FAST_TRAIN_MODE else 8
+    max_epochs = max(4, int(os.environ.get("L1A_MAX_EPOCHS", "8" if FAST_TRAIN_MODE else "18")))
+    patience = max(2, int(os.environ.get("L1A_PATIENCE", "4" if FAST_TRAIN_MODE else "6")))
+    min_delta = float(os.environ.get("L1A_EARLY_STOP_MIN_DELTA", "5e-4"))
     best_state: dict[str, torch.Tensor] | None = None
     best_val = float("inf")
     stale = 0
@@ -1073,7 +1075,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     print(
         f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
         f"tcn_channels={ch}  tcn_dropout={td}  "
-        f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  loss_weights={loss_weights}",
+        f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
+        f"max_epochs={max_epochs}  patience={patience}  min_delta={min_delta:g}  loss_weights={loss_weights}",
         flush=True,
     )
     for epoch in epoch_bar:
@@ -1098,7 +1101,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         if hasattr(epoch_bar, "set_postfix"):
             epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
         print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
-        if va_loss < best_val:
+        if va_loss < (best_val - min_delta):
             best_val = va_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             stale = 0
@@ -1131,14 +1134,14 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "model_file": L1A_MODEL_FILE,
         "output_cache_file": L1A_OUTPUT_CACHE_FILE,
         "transition_target_semantics": "probability of any regime change within decision_horizon_bars",
-        "direction_target_semantics": (
-            "l1a_dir_* (bull/bear geometry) from regime probabilities + transition/vol; no placeholder sign probs."
-        ),
+        "feature_contract_semantics": "L1a exports regime probabilities, volatility, time-in-regime, persistence, embeddings, and warm flag only; directional derived columns are intentionally excluded.",
         "state_structure_semantics": "state_structure_decoder refines regime logits from shared state, transition risk, vol trend, and time-in-regime context; l1a_state_persistence estimates stay probability",
         "l1a_vol_trend_target": f"per-symbol range_norm[t]-range_norm[t-{os.environ.get('L1A_VOL_TREND_LAG', '5')}], clipped",
-        "l1a_time_in_regime_target": f"min(run_length,cap)/cap from state_label runs; cap={os.environ.get('L1A_TIME_IN_REGIME_CAP', '120')}",
+        "l1a_time_in_regime_target": (
+            f"min(run_length,cap)/cap from state_label runs; cap={os.environ.get('L1A_TIME_IN_REGIME_CAP', '120')}  "
+            f"transform={_l1a_time_in_regime_transform()}"
+        ),
         "embed_dim": int(embed_dim),
-        "l1a_direction_arch": "regime_derived_only",
         "l1a_state_arch": "tcn_plus_state_structure_decoder",
         "loss_weights": loss_weights,
         "tcn_channels": list(ch),
@@ -1149,6 +1152,9 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "l1a_weight_decay": float(wd),
         "l1a_cosine_T0": int(T0),
         "l1a_cosine_T_mult": int(Tm),
+        "l1a_max_epochs": int(max_epochs),
+        "l1a_patience": int(patience),
+        "l1a_early_stop_min_delta": float(min_delta),
         "l1a_regime_label_smoothing": float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1")),
     }
     with open(os.path.join(MODEL_DIR, L1A_META_FILE), "wb") as f:
@@ -1157,6 +1163,13 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     print(f"  [L1a] model saved -> {os.path.join(MODEL_DIR, L1A_MODEL_FILE)}", flush=True)
     print(f"  [L1a] meta saved  -> {os.path.join(MODEL_DIR, L1A_META_FILE)}", flush=True)
     print(f"  [L1a] cache saved -> {cache_path}", flush=True)
+    train_finished_at = datetime.now().astimezone()
+    elapsed_sec = max(0.0, time.perf_counter() - train_started_perf)
+    print(
+        f"  [L1a] training finished at {train_finished_at.strftime('%Y-%m-%d %H:%M:%S %z')}  "
+        f"elapsed={elapsed_sec:.1f}s",
+        flush=True,
+    )
     return L1ATrainingBundle(model=model, meta=meta, outputs=outputs)
 
 

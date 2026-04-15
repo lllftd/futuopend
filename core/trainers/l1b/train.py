@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import pickle
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import lightgbm as lgb
@@ -52,7 +54,6 @@ from core.trainers.val_metrics_extra import brier_binary
 from core.trainers.stack_v2_common import (
     build_stack_time_splits,
     compute_cross_asset_context,
-    diagnose_l1b_leakage,
     log_label_baseline,
     save_output_cache,
 )
@@ -85,6 +86,14 @@ L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_follow_through_score",
     "l1b_liquidity_score",
 ]
+L1B_RETAINED_DIRECT_SEMANTIC_COLS = [
+    "l1b_breakout_quality",
+    "l1b_follow_through_score",
+    "l1b_liquidity_score",
+]
+L1B_DIAGNOSTIC_ONLY_DIRECT_COLS = [
+    col for col in L1B_DIRECT_SEMANTIC_COLS if col not in L1B_RETAINED_DIRECT_SEMANTIC_COLS
+]
 L1B_SUPERVISED_REGRESSOR_COLS = ("l1b_edge_pred", "l1b_dq_pred")
 
 # Extra PA/BO columns appended only for L1b supervised heads (not exported to L2). Source col must exist on frame.
@@ -107,9 +116,9 @@ L1B_DIRECT_CONTEXT_COLS = [
     "l1b_correlation_regime",
     "l1b_market_breadth",
 ]
-# Direct condition semantics are exported to L2; directional rule heads are removed from the contract.
+# Direct condition semantics are split into retained tradeability exports and diagnostics-only rule heads.
 L1B_RULE_DIRECT_COLS = list(L1B_DIRECT_SEMANTIC_COLS)
-L1B_EXPORT_DETERMINISTIC_COLS: tuple[str, ...] = tuple(L1B_DIRECT_SEMANTIC_COLS)
+L1B_EXPORT_DETERMINISTIC_COLS: tuple[str, ...] = tuple(L1B_RETAINED_DIRECT_SEMANTIC_COLS)
 L1B_OUTPUT_COLS = (
     list(L1B_UNSUPERVISED_COLS)
     + list(L1B_SUPERVISED_REGRESSOR_COLS)
@@ -1168,8 +1177,17 @@ def _log_l1b_semantic_head_diagnostics(
     label_ok = _l1b_edge_label_valid(work)
     train = np.asarray(train_mask, dtype=bool).ravel()
     val = np.asarray(val_mask, dtype=bool).ravel()
+    low_var_thr = float(os.environ.get("L1B_DIRECT_HEAD_LOW_STD_THR", "0.04"))
     print(
         "  [L1b] semantic head diagnostics (deterministic PA/BO rules; corr vs raw decision edge, finite labels only)",
+        flush=True,
+    )
+    print(
+        f"  [L1b] retained direct exports: {L1B_RETAINED_DIRECT_SEMANTIC_COLS}",
+        flush=True,
+    )
+    print(
+        f"  [L1b] diagnostics-only direct heads: {L1B_DIAGNOSTIC_ONLY_DIRECT_COLS}",
         flush=True,
     )
 
@@ -1184,11 +1202,22 @@ def _log_l1b_semantic_head_diagnostics(
             return
         xs = hv[dist_m]
         p5, p50, p95 = np.percentile(xs, [5.0, 50.0, 95.0]).tolist()
+        std = float(np.std(xs))
+        spread = float(p95 - p5)
         cor = _corr1d(hv[corr_m], fwd[corr_m]) if n_c >= 30 else float("nan")
         cor_s = f"{cor:.4f}" if np.isfinite(cor) else "nan"
+        audit = []
+        if head in L1B_RETAINED_DIRECT_SEMANTIC_COLS:
+            audit.append("export")
+        else:
+            audit.append("diag_only")
+        if std < low_var_thr:
+            audit.append(f"low_var<std{low_var_thr:g}")
+        audit_s = ",".join(audit)
         print(
-            f"    [{name}] {head}: n_dist={n_d:,}  mean={float(np.mean(xs)):.4f}  std={float(np.std(xs)):.4f}  "
-            f"p5/p50/p95={p5:.4f}/{p50:.4f}/{p95:.4f}  corr(edge)_n={n_c:,}  corr={cor_s}",
+            f"    [{name}] {head}: n_dist={n_d:,}  mean={float(np.mean(xs)):.4f}  std={std:.4f}  "
+            f"p5/p50/p95={p5:.4f}/{p50:.4f}/{p95:.4f}  p5_p95_range={spread:.4f}  "
+            f"corr(edge)_n={n_c:,}  corr={cor_s}  audit={audit_s}",
             flush=True,
         )
 
@@ -1352,8 +1381,8 @@ def _l1b_edge_dq_lgb_params() -> dict[str, Any]:
 
 
 def _l1b_edge_dq_train_config() -> tuple[int, int]:
-    rounds = int(os.environ.get("L1B_EDGE_DQ_BOOST_ROUNDS", str(250 if FAST_TRAIN_MODE else 800)))
-    es = int(os.environ.get("L1B_EDGE_DQ_ES_ROUNDS", str(45 if FAST_TRAIN_MODE else 110)))
+    rounds = int(os.environ.get("L1B_EDGE_DQ_BOOST_ROUNDS", str(200 if FAST_TRAIN_MODE else 500)))
+    es = int(os.environ.get("L1B_EDGE_DQ_ES_ROUNDS", str(35 if FAST_TRAIN_MODE else 70)))
     return max(50, rounds), max(20, es)
 
 
@@ -1448,6 +1477,8 @@ def _l1b_fit_lgb_regressor(
     mae_v = float(mean_absolute_error(y_v, pred_v))
     std_v = float(np.std(y_v)) if y_v.size > 1 else 0.0
     cor_v = _corr1d(y_v, pred_v)
+    pos_mask_v = y_v > 1e-8
+    cond_corr_v = _corr1d(y_v[pos_mask_v], pred_v[pos_mask_v]) if int(np.sum(pos_mask_v)) >= 30 else float("nan")
     gap = mae_v - mae_tr
     print(
         f"  [L1b] {label} booster: train_MAE={mae_tr:.4f}  val_MAE={mae_v:.4f}  gap={gap:+.4f}  "
@@ -1455,6 +1486,12 @@ def _l1b_fit_lgb_regressor(
         f"train_n={int(np.sum(fit_tr)):,}  train_target_std={std_tr:.4f}  -> {out_path}",
         flush=True,
     )
+    if label == "l1b_edge_pred":
+        cond_corr_s = f"{cond_corr_v:.4f}" if np.isfinite(cond_corr_v) else "nan"
+        print(
+            f"  [L1b] {label} conditional val: true_edge>0 rows={int(np.sum(pos_mask_v)):,}  corr={cond_corr_s}",
+            flush=True,
+        )
     return booster
 
 
@@ -1464,7 +1501,6 @@ def _fit_l1b_edge_dq_boosters(
     *,
     train_mask: np.ndarray,
     val_mask: np.ndarray,
-    direct_outputs: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, lgb.Booster], dict[str, str], dict[str, np.ndarray], dict[str, Any]]:
     edge_signed = np.clip(_decision_edge_atr_array(work), -5.0, 5.0).astype(np.float64)
     edge_tgt = np.abs(edge_signed).astype(np.float64)
@@ -1545,60 +1581,16 @@ def _fit_l1b_edge_dq_boosters(
         "dq_pred_clip": [dq_clip_lo, dq_clip_hi],
         "boost_rounds_env": "L1B_EDGE_DQ_BOOST_ROUNDS",
         "early_stopping_env": "L1B_EDGE_DQ_ES_ROUNDS",
+        "experts_enabled": False,
+        "routing_semantics": "disabled; base edge/dq regressors only",
     }
-    if direct_outputs:
-        routing_raw = {
-            "trend": np.maximum(
-                np.asarray(direct_outputs.get("l1b_trend_strength", 0.0), dtype=np.float32),
-                np.asarray(direct_outputs.get("l1b_setup_alignment", 0.0), dtype=np.float32),
-            ),
-            "breakout": np.maximum(
-                np.asarray(direct_outputs.get("l1b_breakout_quality", 0.0), dtype=np.float32),
-                np.asarray(direct_outputs.get("l1b_follow_through_score", 0.0), dtype=np.float32),
-            ),
-            "mean_reversion": np.maximum(
-                np.asarray(direct_outputs.get("l1b_mean_reversion_setup", 0.0), dtype=np.float32),
-                np.asarray(direct_outputs.get("l1b_range_reversal_setup", 0.0), dtype=np.float32),
-            ),
-        }
-        routing_mat = np.column_stack([np.clip(v, 0.0, 1.0) for v in routing_raw.values()]).astype(np.float64)
-        routing_mat = routing_mat + 1e-3
-        routing_mat = routing_mat / np.maximum(routing_mat.sum(axis=1, keepdims=True), 1e-6)
-        expert_names = list(routing_raw.keys())
-        block_meta["expert_names"] = expert_names
-        block_meta["routing_semantics"] = "rule-driven setup-family routing over trend/breakout/mean_reversion experts"
-        for target_name, target_arr, clip_lo, clip_hi in (
-            ("l1b_edge_pred", edge_tgt, 0.0, 5.0),
-            ("l1b_dq_pred", dq_tgt, dq_clip_lo, dq_clip_hi),
-        ):
-            blended = preds[target_name].astype(np.float64)
-            for j, expert_name in enumerate(expert_names):
-                sample_weight = 0.10 + routing_mat[:, j]
-                exp_path = os.path.join(MODEL_DIR, f"{target_name}_{expert_name}_expert.txt")
-                expert_model = _l1b_fit_lgb_regressor(
-                    f"{target_name}_{expert_name}_expert",
-                    target_arr,
-                    X,
-                    feature_cols,
-                    train_mask=train_mask,
-                    val_mask=val_mask,
-                    out_path=exp_path,
-                    label_row_ok=(edge_label_ok if target_name == "l1b_edge_pred" else dq_label_ok),
-                    sample_weight=sample_weight.astype(np.float32),
-                )
-                expert_key = f"{target_name}__expert__{expert_name}"
-                models[expert_key] = expert_model
-                model_files[expert_key] = os.path.basename(exp_path)
-                expert_pred = expert_model.predict(X).astype(np.float64)
-                expert_pred = np.clip(expert_pred, clip_lo, clip_hi)
-                blended = 0.35 * blended + 0.65 * (
-                    routing_mat[:, j] * expert_pred + (1.0 - routing_mat[:, j]) * blended
-                )
-            preds[target_name] = np.clip(blended, clip_lo, clip_hi).astype(np.float32)
     return models, model_files, preds, block_meta
 
 
 def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTrainingBundle:
+    train_started_at = datetime.now().astimezone()
+    train_started_perf = time.perf_counter()
+    print(f"  [L1b] training started at {train_started_at.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
     work = df.copy()
     feature_cols = _select_l1b_feature_cols(work, feat_cols)
     X = work[feature_cols].to_numpy(dtype=np.float32, copy=False)
@@ -1662,8 +1654,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         direct_outputs, cross, cross_context_reliable=cross_context_reliable
     )
     print(
-        "  [L1b] note: 8 direct condition + 3 cross-asset ctx columns are logged as diagnostics; "
-        f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (unsup + edge/dq + direct condition heads).",
+        f"  [L1b] note: {len(L1B_RULE_DIRECT_COLS)} direct condition + {len(L1B_DIRECT_CONTEXT_COLS)} cross-asset ctx columns are logged as diagnostics; "
+        f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (unsup + edge/dq + retained tradeability heads).",
         flush=True,
     )
     _log_l1b_semantic_head_diagnostics(work, rule_diag, train_mask=train_mask, val_mask=val_mask)
@@ -1671,7 +1663,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     outputs = pd.concat([outputs, unsup_outputs.reset_index(drop=True)], axis=1)
     print(f"  [L1b] cluster heads: {L1B_CLUSTER_COLS}", flush=True)
     print(f"  [L1b] latent heads: {L1B_LATENT_HEADS}", flush=True)
-    print(f"  [L1b] direct condition heads: {L1B_DIRECT_SEMANTIC_COLS}", flush=True)
+    print(f"  [L1b] retained direct condition heads: {L1B_RETAINED_DIRECT_SEMANTIC_COLS}", flush=True)
+    print(f"  [L1b] diagnostics-only direct heads: {L1B_DIAGNOSTIC_ONLY_DIRECT_COLS}", flush=True)
     print(f"  [L1b] rule diagnostic context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
     print(
         f"  [L1b] latent explained_variance_ratio="
@@ -1698,7 +1691,6 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         supervised_feature_cols,
         train_mask=train_mask,
         val_mask=val_mask,
-        direct_outputs=direct_outputs,
     )
     for k, arr in edge_dq_preds.items():
         outputs[k] = arr
@@ -1720,6 +1712,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "unsupervised_output_cols": list(L1B_UNSUPERVISED_COLS),
         "direct_output_cols": sorted(L1B_EXPORT_DETERMINISTIC_COLS),
         "deterministic_output_cols": list(L1B_EXPORT_DETERMINISTIC_COLS),
+        "diagnostic_only_direct_cols": list(L1B_DIAGNOSTIC_ONLY_DIRECT_COLS),
         "rule_diagnostic_cols": sorted(L1B_RULE_DIRECT_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deprecated_output_cols": ["l1b_pullback_setup", "l1b_failure_risk", "l1b_shock_risk"],
         "constant_output_values": {},
@@ -1728,7 +1721,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": (
             "Binary pullback/failure/shock targets still use candidate scores from full internal rule dict; "
-            "exported L1b cache is unsupervised + l1b_edge_pred/l1b_dq_pred + direct condition heads only."
+            "exported L1b cache is unsupervised + l1b_edge_pred/l1b_dq_pred + retained tradeability heads only."
         ),
         "unsupervised_semantics": (
             "deterministic direct descriptors plus denoising-autoencoder latent embeddings, soft cluster posteriors, "
@@ -1738,7 +1731,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "unsupervised_block_meta": unsup_meta,
         "supervised_edge_dq_block_meta": edge_dq_block_meta,
         "supervised_edge_dq_semantics": (
-            "Independent LightGBM regressors plus rule-routed setup experts: l1b_edge_pred ~ clipped absolute edge magnitude (0..5 ATR opportunity size only); "
+            "Independent LightGBM regressors only: l1b_edge_pred ~ clipped absolute edge magnitude (0..5 ATR opportunity size only); "
             "l1b_dq_pred ~ path-balance (mfe−mae)/(mfe+mae) in ±1 by default (env L1B_DQ_TARGET_MODE=legacy for mfe−mae). "
             "Supervised inputs = tabular base + l1b_atom_* columns (not passed to L2)."
         ),
@@ -1749,6 +1742,13 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     cache_path = save_output_cache(outputs, L1B_OUTPUT_CACHE_FILE)
     print(f"  [L1b] meta saved  -> {os.path.join(MODEL_DIR, L1B_META_FILE)}", flush=True)
     print(f"  [L1b] cache saved -> {cache_path}", flush=True)
+    train_finished_at = datetime.now().astimezone()
+    elapsed_sec = max(0.0, time.perf_counter() - train_started_perf)
+    print(
+        f"  [L1b] training finished at {train_finished_at.strftime('%Y-%m-%d %H:%M:%S %z')}  "
+        f"elapsed={elapsed_sec:.1f}s",
+        flush=True,
+    )
     return L1BTrainingBundle(models=l1b_supervised_models, meta=meta, outputs=outputs)
 
 
@@ -1807,35 +1807,10 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
         if col not in work.columns:
             work[col] = 0.0
     X_inf = work[sup_cols].to_numpy(dtype=np.float64, copy=False)
-    routing_raw = {
-        "trend": np.maximum(
-            np.asarray(direct_outputs.get("l1b_trend_strength", 0.0), dtype=np.float32),
-            np.asarray(direct_outputs.get("l1b_setup_alignment", 0.0), dtype=np.float32),
-        ),
-        "breakout": np.maximum(
-            np.asarray(direct_outputs.get("l1b_breakout_quality", 0.0), dtype=np.float32),
-            np.asarray(direct_outputs.get("l1b_follow_through_score", 0.0), dtype=np.float32),
-        ),
-        "mean_reversion": np.maximum(
-            np.asarray(direct_outputs.get("l1b_mean_reversion_setup", 0.0), dtype=np.float32),
-            np.asarray(direct_outputs.get("l1b_range_reversal_setup", 0.0), dtype=np.float32),
-        ),
-    }
-    routing_names = list((dq_meta.get("expert_names") or list(routing_raw.keys())))
-    routing_mat = np.column_stack([np.clip(routing_raw.get(name, 0.0), 0.0, 1.0) for name in routing_names]).astype(np.float64)
-    routing_mat = routing_mat + 1e-3
-    routing_mat = routing_mat / np.maximum(routing_mat.sum(axis=1, keepdims=True), 1e-6)
     for head in L1B_SUPERVISED_REGRESSOR_COLS:
         mdl = models.get(head)
         if mdl is not None:
             pred = mdl.predict(X_inf).astype(np.float64)
-            for j, expert_name in enumerate(routing_names):
-                expert_key = f"{head}__expert__{expert_name}"
-                expert_model = models.get(expert_key)
-                if expert_model is None:
-                    continue
-                expert_pred = expert_model.predict(X_inf).astype(np.float64)
-                pred = 0.35 * pred + 0.65 * (routing_mat[:, j] * expert_pred + (1.0 - routing_mat[:, j]) * pred)
             if head == "l1b_dq_pred":
                 pred = np.clip(pred, dq_lo, dq_hi)
             else:

@@ -30,6 +30,7 @@ class L1cConfig:
     weight_decay: float = 1e-4
     max_epochs: int = 48
     patience: int = 3
+    early_stop_min_delta: float = 5e-4
 
     # Binary direction BCE: targets smoothed toward 0.5 (e.g. 0→0.05, 1→0.95).
     label_smoothing: float = 0.05

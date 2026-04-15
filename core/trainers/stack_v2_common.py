@@ -53,58 +53,6 @@ def build_stack_time_splits(time_key: pd.Series | np.ndarray) -> StackTimeSplits
     )
 
 
-def future_group_apply(
-    df: pd.DataFrame,
-    column: str,
-    horizon: int,
-    reducer: str,
-) -> np.ndarray:
-    out = np.full(len(df), np.nan, dtype=np.float32)
-    for _, grp in df.groupby("symbol", sort=False):
-        vals = pd.to_numeric(grp[column], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-        n = len(vals)
-        res = np.zeros(n, dtype=np.float32)
-        for i in range(n):
-            j = min(n, i + 1 + horizon)
-            future = vals[i + 1 : j]
-            if future.size == 0:
-                res[i] = vals[i]
-            elif reducer == "mean":
-                res[i] = float(np.nanmean(future))
-            elif reducer == "max":
-                res[i] = float(np.nanmax(future))
-            elif reducer == "min":
-                res[i] = float(np.nanmin(future))
-            elif reducer == "last":
-                res[i] = float(future[-1])
-            else:
-                raise ValueError(f"Unsupported reducer={reducer!r}")
-        out[grp.index.to_numpy()] = res
-    return out
-
-
-def compute_transition_risk_labels(state_label: np.ndarray, symbols: np.ndarray, *, horizon: int = 10) -> np.ndarray:
-    labels = np.zeros(len(state_label), dtype=np.float32)
-    state_label = np.asarray(state_label, dtype=np.int64)
-    symbols = np.asarray(symbols)
-    for sym in np.unique(symbols):
-        idx = np.flatnonzero(symbols == sym)
-        s = state_label[idx]
-        n = len(s)
-        for i in range(n):
-            future = s[i + 1 : min(n, i + 1 + horizon)]
-            if future.size == 0:
-                labels[idx[i]] = 0.0
-                continue
-            changes = np.flatnonzero(future != s[i])
-            if changes.size == 0:
-                labels[idx[i]] = 0.0
-            else:
-                first_change = int(changes[0])
-                labels[idx[i]] = float(1.0 - (first_change / max(horizon, 1)))
-    return labels
-
-
 def compute_transition_event_labels(state_label: np.ndarray, symbols: np.ndarray, *, horizon: int = 10) -> np.ndarray:
     labels = np.zeros(len(state_label), dtype=np.float32)
     state_label = np.asarray(state_label, dtype=np.int64)
