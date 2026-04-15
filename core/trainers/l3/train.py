@@ -433,8 +433,9 @@ def _l3_exit_class_weights(y_exit: np.ndarray) -> tuple[float, float]:
         return 1.0, 1.0
     n_exit = max(int(np.sum(y == 1)), 1)
     n_hold = max(int(np.sum(y == 0)), 1)
-    exit_pos_w = float(np.clip(np.sqrt(n_hold / n_exit), 0.5, 3.0))
-    hold_neg_w = float(np.clip(np.sqrt(n_exit / n_hold), 0.5, 3.0))
+    gamma = _env_float_clipped("L3_EXIT_CLASS_WEIGHT_GAMMA", 0.5, lo=0.25, hi=2.0)
+    exit_pos_w = float(np.clip((n_hold / n_exit) ** gamma, 0.5, 4.0))
+    hold_neg_w = float(np.clip((n_exit / n_hold) ** gamma, 0.5, 4.0))
     return exit_pos_w, hold_neg_w
 
 
@@ -862,6 +863,41 @@ def _l3_filter_cox_covariates(
     return keep, dropped
 
 
+def _l3_cox_stabilize_drawdown_feature(
+    df_ctv: pd.DataFrame,
+    X_cov: np.ndarray,
+    cov_names: list[str],
+) -> tuple[pd.DataFrame, np.ndarray, dict[str, float | int | bool]]:
+    meta: dict[str, float | int | bool] = {"applied": False}
+    if "l3_drawdown_from_peak_atr" not in cov_names:
+        return df_ctv, X_cov, meta
+    col = "l3_drawdown_from_peak_atr"
+    idx = cov_names.index(col)
+    vals_df = pd.to_numeric(df_ctv[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    vals_x = np.asarray(X_cov[:, idx], dtype=np.float64)
+    winsor_q = _env_float_clipped("L3_COX_DRAWDOWN_WINSOR_Q", 0.0, lo=0.0, hi=0.20)
+    if winsor_q > 0.0 and vals_df.size:
+        lo = float(np.quantile(vals_df, winsor_q))
+        hi = float(np.quantile(vals_df, 1.0 - winsor_q))
+        vals_df = np.clip(vals_df, lo, hi)
+        vals_x = np.clip(vals_x, lo, hi)
+        meta.update({"winsor_q": float(winsor_q), "winsor_lo": lo, "winsor_hi": hi, "applied": True})
+    bin_count = int(_env_int_clipped("L3_COX_DRAWDOWN_BIN_COUNT", 1, lo=1, hi=20))
+    if bin_count > 1 and vals_df.size:
+        edges = np.quantile(vals_df, np.linspace(0.0, 1.0, bin_count + 1))
+        edges = np.unique(np.asarray(edges, dtype=np.float64))
+        if len(edges) >= 3:
+            div = max(len(edges) - 1, 1)
+            vals_df = np.digitize(vals_df, edges[1:-1], right=False).astype(np.float64) / float(div)
+            vals_x = np.digitize(vals_x, edges[1:-1], right=False).astype(np.float64) / float(div)
+            meta.update({"bin_count": int(len(edges) - 1), "applied": True})
+    df_new = df_ctv.copy()
+    X_new = np.asarray(X_cov, dtype=np.float64).copy()
+    df_new[col] = vals_df
+    X_new[:, idx] = vals_x
+    return df_new, X_new, meta
+
+
 def _l3_exit_policy_row_state_keys(X: np.ndarray, feature_cols: list[str], *, vol_quantiles: list[float]) -> np.ndarray:
     reg_cols = [feature_cols.index(c) for c in L1A_REGIME_COLS]
     vol_idx = feature_cols.index("l1a_vol_forecast")
@@ -982,6 +1018,8 @@ def _l3_search_exit_policy(
     value_policy_mode: str | None = None,
     value_tie_margin: float | None = None,
     sample_weight: np.ndarray | None = None,
+    hold_bars: np.ndarray | None = None,
+    report_guardrail: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     prob = np.asarray(exit_prob, dtype=np.float64).ravel()
     value = np.asarray(value_pred, dtype=np.float64).ravel()
@@ -1039,105 +1077,164 @@ def _l3_search_exit_policy(
     )
     hold_recall_w = float(os.environ.get("L3_POLICY_HOLD_RECALL_WEIGHT", f"{policy_params.hold_recall_w:.4f}"))
     hold_recall_floor = float(os.environ.get("L3_POLICY_MIN_HOLD_RECALL", f"{policy_params.hold_recall_floor:.4f}"))
+    exit_rate_cap = float(
+        os.environ.get(
+            "L3_POLICY_MAX_EXIT_RATE",
+            f"{float(np.clip(target_exit_rate + _env_float_clipped('L3_POLICY_EXIT_RATE_CAP_BUFFER', 0.08, lo=0.01, hi=0.30), 0.60, 0.95)):.4f}",
+        )
+    )
+    report_exit_hint = float("nan")
+    report_hold_floor_hint = float("nan")
+    if report_guardrail is not None:
+        report_exit_hint = float(report_guardrail.get("exit_rate_hint", float("nan")))
+        report_hold_floor_hint = float(report_guardrail.get("hold_recall_floor_hint", float("nan")))
+        if np.isfinite(report_hold_floor_hint):
+            hold_recall_floor = max(hold_recall_floor, float(np.clip(report_hold_floor_hint, 0.10, 0.75)))
+        if np.isfinite(report_exit_hint):
+            exit_rate_cap = min(exit_rate_cap, float(np.clip(max(target_exit_rate + 0.02, report_exit_hint + 0.05), 0.60, 0.95)))
+    hold_arr = np.zeros_like(prob) if hold_bars is None else np.asarray(hold_bars, dtype=np.float64).ravel()[valid]
+    early_split_enabled = os.environ.get("L3_POLICY_SPLIT_EARLY_HOLD", "1").strip().lower() in {"1", "true", "yes"}
+    early_hold_bar = int(_env_int_clipped("L3_POLICY_EARLY_HOLD_BARS", 3, lo=1, hi=30))
+    early_delta_candidates = (
+        _env_float_list("L3_POLICY_EARLY_PROB_DELTA_CANDIDATES", [-0.08, -0.04, 0.0, 0.04], lo=-0.30, hi=0.30)
+        if early_split_enabled
+        else [0.0]
+    )
     miss_exit_penalty = float(_env_float_clipped("L3_POLICY_UTILITY_MISS_EXIT_PENALTY", 0.20, lo=0.0, hi=2.0))
     utility_tail_weight = float(_env_float_clipped("L3_POLICY_UTILITY_TAIL_WEIGHT", 0.15, lo=0.0, hi=1.0))
     best: dict[str, float] | None = None
     best_relaxed: dict[str, float] | None = None
+    best_under_cap: dict[str, float] | None = None
+    best_under_floor: dict[str, float] | None = None
     n_total = 0
+    n_under_cap = 0
+    n_under_floor = 0
     n_passing = 0
     for prob_thr in prob_candidates.tolist():
         local_values = [0.0] if mode == "prob_only" else value_candidates.tolist()
         for value_thr in local_values:
-            n_total += 1
-            if mode == "hard_gate":
-                pred = ((prob >= prob_thr) & (value_adj <= value_thr)).astype(np.int32)
-            elif mode == "tie_break":
-                pred = (
-                    (prob >= prob_thr)
-                    | (((prob >= max(0.0, prob_thr - tie_margin)) & (prob < prob_thr)) & (value_adj <= value_thr))
-                ).astype(np.int32)
-            else:
-                pred = (prob >= prob_thr).astype(np.int32)
-            f1 = float(f1_score(y, pred, zero_division=0))
-            acc = float(accuracy_score(y, pred))
-            exit_rate = float(_weighted_mean(pred.astype(np.float64), sw))
-            hold_mask = y == 0
-            pred_hold = pred == 0
-            hold_recall = (
-                float(_weighted_mean((pred[hold_mask] == 0).astype(np.float64), None if sw is None else sw[hold_mask]))
-                if hold_mask.any()
-                else 0.0
-            )
-            hold_precision = (
-                float(_weighted_mean((y[pred_hold] == 0).astype(np.float64), None if sw is None else sw[pred_hold]))
-                if pred_hold.any()
-                else 0.0
-            )
-            exit_recall = (
-                float(_weighted_mean((pred[y == 1] == 1).astype(np.float64), None if sw is None else sw[y == 1]))
-                if np.any(y == 1)
-                else 0.0
-            )
-            miss_exit = float(_weighted_mean(((y == 1) & (pred == 0)).astype(np.float64), sw))
-            utility_mean = float("nan")
-            utility_p10 = float("nan")
-            utility_score = 0.0
-            if value_true is not None and value_true.size:
-                # Exit realizes current PnL and gives up continuation value; hold keeps continuation value.
-                realized = np.where(pred == 1, -value_true, value_true)
-                utility_mean = float(_weighted_mean(realized, sw))
-                utility_p10 = float(_weighted_quantile(realized, 0.10, sw))
-                utility_score = (
-                    (utility_mean / util_scale)
-                    + utility_tail_weight * (utility_p10 / util_scale)
-                    - exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
-                    - miss_exit_penalty * miss_exit
+            for early_delta in early_delta_candidates:
+                n_total += 1
+                prob_thr_late = float(prob_thr)
+                prob_thr_early = float(np.clip(prob_thr + early_delta, 0.05, 0.95))
+                thr_vec = np.where(hold_arr < float(early_hold_bar), prob_thr_early, prob_thr_late)
+                if mode == "hard_gate":
+                    pred = ((prob >= thr_vec) & (value_adj <= value_thr)).astype(np.int32)
+                elif mode == "tie_break":
+                    lower_vec = np.maximum(0.0, thr_vec - tie_margin)
+                    pred = (
+                        (prob >= thr_vec)
+                        | (((prob >= lower_vec) & (prob < thr_vec)) & (value_adj <= value_thr))
+                    ).astype(np.int32)
+                else:
+                    pred = (prob >= thr_vec).astype(np.int32)
+                f1 = float(f1_score(y, pred, zero_division=0))
+                acc = float(accuracy_score(y, pred))
+                exit_rate = float(_weighted_mean(pred.astype(np.float64), sw))
+                hold_mask = y == 0
+                pred_hold = pred == 0
+                hold_recall = (
+                    float(_weighted_mean((pred[hold_mask] == 0).astype(np.float64), None if sw is None else sw[hold_mask]))
+                    if hold_mask.any()
+                    else 0.0
                 )
-            hold_recall_contrib = hold_recall_w * hold_recall
-            exit_rate_penalty_contrib = exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
-            score = (
-                utility_score
-                + 0.10 * f1
-                + hold_recall_contrib
-                + 0.08 * hold_precision
-                - 0.10 * max(0.0, hold_recall_floor - hold_recall)
-            )
-            cand = {
-                "exit_prob_threshold": float(prob_thr),
-                "value_left_threshold": float(value_thr),
-                "score": float(score),
-                "utility_mean": float(utility_mean),
-                "utility_p10": float(utility_p10),
-                "f1": float(f1),
-                "acc": float(acc),
-                "exit_rate": float(exit_rate),
-                "target_exit_rate": float(target_exit_rate),
-                "max_exit_rate": float(target_exit_rate),
-                "min_hold_recall": float(hold_recall_floor),
-                "hold_recall": float(hold_recall),
-                "hold_precision": float(hold_precision),
-                "exit_recall": float(exit_recall),
-                "value_policy_mode": mode,
-                "value_tie_margin": tie_margin,
-                "hold_recall_contrib": float(hold_recall_contrib),
-                "exit_rate_penalty_contrib": float(exit_rate_penalty_contrib),
-            }
-            if best_relaxed is None or float(cand["score"]) > float(best_relaxed["score"]):
-                best_relaxed = cand
-            if hold_recall < hold_recall_floor:
-                continue
-            n_passing += 1
-            if best is None or float(cand["score"]) > float(best["score"]):
-                best = cand
+                hold_precision = (
+                    float(_weighted_mean((y[pred_hold] == 0).astype(np.float64), None if sw is None else sw[pred_hold]))
+                    if pred_hold.any()
+                    else 0.0
+                )
+                exit_recall = (
+                    float(_weighted_mean((pred[y == 1] == 1).astype(np.float64), None if sw is None else sw[y == 1]))
+                    if np.any(y == 1)
+                    else 0.0
+                )
+                miss_exit = float(_weighted_mean(((y == 1) & (pred == 0)).astype(np.float64), sw))
+                utility_mean = float("nan")
+                utility_p10 = float("nan")
+                utility_score = 0.0
+                if value_true is not None and value_true.size:
+                    # Exit realizes current PnL and gives up continuation value; hold keeps continuation value.
+                    realized = np.where(pred == 1, -value_true, value_true)
+                    utility_mean = float(_weighted_mean(realized, sw))
+                    utility_p10 = float(_weighted_quantile(realized, 0.10, sw))
+                    utility_score = (
+                        (utility_mean / util_scale)
+                        + utility_tail_weight * (utility_p10 / util_scale)
+                        - exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
+                        - miss_exit_penalty * miss_exit
+                    )
+                hold_recall_contrib = hold_recall_w * hold_recall
+                exit_rate_penalty_contrib = exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
+                score = (
+                    utility_score
+                    + 0.10 * f1
+                    + hold_recall_contrib
+                    + 0.08 * hold_precision
+                    - 0.10 * max(0.0, hold_recall_floor - hold_recall)
+                )
+                cand = {
+                    "exit_prob_threshold": float(prob_thr),
+                    "value_left_threshold": float(value_thr),
+                    "exit_prob_threshold_early": float(prob_thr_early),
+                    "exit_prob_threshold_late": float(prob_thr_late),
+                    "early_prob_threshold_delta": float(early_delta),
+                    "early_hold_split_bar": int(early_hold_bar),
+                    "score": float(score),
+                    "utility_mean": float(utility_mean),
+                    "utility_p10": float(utility_p10),
+                    "f1": float(f1),
+                    "acc": float(acc),
+                    "exit_rate": float(exit_rate),
+                    "target_exit_rate": float(target_exit_rate),
+                    "max_exit_rate": float(exit_rate_cap),
+                    "min_hold_recall": float(hold_recall_floor),
+                    "hold_recall": float(hold_recall),
+                    "hold_precision": float(hold_precision),
+                    "exit_recall": float(exit_recall),
+                    "value_policy_mode": mode,
+                    "value_tie_margin": tie_margin,
+                    "hold_recall_contrib": float(hold_recall_contrib),
+                    "exit_rate_penalty_contrib": float(exit_rate_penalty_contrib),
+                }
+                if best_relaxed is None or float(cand["score"]) > float(best_relaxed["score"]):
+                    best_relaxed = cand
+                if exit_rate <= exit_rate_cap:
+                    n_under_cap += 1
+                    if best_under_cap is None or float(cand["score"]) > float(best_under_cap["score"]):
+                        best_under_cap = cand
+                if hold_recall >= hold_recall_floor:
+                    n_under_floor += 1
+                    if best_under_floor is None or float(cand["score"]) > float(best_under_floor["score"]):
+                        best_under_floor = cand
+                if hold_recall < hold_recall_floor:
+                    continue
+                if exit_rate > exit_rate_cap:
+                    continue
+                n_passing += 1
+                if best is None or float(cand["score"]) > float(best["score"]):
+                    best = cand
     if best is None:
+        fallback_reason = "best_relaxed"
+        fallback = best_relaxed
+        if best_under_cap is not None:
+            fallback_reason = "exit_rate_cap"
+            fallback = best_under_cap
+        elif best_under_floor is not None:
+            fallback_reason = "hold_recall_floor"
+            fallback = best_under_floor
         print(
-            f"  [L3][warn] EXIT POLICY FALLBACK: no candidate met hold_recall >= {hold_recall_floor:.4f}; "
-            "relaxing to best candidate without floor.",
+            f"  [L3][warn] EXIT POLICY FALLBACK: no candidate met guardrails "
+            f"(hold_recall>={hold_recall_floor:.4f}, exit_rate<={exit_rate_cap:.4f}); "
+            f"fallback={fallback_reason}.",
             flush=True,
         )
-        best = dict(best_relaxed) if best_relaxed is not None else {
+        best = dict(fallback) if fallback is not None else {
             "exit_prob_threshold": 0.55,
             "value_left_threshold": 0.02,
+            "exit_prob_threshold_early": 0.55,
+            "exit_prob_threshold_late": 0.55,
+            "early_prob_threshold_delta": 0.0,
+            "early_hold_split_bar": int(early_hold_bar),
             "value_policy_mode": mode,
             "value_tie_margin": tie_margin,
             "score": float("nan"),
@@ -1147,7 +1244,7 @@ def _l3_search_exit_policy(
             "acc": float("nan"),
             "exit_rate": float("nan"),
             "target_exit_rate": float(target_exit_rate),
-            "max_exit_rate": float(target_exit_rate),
+            "max_exit_rate": float(exit_rate_cap),
             "min_hold_recall": float(hold_recall_floor),
             "hold_recall": float("nan"),
             "hold_precision": float("nan"),
@@ -1159,19 +1256,33 @@ def _l3_search_exit_policy(
     print(
         f"  [L3] derived policy params: exit_rate_penalty={exit_rate_penalty:.4f}  hold_recall_w={hold_recall_w:.4f}  "
         f"hold_recall_floor={hold_recall_floor:.4f}  target_exit_rate={target_exit_rate:.4f}  "
+        f"exit_rate_cap={exit_rate_cap:.4f}  report_exit_hint={report_exit_hint:.4f}  "
+        f"report_hold_floor_hint={report_hold_floor_hint:.4f}  split_early_hold={early_split_enabled}({early_hold_bar})  "
         f"diag_hold_rate={policy_params.diag_hold_rate:.4f}  diag_opp_cost={policy_params.diag_opp_cost:.4f}  "
         f"diag_save_benefit={policy_params.diag_save_benefit:.4f}  diag_value_head_degen={policy_params.diag_value_head_degen}",
         flush=True,
     )
+    if best_relaxed is not None:
+        print(
+            f"  [L3] unconstrained best: p_exit>={best_relaxed['exit_prob_threshold']:.4f}  "
+            f"exit_rate={best_relaxed.get('exit_rate', float('nan')):.3f}  "
+            f"hold_recall={best_relaxed.get('hold_recall', float('nan')):.4f}  score={best_relaxed.get('score', float('nan')):.4f}",
+            flush=True,
+        )
     print(
         f"  [L3] selected exit policy: mode={best['value_policy_mode']}  p_exit>={best['exit_prob_threshold']:.4f}  "
         f"value_left<={best['value_left_threshold']:.4f}  utility_mean={best.get('utility_mean', float('nan')):.4f}  "
         f"utility_p10={best.get('utility_p10', float('nan')):.4f}  F1={best.get('f1', float('nan')):.4f}  acc={best.get('acc', float('nan')):.4f}  "
         f"exit_rate={best.get('exit_rate', float('nan')):.3f}  hold_recall={best.get('hold_recall', float('nan')):.4f}  "
         f"hold_precision={best.get('hold_precision', float('nan')):.4f}  "
+        f"p_exit_early={best.get('exit_prob_threshold_early', float('nan')):.4f}  "
+        f"p_exit_late={best.get('exit_prob_threshold_late', float('nan')):.4f}  "
+        f"early_delta={best.get('early_prob_threshold_delta', float('nan')):+.4f}  "
         f"exit_rate_penalty_contrib={best.get('exit_rate_penalty_contrib', float('nan')):.4f}  "
         f"hold_recall_contrib={best.get('hold_recall_contrib', float('nan')):.4f}  "
-        f"candidates_passing_floor={n_passing}/{n_total}",
+        f"candidates_passing_floor={n_under_floor}/{n_total}  "
+        f"candidates_under_cap={n_under_cap}/{n_total}  "
+        f"candidates_guarded={n_passing}/{n_total}",
         flush=True,
     )
     return dict(best)
@@ -1187,6 +1298,8 @@ def _l3_search_conditional_exit_policy(
     value_policy_mode: str | None = None,
     value_tie_margin: float | None = None,
     sample_weight: np.ndarray | None = None,
+    hold_bars: np.ndarray | None = None,
+    report_guardrail: Mapping[str, float] | None = None,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     global_policy = _l3_search_exit_policy(
         exit_prob,
@@ -1196,6 +1309,8 @@ def _l3_search_conditional_exit_policy(
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
         sample_weight=sample_weight,
+        hold_bars=hold_bars,
+        report_guardrail=report_guardrail,
     )
     keys = np.asarray(state_keys, dtype=object).ravel()
     valid = np.isfinite(np.asarray(exit_prob, dtype=np.float64).ravel()) & np.isfinite(np.asarray(value_pred, dtype=np.float64).ravel())
@@ -1214,6 +1329,8 @@ def _l3_search_conditional_exit_policy(
             value_policy_mode=value_policy_mode,
             value_tie_margin=value_tie_margin,
             sample_weight=None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).ravel()[valid][m],
+            hold_bars=None if hold_bars is None else np.asarray(hold_bars, dtype=np.float64).ravel()[valid][m],
+            report_guardrail=report_guardrail,
         )
     print(f"  [L3] conditional exit states learned={len(by_state)}", flush=True)
     return global_policy, by_state
@@ -1645,6 +1762,13 @@ def _l3_append_cox_survival_features(
     cov_idx = [feature_cols.index(c) for c in cox_cols]
     X_cov = X[:, cov_idx]
     df_ctv = _l3_ctv_frame_first_event(rows_entry, holds, y_exit, X_cov, cox_cols, train_mask)
+    df_ctv, X_cov, drawdown_stab_meta = _l3_cox_stabilize_drawdown_feature(df_ctv, X_cov, cox_cols)
+    if bool(drawdown_stab_meta.get("applied")):
+        print(
+            f"  [L3] Cox stabilization(drawdown): winsor_q={drawdown_stab_meta.get('winsor_q', float('nan'))}  "
+            f"bins={drawdown_stab_meta.get('bin_count', 0)}",
+            flush=True,
+        )
     min_rows = int(os.environ.get("L3_COX_MIN_ROWS", "400"))
     min_ev = int(os.environ.get("L3_COX_MIN_EVENTS", "80"))
     if len(df_ctv) < min_rows or int(df_ctv["event"].sum()) < min_ev:
@@ -1657,18 +1781,33 @@ def _l3_append_cox_survival_features(
         return np.hstack([X, z]), feature_cols + [
             "l3_cox_log_partial_hazard",
             "l3_cox_baseline_cumhaz_at_stop",
-        ], {"l3_cox_fitted": False, "reason": "too_few_rows", "dropped_covariates": {}}
+        ], {
+            "l3_cox_fitted": False,
+            "reason": "too_few_rows",
+            "dropped_covariates": {},
+            "drawdown_stabilization": drawdown_stab_meta,
+        }
 
     filtered_cols, dropped_covariates = _l3_filter_cox_covariates(df_ctv, cox_cols)
     if dropped_covariates:
         parts = [f"{name}={reason}" for name, reason in dropped_covariates.items()]
         print("  [L3] Cox survival: filtered covariates -> " + ", ".join(parts), flush=True)
+        reason_counts: dict[str, int] = {}
+        for reason in dropped_covariates.values():
+            key = str(reason).split("(")[0]
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+        print(f"  [L3] Cox dropped summary: {reason_counts}", flush=True)
     if not filtered_cols:
         z = np.zeros((len(X), 2), dtype=np.float32)
         return np.hstack([X, z]), feature_cols + [
             "l3_cox_log_partial_hazard",
             "l3_cox_baseline_cumhaz_at_stop",
-        ], {"l3_cox_fitted": False, "reason": "filtered_all_covariates", "dropped_covariates": dropped_covariates}
+        ], {
+            "l3_cox_fitted": False,
+            "reason": "filtered_all_covariates",
+            "dropped_covariates": dropped_covariates,
+            "drawdown_stabilization": drawdown_stab_meta,
+        }
     if len(filtered_cols) != len(cox_cols):
         cox_cols = filtered_cols
         cov_idx = [feature_cols.index(c) for c in cox_cols]
@@ -1685,7 +1824,12 @@ def _l3_append_cox_survival_features(
         return np.hstack([X, z]), feature_cols + [
             "l3_cox_log_partial_hazard",
             "l3_cox_baseline_cumhaz_at_stop",
-        ], {"l3_cox_fitted": False, "reason": f"fit_error:{ex}", "dropped_covariates": dropped_covariates}
+        ], {
+            "l3_cox_fitted": False,
+            "reason": f"fit_error:{ex}",
+            "dropped_covariates": dropped_covariates,
+            "drawdown_stabilization": drawdown_stab_meta,
+        }
 
     pred_df = pd.DataFrame(np.nan_to_num(X_cov, nan=0.0, posinf=0.0, neginf=0.0), columns=cox_cols)
     ph = np.asarray(ctv.predict_partial_hazard(pred_df), dtype=np.float64).ravel()
@@ -1698,6 +1842,7 @@ def _l3_append_cox_survival_features(
         "cov_names": list(cox_cols),
         "reason": "ok",
         "dropped_covariates": dropped_covariates,
+        "drawdown_stabilization": drawdown_stab_meta,
     }
     print(
         f"  [L3] Cox time-varying survival: fitted on {len(df_ctv):,} CTV rows ({int(df_ctv['event'].sum())} events); "
@@ -1805,6 +1950,10 @@ def l3_exit_policy_params(
     )
     params = (meta.get("l3_exit_policy_by_state") or {}).get(state_key, {})
     prob_thr = float(params.get("exit_prob_threshold", meta.get("l3_exit_prob_threshold", 0.55)))
+    split_bar = int(params.get("early_hold_split_bar", meta.get("l3_policy_early_hold_split_bar", 3)))
+    prob_thr_early = float(params.get("exit_prob_threshold_early", meta.get("l3_exit_prob_threshold_early", prob_thr)))
+    prob_thr_late = float(params.get("exit_prob_threshold_late", meta.get("l3_exit_prob_threshold_late", prob_thr)))
+    prob_thr = prob_thr_early if int(hold_bars) < split_bar else prob_thr_late
     value_thr = float(params.get("value_left_threshold", meta.get("l3_value_left_threshold", 0.02)))
     hold_map = meta.get("l3_target_horizon_bars_by_state") or {}
     max_hold = int(hold_map.get(state_key, meta.get("l3_target_horizon_bars", _l3_target_horizon_bars(30))))
@@ -2305,10 +2454,18 @@ def _log_l3_val_extended(
     exit_calibrator: IsotonicRegression | None = None,
     value_policy_mode: str = "prob_only",
     value_tie_margin: float = 0.03,
-) -> None:
+    exit_policy_summary: Mapping[str, Any] | None = None,
+) -> dict[str, float]:
+    out = {
+        "val_hold_recall": float("nan"),
+        "val_exit_rate": float("nan"),
+        "val_auc": float("nan"),
+        "holdout_hold_recall": float("nan"),
+        "holdout_auc": float("nan"),
+    }
     vm = np.asarray(val_mask, dtype=bool)
     if int(vm.sum()) < 5:
-        return
+        return out
     p_exit = _apply_l3_exit_calibrator(exit_model.predict(X[vm]).astype(np.float64), exit_calibrator)
     yv = y_exit[vm].astype(np.int32)
     try:
@@ -2330,6 +2487,9 @@ def _log_l3_val_extended(
     exit_recall = float(np.mean(yhat[yv == 1] == 1)) if np.any(yv == 1) else float("nan")
     exit_precision = float(np.mean(yv[yhat == 1] == 1)) if np.any(yhat == 1) else float("nan")
     exit_rate = float(np.mean(yhat))
+    out["val_hold_recall"] = hold_recall
+    out["val_exit_rate"] = exit_rate
+    out["val_auc"] = auc
     print("\n  [L3] val — exit (extended)", flush=True)
     print(
         f"    AUC={auc:.4f}  log_loss={ll:.4f}  Brier={br:.4f}  ECE={ece:.4f}  acc@0.5={acc:.4f}  F1={f1:.4f}  "
@@ -2338,6 +2498,15 @@ def _log_l3_val_extended(
         flush=True,
     )
     print(f"    confusion [[TN FP][FN TP]]:\n    {cm}", flush=True)
+    if exit_policy_summary:
+        print(
+            "    policy-search decomposition: "
+            f"utility_mean={float(exit_policy_summary.get('utility_mean', float('nan'))):.4f}  "
+            f"utility_p10={float(exit_policy_summary.get('utility_p10', float('nan'))):.4f}  "
+            f"hold_recall_contrib={float(exit_policy_summary.get('hold_recall_contrib', float('nan'))):.4f}  "
+            f"exit_rate_penalty_contrib={float(exit_policy_summary.get('exit_rate_penalty_contrib', float('nan'))):.4f}",
+            flush=True,
+        )
     if np.isfinite(hold_recall) and hold_recall < 0.20:
         print(f"    WARNING: hold recall still very low ({hold_recall:.3f})", flush=True)
 
@@ -2485,6 +2654,9 @@ def _log_l3_val_extended(
             f"hold_recall={hold_recall_t:.4f}  hold_precision={hold_precision_t:.4f}  n={int(tm.sum()):,}",
             flush=True,
         )
+        out["holdout_hold_recall"] = hold_recall_t
+        out["holdout_auc"] = auc_t
+    return out
 
 
 def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_outputs: pd.DataFrame) -> L3TrainingBundle:
@@ -2777,11 +2949,30 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     try:
         ih_tr = feature_cols.index("l3_hold_bars")
         hold_tr = X_lgb[train_mask, ih_tr].astype(np.float64)
+        y_exit_tr = y_exit[train_mask]
         w_exit = _l3_trade_normalized_exit_weights(
             rows_entry[train_mask],
             hold_tr,
-            y_exit[train_mask],
+            y_exit_tr,
             pa_state={k: v[train_mask] for k, v in pa_state_all.items()},
+        )
+        exit_pos_w, hold_neg_w = _l3_exit_class_weights(y_exit_tr)
+        hb_tr = _hold_bucket_ids(hold_tr)
+        hb_stats = []
+        for hb in range(4):
+            m = hb_tr == hb
+            if not np.any(m):
+                hb_stats.append(f"b{hb}:n=0")
+                continue
+            hb_stats.append(
+                f"b{hb}:n={int(np.sum(m))} w={float(np.mean(w_exit[m])):.3f}"
+            )
+        print(
+            f"  [L3] exit weight profile: hold_rate={float(np.mean(y_exit_tr == 0)):.4f}  "
+            f"exit_rate={float(np.mean(y_exit_tr == 1)):.4f}  "
+            f"class_w(exit={exit_pos_w:.3f}, hold={hold_neg_w:.3f})  "
+            f"bucket_w({' | '.join(hb_stats)})",
+            flush=True,
         )
         cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_exit, "[L3] exit")
         try:
@@ -2919,6 +3110,21 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         static_cols,
         vol_quantiles=[float(x) for x in (dataset_policy.get("policy_state_vol_quantiles") or [])],
     )
+    hold_idx = static_cols.index("l3_hold_bars")
+    report_guardrail: dict[str, float] = {}
+    report_idx = np.flatnonzero(val_report_mask)
+    if report_idx.size:
+        report_exit_rate_hint = float(np.mean(y_exit[report_idx].astype(np.float64)))
+        report_hold_recall_floor_hint = float(np.clip((1.0 - report_exit_rate_hint) * 0.5, 0.10, 0.75))
+        report_guardrail = {
+            "exit_rate_hint": report_exit_rate_hint,
+            "hold_recall_floor_hint": report_hold_recall_floor_hint,
+        }
+        print(
+            f"  [L3] report guardrail hints: exit_rate_hint={report_exit_rate_hint:.4f}  "
+            f"hold_recall_floor_hint={report_hold_recall_floor_hint:.4f}",
+            flush=True,
+        )
     exit_policy, exit_policy_by_state = _l3_search_conditional_exit_policy(
         exit_state_keys,
         _apply_l3_exit_calibrator(exit_model.predict(X_lgb[tune_idx]).astype(np.float64), exit_calibrator),
@@ -2933,6 +3139,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
         sample_weight=tune_weights,
+        hold_bars=X[tune_idx, hold_idx].astype(np.float64),
+        report_guardrail=report_guardrail,
     )
     print(
         f"  [L3] live exit smoothing check: smooth={_l3_exit_infer_params(None)['smooth']}  "
@@ -2986,7 +3194,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         if value_model is not None:
             st_v, em_v = l3_trajectory_embed_importance_ratio(value_model, n_static, traj_cfg.embed_dim)
             print(f"  [L3] gain importance share — value: static={st_v:.1%}  traj_emb={em_v:.1%}", flush=True)
-    _log_l3_val_extended(
+    eval_summary = _log_l3_val_extended(
         X_lgb,
         y_exit,
         y_value,
@@ -3001,7 +3209,34 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         exit_calibrator=exit_calibrator,
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
+        exit_policy_summary=exit_policy,
     )
+    release_hold_recall_min = _env_float_clipped("L3_RELEASE_MIN_HOLD_RECALL", 0.25, lo=0.0, hi=1.0)
+    release_exit_rate_max = _env_float_clipped("L3_RELEASE_MAX_EXIT_RATE", 0.85, lo=0.0, hi=1.0)
+    release_holdout_gap_max = _env_float_clipped("L3_RELEASE_MAX_HOLD_RECALL_GAP", 0.05, lo=0.0, hi=1.0)
+    hold_recall_release_flag = False
+    hold_recall_release_reasons: list[str] = []
+    val_hold_recall = float(eval_summary.get("val_hold_recall", float("nan")))
+    val_exit_rate = float(eval_summary.get("val_exit_rate", float("nan")))
+    holdout_hold_recall = float(eval_summary.get("holdout_hold_recall", float("nan")))
+    if np.isfinite(val_hold_recall) and np.isfinite(val_exit_rate):
+        if val_hold_recall < release_hold_recall_min and val_exit_rate > release_exit_rate_max:
+            hold_recall_release_flag = True
+            hold_recall_release_reasons.append(
+                f"val_hold_recall<{release_hold_recall_min:.2f}&val_exit_rate>{release_exit_rate_max:.2f}"
+            )
+    if np.isfinite(val_hold_recall) and np.isfinite(holdout_hold_recall):
+        if holdout_hold_recall < (val_hold_recall - release_holdout_gap_max):
+            hold_recall_release_flag = True
+            hold_recall_release_reasons.append(
+                f"holdout_hold_recall_drop>{release_holdout_gap_max:.2f}"
+            )
+    if hold_recall_release_flag:
+        print(
+            "  [L3][WARN][RELEASE_GUARD] hold-recall acceptance failed: "
+            + ", ".join(hold_recall_release_reasons),
+            flush=True,
+        )
     os.makedirs(MODEL_DIR, exist_ok=True)
     exit_model.save_model(os.path.join(MODEL_DIR, L3_EXIT_FILE))
     model_files: dict[str, str] = {"exit": L3_EXIT_FILE}
@@ -3070,6 +3305,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_cox_artifact_file": L3_COX_FILE,
         "l3_cox_fit_reason": str(cox_bundle.get("reason", "")),
         "l3_cox_dropped_covariates": dict(cox_bundle.get("dropped_covariates", {})),
+        "l3_cox_drawdown_stabilization": dict(cox_bundle.get("drawdown_stabilization", {})),
         "l3_value_disabled": bool(value_disabled),
         "l3_value_mode": "disabled" if value_disabled else "full",
         "l3_value_head_type": "hurdle_two_stage" if value_nonzero_model is not None else ("single_regression" if not value_disabled else "disabled"),
@@ -3102,6 +3338,10 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_exit_loss_buffer_atr": _l3_exit_loss_buffer_atr(),
         "l3_exit_live_edge_floor": _l3_exit_live_edge_floor(),
         "l3_exit_prob_threshold": float(exit_policy["exit_prob_threshold"]),
+        "l3_exit_prob_threshold_early": float(exit_policy.get("exit_prob_threshold_early", exit_policy["exit_prob_threshold"])),
+        "l3_exit_prob_threshold_late": float(exit_policy.get("exit_prob_threshold_late", exit_policy["exit_prob_threshold"])),
+        "l3_policy_early_hold_split_bar": int(exit_policy.get("early_hold_split_bar", 3)),
+        "l3_policy_early_prob_threshold_delta": float(exit_policy.get("early_prob_threshold_delta", 0.0)),
         "l3_value_left_threshold": float(exit_policy["value_left_threshold"]),
         "l3_value_policy_mode": str(exit_policy.get("value_policy_mode", value_policy_mode)),
         "l3_value_tie_margin": float(exit_policy.get("value_tie_margin", value_tie_margin)),
@@ -3114,6 +3354,23 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         },
         "l3_exit_policy_search": exit_policy,
         "l3_exit_policy_by_state": exit_policy_by_state,
+        "l3_release_guard": {
+            "enabled": True,
+            "flagged": bool(hold_recall_release_flag),
+            "reasons": list(hold_recall_release_reasons),
+            "thresholds": {
+                "min_hold_recall": float(release_hold_recall_min),
+                "max_exit_rate": float(release_exit_rate_max),
+                "max_holdout_drop": float(release_holdout_gap_max),
+            },
+            "metrics": {
+                "val_hold_recall": float(val_hold_recall),
+                "val_exit_rate": float(val_exit_rate),
+                "holdout_hold_recall": float(holdout_hold_recall),
+                "val_auc": float(eval_summary.get("val_auc", float("nan"))),
+                "holdout_auc": float(eval_summary.get("holdout_auc", float("nan"))),
+            },
+        },
         "pa_state_features": list(PA_STATE_FEATURES),
         "pa_policy_semantics": "PA buckets expand L3 entry/exit/horizon state policies and tighten holds in fragile price-action contexts",
         "pa_target_semantics": str(dataset_policy.get("pa_target_semantics", "PA-aware continuation thresholds and target horizon scaling are applied inside L3 supervision")),
@@ -3148,6 +3405,20 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
                 category="adaptive_candidate",
                 role="state-conditioned exit probability cutoff",
                 adaptive_hint="utility search on val_tune with recency weights",
+            ),
+            threshold_entry(
+                "l3_exit_prob_threshold_early",
+                float(exit_policy.get("exit_prob_threshold_early", exit_policy["exit_prob_threshold"])),
+                category="adaptive_candidate",
+                role="early-hold exit cutoff",
+                adaptive_hint="segmented policy for hold<split_bar",
+            ),
+            threshold_entry(
+                "l3_exit_prob_threshold_late",
+                float(exit_policy.get("exit_prob_threshold_late", exit_policy["exit_prob_threshold"])),
+                category="adaptive_candidate",
+                role="post-early-hold exit cutoff",
+                adaptive_hint="segmented policy for hold>=split_bar",
             ),
             threshold_entry(
                 "l3_value_left_threshold",

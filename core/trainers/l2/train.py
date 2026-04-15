@@ -862,7 +862,12 @@ def _log_l2_extended_val_metrics(
             if hard_decision is not None
             else vm & (np.abs(e_pred) > 1e-6)
         )
+        pred_nonzero = vm & (np.abs(e_pred) > 1e-6)
+        active_pred_nonzero = active_pred & pred_nonzero
         corr_active = pearson_corr(e_pred[active_true], e_true[active_true]) if active_true.any() else float("nan")
+        corr_pred_active_nonzero = (
+            pearson_corr(e_pred[active_pred_nonzero], e_true[active_pred_nonzero]) if active_pred_nonzero.any() else float("nan")
+        )
         sign_acc_true = (
             float(np.mean(np.sign(e_pred[active_true]) == np.sign(e_true[active_true])))
             if active_true.any()
@@ -873,10 +878,22 @@ def _log_l2_extended_val_metrics(
             if active_pred.any()
             else float("nan")
         )
+        sign_acc_pred_nonzero = (
+            float(np.mean(np.sign(e_pred[active_pred_nonzero]) == np.sign(e_true[active_pred_nonzero])))
+            if active_pred_nonzero.any()
+            else float("nan")
+        )
         print(
             f"    expected_edge: corr_all={corr_all:.4f}  corr_active={corr_active:.4f}  "
             f"sign_acc_true_active={sign_acc_true:.4f}  sign_acc_pred_active={sign_acc_pred:.4f}  "
             f"pred_active={float(np.mean(active_pred[vm])):.3f}",
+            flush=True,
+        )
+        print(
+            f"    expected_edge (pred-active & nonzero): corr={corr_pred_active_nonzero:.4f}  "
+            f"sign_acc={sign_acc_pred_nonzero:.4f}  "
+            f"coverage={float(np.mean(active_pred_nonzero[vm])):.3f}  "
+            f"active_pred_nonzero_n={int(np.sum(active_pred_nonzero))}",
             flush=True,
         )
         pos = vm & (e_pred > 0.0)
@@ -899,6 +916,12 @@ def _log_l2_extended_val_metrics(
             "A1=likely_sign_flip  A2=formula_scaling_issue  A3=upstream_signal_quality_issue",
             flush=True,
         )
+        if np.isfinite(sign_acc_pred_nonzero) and np.isfinite(sign_acc_true):
+            print(
+                f"    [L2][P0-A] dual-view: sign_true_active={sign_acc_true:.4f}  "
+                f"sign_pred_active_nonzero={sign_acc_pred_nonzero:.4f}",
+                flush=True,
+            )
         rid_all = np.argmax(frame[L1A_REGIME_COLS].to_numpy(dtype=np.float64), axis=1)
         if tm is not None:
             corr_test = pearson_corr(e_pred[tm], e_true[tm])
