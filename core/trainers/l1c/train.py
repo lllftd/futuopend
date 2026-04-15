@@ -5,6 +5,7 @@ import pickle
 import time
 from dataclasses import asdict
 from datetime import datetime
+from statistics import NormalDist
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,7 @@ from core.trainers.l1c.model import L1cDirectionModel
 from core.trainers.lgbm_utils import TQDM_FILE, _lgb_round_tqdm_enabled
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner
 from core.trainers.stack_v2_common import build_stack_time_splits, log_label_baseline, save_output_cache
+from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.tcn_constants import DEVICE
 
 
@@ -78,6 +80,17 @@ def _sample_weights_from_abs_return(abs_ret: np.ndarray) -> np.ndarray:
     ranks = np.empty_like(order, dtype=np.float64)
     ranks[order] = np.arange(1, n + 1, dtype=np.float64)
     return (ranks / float(max(n, 1))).astype(np.float32)
+
+
+def _robust_sigma(values: np.ndarray) -> tuple[float, float, float]:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0, 0.0, 0.0
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med)))
+    sigma = float(mad / 0.67448975) if mad > 0 else 0.0
+    return med, mad, sigma
 
 
 def _l1c_forward_dict(model: L1cDirectionModel, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -210,6 +223,12 @@ def _build_l1c_windows_labels(
     end_list: list[np.ndarray] = []
     ybin_list: list[np.ndarray] = []
     ret_list: list[np.ndarray] = []
+    neutral_scale_list: list[np.ndarray] = []
+    flat_band_stats: list[dict[str, float]] = []
+    flat_mode = (os.environ.get("L1C_FLAT_MODE", "mde") or "mde").strip().lower()
+    flat_alpha = float(np.clip(float(os.environ.get("L1C_FLAT_ALPHA", "0.05")), 1e-4, 0.20))
+    flat_power = float(np.clip(float(os.environ.get("L1C_FLAT_POWER", "0.80")), 0.50, 0.99))
+    weight_mode = (os.environ.get("L1C_FLAT_WEIGHT_MODE", "snr_gaussian") or "snr_gaussian").strip().lower()
     for _, grp in work_x.groupby("symbol", sort=False):
         x = grp[feature_cols].to_numpy(dtype=np.float32, copy=False)
         windows, end_local = _create_tcn_windows(x, seq_len)
@@ -226,11 +245,44 @@ def _build_l1c_windows_labels(
         idx_global = grp.index.to_numpy()[end_local]
         el = end_local
         ret = (close[el + horizon] - close[el]) / (np.abs(close[el]) + 1e-9)
-        y_bin = (ret > 0.0).astype(np.float32)
+        abs_ret = np.abs(ret)
+        flat_q = float(np.clip(float(os.environ.get("L1C_DIRECTION_FLAT_Q", "0.20")), 0.0, 0.45))
+        med_ret, mad_ret, sigma_ret = _robust_sigma(ret)
+        if flat_mode == "quantile":
+            flat_band = float(np.quantile(abs_ret[np.isfinite(abs_ret)], flat_q)) if np.isfinite(abs_ret).any() else 0.0
+            z_alpha = float("nan")
+            z_beta = float("nan")
+            principle = "quantile_flat_band"
+        else:
+            z_alpha = float(NormalDist().inv_cdf(1.0 - flat_alpha / 2.0))
+            z_beta = float(NormalDist().inv_cdf(flat_power))
+            flat_band = float((z_alpha + z_beta) * max(sigma_ret, 1e-8))
+            principle = "minimum_detectable_effect"
+        y_bin = (ret > flat_band).astype(np.float32)
+        neutral_weight = float(np.clip(float(os.environ.get("L1C_FLAT_BAND_WEIGHT", "0.5")), 0.1, 1.0))
+        if weight_mode == "fixed":
+            neutral_scale = np.where(abs_ret <= flat_band, neutral_weight, 1.0).astype(np.float32)
+        else:
+            snr = abs_ret / max(sigma_ret, 1e-8)
+            neutral_scale = (1.0 - np.exp(-0.5 * np.square(snr))).astype(np.float32)
         windows_list.append(windows)
         end_list.append(idx_global)
         ybin_list.append(y_bin.astype(np.float32))
         ret_list.append(ret.astype(np.float32))
+        neutral_scale_list.append(neutral_scale)
+        flat_band_stats.append(
+            {
+                "flat_band": float(flat_band),
+                "sigma_ret": float(sigma_ret),
+                "median_ret": float(med_ret),
+                "mad_ret": float(mad_ret),
+                "alpha": float(flat_alpha),
+                "power": float(flat_power),
+                "z_alpha": float(z_alpha) if np.isfinite(z_alpha) else float("nan"),
+                "z_beta": float(z_beta) if np.isfinite(z_beta) else float("nan"),
+                "principle": principle,
+            }
+        )
     if not windows_list:
         z = np.zeros(0, dtype=np.float32)
         return (
@@ -244,6 +296,18 @@ def _build_l1c_windows_labels(
     y_bin = np.concatenate(ybin_list, axis=0).astype(np.float32)
     y_ret = np.concatenate(ret_list, axis=0).astype(np.float32)
     sw = _sample_weights_from_abs_return(np.abs(y_ret.astype(np.float64)))
+    if neutral_scale_list:
+        sw = sw * np.concatenate(neutral_scale_list, axis=0).astype(np.float32)
+    if flat_band_stats:
+        band_values = np.asarray([x["flat_band"] for x in flat_band_stats], dtype=np.float64)
+        sigma_values = np.asarray([x["sigma_ret"] for x in flat_band_stats], dtype=np.float64)
+        print(
+            f"  [L1c] flat-band mode={flat_mode}  principle={(flat_band_stats[0].get('principle') or '')}  "
+            f"alpha={flat_alpha:.4f}  power={flat_power:.2f}  "
+            f"flat_band median={float(np.nanmedian(band_values)):.6f} p90={float(np.nanquantile(band_values, 0.90)):.6f}  "
+            f"sigma_ret median={float(np.nanmedian(sigma_values)):.6f}  weight_mode={weight_mode}",
+            flush=True,
+        )
     return windows, y_bin, sw, y_ret, np.concatenate(end_list, axis=0)
 
 
@@ -596,8 +660,10 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         "model_file": L1C_MODEL_FILE,
         "output_cache_file": L1C_OUTPUT_CACHE_FILE,
         "direction_target_semantics": (
-            f"per-symbol 1[(close[t+H]-close[t])/close[t] > 0] at H={horizon}; "
-            f"weighted BCE on logits; label_smoothing={float(config.label_smoothing):.4f}"
+            f"per-symbol 1[(close[t+H]-close[t])/close[t] > flat_band] at H={horizon}; "
+            f"flat_mode={(os.environ.get('L1C_FLAT_MODE', 'mde') or 'mde').strip().lower()} "
+            f"(MDE from robust sigma when mode=mde); weighted BCE on logits; "
+            f"label_smoothing={float(config.label_smoothing):.4f}"
         ),
         "direction_aux_semantics": "dual-branch model with local CNN branch; auxiliary head predicts asinh(|future_ret|*100)",
         "early_stopping": {
@@ -607,6 +673,67 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         },
         "val_metrics": val_metrics,
     }
+    meta = attach_threshold_registry(
+        meta,
+        "l1c",
+        [
+            threshold_entry(
+                "L1C_FLAT_MODE",
+                str((os.environ.get("L1C_FLAT_MODE", "mde") or "mde").strip().lower()),
+                category="adaptive_candidate",
+                role="flat-band estimator mode for binary direction labels",
+                adaptive_hint="mde default; quantile fallback for compatibility",
+                statistical_principle="estimator_selection",
+                method_selected=str((os.environ.get("L1C_FLAT_MODE", "mde") or "mde").strip().lower()),
+            ),
+            threshold_entry(
+                "L1C_FLAT_ALPHA",
+                float(np.clip(float(os.environ.get("L1C_FLAT_ALPHA", "0.05")), 1e-4, 0.20)),
+                category="adaptive_candidate",
+                role="type-I error control for MDE flat band",
+                statistical_principle="two_sided_significance_level",
+                alpha=float(np.clip(float(os.environ.get("L1C_FLAT_ALPHA", "0.05")), 1e-4, 0.20)),
+            ),
+            threshold_entry(
+                "L1C_FLAT_POWER",
+                float(np.clip(float(os.environ.get("L1C_FLAT_POWER", "0.80")), 0.50, 0.99)),
+                category="adaptive_candidate",
+                role="target power for MDE flat band",
+                statistical_principle="minimum_detectable_effect",
+                power=float(np.clip(float(os.environ.get("L1C_FLAT_POWER", "0.80")), 0.50, 0.99)),
+            ),
+            threshold_entry(
+                "L1C_FLAT_WEIGHT_MODE",
+                str((os.environ.get("L1C_FLAT_WEIGHT_MODE", "snr_gaussian") or "snr_gaussian").strip().lower()),
+                category="adaptive_candidate",
+                role="flat-region sample weighting rule",
+                statistical_principle="snr_soft_weighting",
+                method_selected=str((os.environ.get("L1C_FLAT_WEIGHT_MODE", "snr_gaussian") or "snr_gaussian").strip().lower()),
+            ),
+            threshold_entry(
+                "L1C_CONF_MODE",
+                str((os.environ.get("L1C_CONF_MODE", "cost_based") or "cost_based").strip().lower()),
+                category="adaptive_candidate",
+                role="confidence zone derivation mode",
+                statistical_principle="cost_aware_decision_boundary",
+                method_selected=str((os.environ.get("L1C_CONF_MODE", "cost_based") or "cost_based").strip().lower()),
+            ),
+            threshold_entry(
+                "L1C_TX_COST_RATE",
+                float(max(0.0, float(os.environ.get("L1C_TX_COST_RATE", "0.0005")))),
+                category="safety_constraint",
+                role="transaction cost floor for confidence threshold",
+                statistical_principle="observed_execution_cost",
+                cost_input=float(max(0.0, float(os.environ.get("L1C_TX_COST_RATE", "0.0005")))),
+            ),
+            threshold_entry(
+                "L1C_PATIENCE",
+                int(patience),
+                category="data_guardrail",
+                role="early-stop patience",
+            ),
+        ],
+    )
     with open(os.path.join(MODEL_DIR, L1C_META_FILE), "wb") as f:
         pickle.dump(meta, f)
     cache_path = save_output_cache(outputs, L1C_OUTPUT_CACHE_FILE)

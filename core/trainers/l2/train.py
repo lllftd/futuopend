@@ -67,6 +67,7 @@ from core.trainers.pa_state_controls import (
 )
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_split
 from core.trainers.stack_v2_common import build_stack_time_splits, l2_val_start_time, log_label_baseline, save_output_cache
+from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.val_metrics_extra import (
     brier_binary,
     brier_multiclass,
@@ -123,7 +124,6 @@ _L2_GATE_BLOCKED_SIGN_FEATURES = frozenset(
         "l2_range_mass_x_l1c_dir",
         "l2_signal_spread_var",
         "l2_breakout_quality_x_l1c_dir",
-        "l2_follow_through_x_l1c_dir",
     }
 )
 
@@ -249,8 +249,9 @@ def _l2_direction_sample_weights(y_dir: np.ndarray, fusion_frame: pd.DataFrame |
     n_short = max(int(np.sum(y_act == 0)), 1)
     n_long = max(int(np.sum(y_act == 1)), 1)
     total = n_short + n_long
-    short_w = float(np.clip(total / (2.0 * n_short), 0.75, 3.0))
-    long_w = float(np.clip(total / (2.0 * n_long), 0.75, 3.0))
+    gamma = float(np.clip(float(os.environ.get("L2_DIRECTION_CLASS_WEIGHT_GAMMA", "1.25")), 0.5, 2.5))
+    short_w = float(np.clip((total / (2.0 * n_short)) ** gamma, 0.60, 4.0))
+    long_w = float(np.clip((total / (2.0 * n_long)) ** gamma, 0.60, 4.0))
     w[active & (y == 0)] = short_w
     w[active & (y == 1)] = long_w
     if fusion_frame is not None:
@@ -267,6 +268,25 @@ def _l2_direction_sample_weights(y_dir: np.ndarray, fusion_frame: pd.DataFrame |
         uncertain = np.clip(1.0 + 0.25 * range_risk + 0.20 * breakout + 0.10 * pullback - 0.10 * trend, 0.60, 1.75)
         w[active] *= uncertain[active].astype(np.float32)
     return w
+
+
+def _safe_logit(p: np.ndarray) -> np.ndarray:
+    pp = np.clip(np.asarray(p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
+    return np.log(pp) - np.log1p(-pp)
+
+
+def _l2_direction_prior_corrected_prob(
+    dir_p: np.ndarray,
+    *,
+    train_long_prior: float,
+    target_long_prior: float,
+) -> np.ndarray:
+    p = np.clip(np.asarray(dir_p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
+    tr = float(np.clip(train_long_prior, 1e-4, 1.0 - 1e-4))
+    tgt = float(np.clip(target_long_prior, 1e-4, 1.0 - 1e-4))
+    shift = float(_safe_logit(np.asarray([tgt]))[0] - _safe_logit(np.asarray([tr]))[0])
+    z = _safe_logit(p) + shift
+    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
 
 def _l2_formula_size_from_context(
@@ -309,6 +329,49 @@ def _l2_formula_size_from_context(
     return np.clip(size, 0.0, 1.0).astype(np.float32)
 
 
+def _l2_bucketized_size_from_signals(
+    frame: pd.DataFrame,
+    trade_p: np.ndarray,
+    dir_p: np.ndarray,
+    *,
+    trade_threshold: float,
+    fit_mask: np.ndarray | None = None,
+    bins: list[float] | None = None,
+    levels: list[float] | None = None,
+) -> tuple[np.ndarray, list[float], list[float]]:
+    trade = np.asarray(trade_p, dtype=np.float64).ravel()
+    direction = np.clip(np.asarray(dir_p, dtype=np.float64).ravel(), 0.0, 1.0)
+    thr = float(np.clip(trade_threshold, 0.01, 0.99))
+    active_strength = np.clip((trade - thr) / max(1.0 - thr, 1e-3), 0.0, 1.0)
+    dir_conf = np.abs((2.0 * direction) - 1.0)
+    l1c_conf = pd.to_numeric(frame.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    l1c_strength = pd.to_numeric(frame.get("l1c_direction_strength", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    strength_norm = _quantile_rescale_01(np.abs(l1c_strength), fit_mask=fit_mask, q_low=0.05, q_high=0.95).astype(np.float64)
+    edge_proxy = pd.to_numeric(frame.get("l1b_edge_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    edge_norm = _quantile_rescale_01(np.abs(edge_proxy), fit_mask=fit_mask, q_low=0.05, q_high=0.95).astype(np.float64)
+    score = 0.45 * active_strength + 0.30 * dir_conf + 0.15 * np.clip(l1c_conf, 0.0, 1.0) + 0.10 * edge_norm
+    score = np.clip(score, 0.0, 1.0)
+    if levels is None:
+        levels = [0.20, 0.35, 0.50, 0.70, 0.90]
+    lv = [float(np.clip(x, 0.0, 1.0)) for x in levels]
+    fit = np.ones(len(score), dtype=bool) if fit_mask is None else np.asarray(fit_mask, dtype=bool).ravel()
+    active_fit = fit & (trade >= thr)
+    if bins is None:
+        if np.any(active_fit):
+            quantiles = np.linspace(0.2, 0.8, len(lv) - 1)
+            bs = np.quantile(score[active_fit], quantiles).astype(np.float64).tolist()
+        else:
+            bs = [0.25, 0.40, 0.55, 0.70][: max(0, len(lv) - 1)]
+    else:
+        bs = [float(x) for x in bins]
+    out = np.full(len(score), lv[0], dtype=np.float64)
+    idx = np.searchsorted(np.asarray(bs, dtype=np.float64), score, side="right")
+    idx = np.clip(idx, 0, len(lv) - 1)
+    out = np.asarray([lv[int(i)] for i in idx], dtype=np.float64)
+    out[trade < thr] = 0.0
+    return out.astype(np.float32), bs, lv
+
+
 def _l2_expected_edge_from_gate_dir(
     trade_p: np.ndarray,
     dir_p: np.ndarray,
@@ -316,6 +379,9 @@ def _l2_expected_edge_from_gate_dir(
     *,
     trade_threshold: float | np.ndarray,
     direction_strength: pd.Series | np.ndarray | None = None,
+    l1b_edge_proxy: pd.Series | np.ndarray | None = None,
+    range_mass: pd.Series | np.ndarray | None = None,
+    regime_entropy: pd.Series | np.ndarray | None = None,
 ) -> np.ndarray:
     trade = np.asarray(trade_p, dtype=np.float64).ravel()
     direction = np.clip(np.asarray(dir_p, dtype=np.float64).ravel(), 0.0, 1.0)
@@ -332,7 +398,32 @@ def _l2_expected_edge_from_gate_dir(
     else:
         strength = np.asarray(direction_strength, dtype=np.float64).ravel()
         strength = np.clip(strength, 0.0, 5.0)
-    edge = active_strength * size * np.sign(dir_margin) * np.maximum(np.abs(dir_margin), 1e-3) * np.maximum(strength, 1e-3)
+    if l1b_edge_proxy is None:
+        edge_proxy_mag = np.abs(dir_margin)
+    else:
+        edge_proxy_mag = np.asarray(l1b_edge_proxy, dtype=np.float64).ravel()
+        edge_proxy_mag = np.clip(edge_proxy_mag, 0.0, 5.0) / 5.0
+    if range_mass is None:
+        rm = np.zeros(len(trade), dtype=np.float64)
+    else:
+        rm = np.clip(np.asarray(range_mass, dtype=np.float64).ravel(), 0.0, 1.0)
+    if regime_entropy is None:
+        ent_norm = np.zeros(len(trade), dtype=np.float64)
+    else:
+        ent = np.clip(np.asarray(regime_entropy, dtype=np.float64).ravel(), 0.0, np.log(float(NUM_REGIME_CLASSES)))
+        ent_norm = ent / max(np.log(float(NUM_REGIME_CLASSES)), 1e-6)
+    range_lambda = float(np.clip(float(os.environ.get("L2_EXPECTED_EDGE_RANGE_LAMBDA", "0.45")), 0.0, 1.5))
+    entropy_lambda = float(np.clip(float(os.environ.get("L2_EXPECTED_EDGE_ENTROPY_LAMBDA", "0.30")), 0.0, 1.5))
+    regime_shrink = np.clip(1.0 - range_lambda * rm - entropy_lambda * ent_norm, 0.20, 1.0)
+    edge = (
+        active_strength
+        * size
+        * np.sign(dir_margin)
+        * np.maximum(np.abs(dir_margin), 1e-3)
+        * np.maximum(strength, 1e-3)
+        * (0.35 + 0.65 * edge_proxy_mag)
+        * regime_shrink
+    )
     return np.clip(edge, -5.0, 5.0).astype(np.float32)
 
 
@@ -362,7 +453,13 @@ def _split_mask_for_tuning_and_report(
     return tune_mask, report_mask
 
 
-def _l2_hard_decision_from_gate_dir(gate_p: np.ndarray, dir_p: np.ndarray, thr: float) -> np.ndarray:
+def _l2_hard_decision_from_gate_dir(
+    gate_p: np.ndarray,
+    dir_p: np.ndarray,
+    thr: float,
+    *,
+    direction_abstain_margin: float = 0.0,
+) -> np.ndarray:
     gate_p = np.asarray(gate_p, dtype=np.float64).ravel()
     dir_p = np.asarray(dir_p, dtype=np.float64).ravel()
     thr_arr = np.asarray(thr, dtype=np.float64)
@@ -372,8 +469,13 @@ def _l2_hard_decision_from_gate_dir(gate_p: np.ndarray, dir_p: np.ndarray, thr: 
         thr_arr = np.broadcast_to(thr_arr.reshape(-1), gate_p.shape)
     out = np.ones(len(gate_p), dtype=np.int64)
     trade = gate_p >= thr_arr
-    out[trade & (dir_p >= 0.5)] = 0
-    out[trade & (dir_p < 0.5)] = 2
+    margin = float(np.clip(direction_abstain_margin, 0.0, 0.49))
+    dir_conf = np.abs((2.0 * dir_p) - 1.0)
+    abstain = dir_conf < margin
+    long_mask = trade & (~abstain) & (dir_p >= 0.5)
+    short_mask = trade & (~abstain) & (dir_p < 0.5)
+    out[long_mask] = 0
+    out[short_mask] = 2
     return out
 
 
@@ -404,6 +506,59 @@ def _search_l2_trade_threshold(
     return thr
 
 
+def _search_l2_direction_abstain_margin(
+    trade_p: np.ndarray,
+    direction_p: np.ndarray,
+    *,
+    trade_threshold: float,
+    target_abstain_rate: float = 0.10,
+) -> float:
+    trade = np.asarray(trade_p, dtype=np.float64).ravel()
+    direction = np.asarray(direction_p, dtype=np.float64).ravel()
+    live = trade >= float(trade_threshold)
+    if not np.any(live):
+        return 0.0
+    conf = np.abs((2.0 * np.clip(direction[live], 0.0, 1.0)) - 1.0)
+    target = float(np.clip(target_abstain_rate, 0.0, 0.5))
+    if target <= 1e-6:
+        return 0.0
+    margin = float(np.quantile(conf, target))
+    realized = float(np.mean(conf < margin))
+    print("\n  [L2] direction abstain-margin search on active trades", flush=True)
+    for rate in [0.05, target, min(0.25, max(target, 0.05) + 0.10)]:
+        cand = float(np.quantile(conf, float(np.clip(rate, 0.0, 0.5))))
+        cand_rate = float(np.mean(conf < cand))
+        mark = "  *" if abs(rate - target) < 1e-9 else ""
+        print(f"    target_abstain_rate={rate:.3f}  margin={cand:.4f}  realized={cand_rate:.3f}{mark}", flush=True)
+    print(
+        f"  [L2] selected direction_abstain_margin={margin:.4f}  target_abstain_rate={target:.3f}  realized={realized:.3f}",
+        flush=True,
+    )
+    return float(np.clip(margin, 0.0, 0.45))
+
+
+def _l2_edge_diagnosis_branch(
+    e_pred: np.ndarray,
+    e_true: np.ndarray,
+    y_decision: np.ndarray,
+    mask: np.ndarray,
+) -> str:
+    sm = np.asarray(mask, dtype=bool)
+    yp = np.asarray(e_pred, dtype=np.float64).ravel()
+    yt = np.asarray(e_true, dtype=np.float64).ravel()
+    yd = np.asarray(y_decision, dtype=np.int64).ravel()
+    active = sm & (yd != 1)
+    if not np.any(active):
+        return "A2"
+    sign_acc = float(np.mean(np.sign(yp[active]) == np.sign(yt[active])))
+    corr_active = pearson_corr(yp[active], yt[active])
+    if sign_acc < 0.35 and np.isfinite(corr_active) and corr_active <= 0.0:
+        return "A1"
+    if sign_acc < 0.45 and np.isfinite(corr_active) and corr_active < 0.05:
+        return "A3"
+    return "A2"
+
+
 def _log_l2_two_stage_val_diagnostics(
     trade_p: np.ndarray,
     dir_p: np.ndarray,
@@ -412,6 +567,7 @@ def _log_l2_two_stage_val_diagnostics(
     y_decision: np.ndarray,
     *,
     trade_threshold: float,
+    direction_abstain_margin: float = 0.0,
     split_label: str = "val_report",
 ) -> None:
     trade = np.asarray(trade_p, dtype=np.float64).ravel()
@@ -476,10 +632,30 @@ def _log_l2_two_stage_val_diagnostics(
             f"precision_delta(long-short)={long_precision - short_precision:+.4f}",
             flush=True,
         )
-    pred_hard = _l2_hard_decision_from_gate_dir(trade, direction, float(trade_threshold))
+    pred_hard = _l2_hard_decision_from_gate_dir(
+        trade,
+        direction,
+        float(trade_threshold),
+        direction_abstain_margin=float(direction_abstain_margin),
+    )
+    active_trade = trade >= float(trade_threshold)
+    if np.any(active_trade):
+        active_pred = pred_hard[active_trade]
+        abstain_rate = float(np.mean(active_pred == 1))
+        directional = active_pred != 1
+        if directional.any():
+            long_share = float(np.mean(active_pred[directional] == 0))
+            short_share = float(np.mean(active_pred[directional] == 2))
+        else:
+            long_share = float("nan")
+            short_share = float("nan")
+        print(
+            f"    active trade mix: abstain_rate={abstain_rate:.4f}  long_share={long_share:.4f}  short_share={short_share:.4f}",
+            flush=True,
+        )
     print(
         f"\n  [L2] {split_label} — hard two-stage vs truth: pred_active={float(np.mean(pred_hard != 1)):.3f}  "
-        f"true_active={float(np.mean(y_decision != 1)):.3f}",
+        f"true_active={float(np.mean(y_decision != 1)):.3f}  abstain_margin={float(direction_abstain_margin):.4f}",
         flush=True,
     )
 
@@ -661,11 +837,47 @@ def _log_l2_extended_val_metrics(
         e_pred = np.asarray(expected_edge_pred, dtype=np.float64).ravel()
         e_true = np.asarray(true_edge, dtype=np.float64).ravel()
         corr_all = pearson_corr(e_pred[vm], e_true[vm])
-        active = vm & (y_decision != 1)
-        corr_active = pearson_corr(e_pred[active], e_true[active]) if active.any() else float("nan")
-        sign_acc = float(np.mean(np.sign(e_pred[active]) == np.sign(e_true[active]))) if active.any() else float("nan")
+        active_true = vm & (y_decision != 1)
+        active_pred = (
+            vm & (np.asarray(hard_decision, dtype=np.int64).ravel() != 1)
+            if hard_decision is not None
+            else vm & (np.abs(e_pred) > 1e-6)
+        )
+        corr_active = pearson_corr(e_pred[active_true], e_true[active_true]) if active_true.any() else float("nan")
+        sign_acc_true = (
+            float(np.mean(np.sign(e_pred[active_true]) == np.sign(e_true[active_true])))
+            if active_true.any()
+            else float("nan")
+        )
+        sign_acc_pred = (
+            float(np.mean(np.sign(e_pred[active_pred]) == np.sign(e_true[active_pred])))
+            if active_pred.any()
+            else float("nan")
+        )
         print(
-            f"    expected_edge: corr_all={corr_all:.4f}  corr_active={corr_active:.4f}  sign_acc_active={sign_acc:.4f}",
+            f"    expected_edge: corr_all={corr_all:.4f}  corr_active={corr_active:.4f}  "
+            f"sign_acc_true_active={sign_acc_true:.4f}  sign_acc_pred_active={sign_acc_pred:.4f}  "
+            f"pred_active={float(np.mean(active_pred[vm])):.3f}",
+            flush=True,
+        )
+        pos = vm & (e_pred > 0.0)
+        neg = vm & (e_pred < 0.0)
+        mean_ret_pos = float(np.mean(e_true[pos])) if np.any(pos) else float("nan")
+        mean_ret_neg = float(np.mean(e_true[neg])) if np.any(neg) else float("nan")
+        print(
+            f"    expected_edge sign buckets: mean_true_edge(edge>0)={mean_ret_pos:.6f}  "
+            f"mean_true_edge(edge<0)={mean_ret_neg:.6f}",
+            flush=True,
+        )
+        branch = "A2"
+        if np.isfinite(sign_acc_true):
+            if sign_acc_true < 0.35 and np.isfinite(corr_active) and corr_active <= 0.0:
+                branch = "A1"
+            elif sign_acc_true < 0.45 and np.isfinite(corr_active) and corr_active < 0.05:
+                branch = "A3"
+        print(
+            f"    [L2][P0-A] diagnosis_branch={branch}  "
+            "A1=likely_sign_flip  A2=formula_scaling_issue  A3=upstream_signal_quality_issue",
             flush=True,
         )
         rid_all = np.argmax(frame[L1A_REGIME_COLS].to_numpy(dtype=np.float64), axis=1)
@@ -757,17 +969,64 @@ def _log_l2_extended_val_metrics(
         )
 
 
+def _l2_dynamic_hard_drop_from_prev_model(feature_cols: list[str]) -> set[str]:
+    path = os.path.join(MODEL_DIR, L2_GATE_FILE)
+    if not os.path.exists(path):
+        return set()
+    try:
+        booster = lgb.Booster(model_file=path)
+    except Exception:
+        return set()
+    names = list(booster.feature_name() or [])
+    gains = np.asarray(booster.feature_importance(importance_type="gain"), dtype=np.float64).ravel()
+    if len(names) != len(gains) or len(names) == 0:
+        return set()
+    total = float(np.sum(np.maximum(gains, 0.0)))
+    rel = np.maximum(gains, 0.0) / max(total, 1e-12)
+    gain_map = {str(n): float(g) for n, g in zip(names, rel)}
+    extra: set[str] = set()
+    det_thr = float(np.clip(float(os.environ.get("L2_PRUNE_DETERMINISTIC_GAIN_THR", "0.005")), 0.0, 0.05))
+    for n in feature_cols:
+        if _l2_l1b_importance_bucket(n) == "l1b_deterministic_semantic" and gain_map.get(n, 1.0) < det_thr:
+            extra.add(n)
+    bottom_n = int(np.clip(int(os.environ.get("L2_PRUNE_BOTTOM_N", "0")), 0, 128))
+    if bottom_n > 0:
+        ranked = sorted([(n, gain_map.get(n, 0.0)) for n in feature_cols], key=lambda x: x[1])
+        for n, _ in ranked[:bottom_n]:
+            extra.add(n)
+    if extra:
+        print(f"  [L2] dynamic hard-drop from previous gate model: {len(extra)} cols", flush=True)
+    return extra
+
+
 def _l2_l1b_importance_bucket(name: str) -> str:
-    if name in {"l1b_edge_pred", "l1b_dq_pred"}:
+    if name in {
+        "l1b_edge_pred",
+        "l1b_dq_pred",
+        "l2_vol_adjusted_l1b_edge",
+        "l2_dir_x_edge_opportunity",
+        "l2_dir_conf_x_edge_mag",
+        "l2_dq_x_edge",
+        "l2_signal_strength_mean_abs",
+        "l2_signal_spread_var",
+    }:
         return "l1b_supervised_pred"
-    if name.startswith("l1b_cluster_prob_"):
+    if name.startswith("l1b_cluster_prob_") or name in {"l1b_cluster_top1", "l1b_cluster_top2_gap"}:
         return "l1b_unsup_cluster"
-    if name.startswith("l1b_latent_") or name in {"l1b_novelty_score", "l1b_regime_change_score"}:
-        return "l1b_unsup_latent_novelty"
+    if name.startswith("l1b_latent_") or name in {
+        "l1b_novelty_score",
+        "l1b_regime_change_score",
+        "l1b_novelty_x_vol",
+        "l1b_regime_change_x_entropy",
+        "l1b_unsup_pressure",
+    }:
+        return "l1b_unsup_descriptor"
     if name in {"l1b_sector_relative_strength", "l1b_correlation_regime", "l1b_market_breadth"}:
         return "l1b_context"
     if name.startswith("l1b_atom_"):
         return "l1b_atom_internal"
+    if name == "l2_breakout_quality_x_l1c_dir":
+        return "l1b_deterministic_semantic"
     if name.startswith("l1b_"):
         return "l1b_deterministic_semantic"
     return "non_l1b"
@@ -821,7 +1080,7 @@ def _l2_zero_feature_buckets(
     all_l1b: bool = False,
 ) -> tuple[np.ndarray, list[str]]:
     if all_l1b:
-        idx = [j for j, name in enumerate(feature_cols) if name.startswith("l1b_")]
+        idx = [j for j, name in enumerate(feature_cols) if _l2_l1b_importance_bucket(str(name)) != "non_l1b"]
     else:
         tgt = set(buckets or set())
         idx = [j for j, name in enumerate(feature_cols) if _l2_l1b_importance_bucket(str(name)) in tgt]
@@ -845,6 +1104,7 @@ def _log_l2_l1b_masking_audit(
     gate_calibrator: Any | None,
     direction_calibrator: Any | None,
     trade_threshold: float,
+    direction_abstain_margin: float = 0.0,
 ) -> None:
     if os.environ.get("L2_L1B_MASKING_AUDIT", "1").strip().lower() in {"0", "false", "no"}:
         return
@@ -856,7 +1116,7 @@ def _log_l2_l1b_masking_audit(
         ("without_l1b", None, True),
         ("no_l1b_supervised", {"l1b_supervised_pred"}, False),
         ("no_l1b_cluster", {"l1b_unsup_cluster"}, False),
-        ("no_l1b_unsup_latent", {"l1b_unsup_latent_novelty"}, False),
+        ("no_l1b_unsup_descriptor", {"l1b_unsup_descriptor"}, False),
         ("no_l1b_deterministic", {"l1b_deterministic_semantic"}, False),
     ]
     print("\n  [L2] val_report — L1b masking audit (post-fit, no retraining)", flush=True)
@@ -879,7 +1139,12 @@ def _log_l2_l1b_masking_audit(
         probs = _l2_compose_probs_from_gate_dir(trade_p, direction_p).astype(np.float64)
         probs = np.clip(probs, 1e-15, 1.0)
         probs = probs / probs.sum(axis=1, keepdims=True)
-        pred = _l2_hard_decision_from_gate_dir(trade_p, direction_p, float(trade_threshold))
+        pred = _l2_hard_decision_from_gate_dir(
+            trade_p,
+            direction_p,
+            float(trade_threshold),
+            direction_abstain_margin=float(direction_abstain_margin),
+        )
         try:
             gate_auc = float(roc_auc_score(y_trade[vm], trade_p[vm]))
         except ValueError:
@@ -1158,10 +1423,22 @@ def _l2_hard_decode_prob_aligned_outputs(
     decision_probs: np.ndarray,
     *,
     trade_threshold: float,
+    direction_abstain_margin: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    hard_cls = _l2_hard_decision_from_gate_dir(gate_p, dir_p, trade_threshold)
+    hard_cls = _l2_hard_decision_from_gate_dir(
+        gate_p,
+        dir_p,
+        trade_threshold,
+        direction_abstain_margin=direction_abstain_margin,
+    )
     prob_mat = np.asarray(decision_probs, dtype=np.float32)
     confidence = prob_mat[np.arange(len(prob_mat)), hard_cls].astype(np.float32)
+    if float(direction_abstain_margin) > 0.0:
+        direction = np.asarray(dir_p, dtype=np.float64).ravel()
+        dir_conf = np.abs((2.0 * np.clip(direction, 0.0, 1.0)) - 1.0).astype(np.float32)
+        abstain = hard_cls == 1
+        if np.any(abstain):
+            confidence[abstain] = np.maximum(confidence[abstain], (1.0 - dir_conf[abstain]).astype(np.float32))
     return hard_cls.astype(np.int64), confidence
 
 
@@ -1297,8 +1574,6 @@ def _l2_condition_input_cols(merged: pd.DataFrame) -> list[str]:
         "l1b_novelty_score",
         "l1b_regime_change_score",
         "l1b_breakout_quality",
-        "l1b_follow_through_score",
-        "l1b_liquidity_score",
     ]
     allow.extend([c for c in merged.columns if c.startswith("l1b_cluster_prob_")])
     return [c for c in allow if c in merged.columns]
@@ -1310,6 +1585,7 @@ def _l2_direction_input_cols(merged: pd.DataFrame) -> list[str]:
         "l1c_direction_score",
         "l1c_confidence",
         "l1c_direction_strength",
+        "l1c_conf_zone",
         "l1c_is_warm",
     ]
     return [c for c in allow if c in merged.columns]
@@ -1368,13 +1644,20 @@ def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
             merged.get("l1c_direction_score", 0.0),
             errors="coerce",
         ).fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+        l1c_p = pd.to_numeric(merged.get("l1c_direction_prob", 0.5), errors="coerce").fillna(0.5).to_numpy(dtype=np.float32, copy=False)
         l1c_c = pd.to_numeric(merged.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
         l1c_s = pd.to_numeric(merged.get("l1c_direction_strength", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+        abst_margin = float(np.clip(float(os.environ.get("L1C_ABSTAIN_MARGIN", "0.10")), 0.02, 0.30))
+        low_margin = float(np.clip(abst_margin * 2.0, abst_margin + 0.01, 0.45))
+        d = np.abs(l1c_p - 0.5)
+        conf_zone = np.where(d < abst_margin, 0.0, np.where(d < low_margin, 1.0, 2.0)).astype(np.float32)
+        out["l1c_conf_zone"] = conf_zone
         out["l1c_weighted_dir"] = (l1c_d * l1c_c).astype(np.float32)
         out["l1c_dir_x_vol"] = (l1c_d * vol).astype(np.float32)
         out["l1c_dir_x_state_persistence"] = (l1c_d * persistence).astype(np.float32)
         out["l1c_strength_x_conf"] = (l1c_s * l1c_c).astype(np.float32)
     else:
+        out["l1c_conf_zone"] = np.zeros(n_m, dtype=np.float32)
         out["l1c_weighted_dir"] = np.zeros(n_m, dtype=np.float32)
         out["l1c_dir_x_vol"] = np.zeros(n_m, dtype=np.float32)
         out["l1c_dir_x_state_persistence"] = np.zeros(n_m, dtype=np.float32)
@@ -1383,8 +1666,14 @@ def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
     l1b_edge_f = pd.to_numeric(merged.get("l1b_edge_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     l1b_dq_f = pd.to_numeric(merged.get("l1b_dq_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     l1b_breakout_f = pd.to_numeric(merged.get("l1b_breakout_quality", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    l1b_follow_f = pd.to_numeric(merged.get("l1b_follow_through_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    l1b_liq_f = pd.to_numeric(merged.get("l1b_liquidity_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    l1b_tau_f = pd.to_numeric(merged.get("l1b_edge_candidate_tau", np.nan), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    if np.isfinite(l1b_tau_f).any():
+        tau_eff = np.where(np.isfinite(l1b_tau_f), l1b_tau_f, np.nanmedian(l1b_tau_f[np.isfinite(l1b_tau_f)]))
+    else:
+        tau_q = float(np.clip(float(os.environ.get("L2_L1B_TAU_PROXY_Q", "0.70")), 0.50, 0.95))
+        tau_proxy = float(np.quantile(np.abs(l1b_edge_f).astype(np.float64), tau_q)) if len(l1b_edge_f) else 0.05
+        tau_eff = np.full(len(l1b_edge_f), max(tau_proxy, 1e-3), dtype=np.float64)
+    out["l2_l1b_edge_over_tau"] = (l1b_edge_f.astype(np.float64) / np.maximum(tau_eff, 1e-3)).astype(np.float32)
     vol_f = pd.to_numeric(merged.get("l1a_vol_forecast", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
     out["l2_vol_adjusted_l1b_edge"] = (l1b_edge_f / np.maximum(vol_f, 1e-4)).astype(np.float32)
     l1c_dir_f = pd.to_numeric(merged.get("l1c_direction_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
@@ -1393,8 +1682,6 @@ def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
     out["l2_dir_conf_x_edge_mag"] = (l1c_conf_f * np.abs(l1b_edge_f)).astype(np.float32)
     out["l2_dq_x_edge"] = (l1b_dq_f * l1b_edge_f).astype(np.float32)
     out["l2_breakout_quality_x_l1c_dir"] = (l1b_breakout_f * l1c_dir_f).astype(np.float32)
-    out["l2_follow_through_x_l1c_dir"] = (l1b_follow_f * l1c_dir_f).astype(np.float32)
-    out["l2_liquidity_x_l1c_conf"] = (l1b_liq_f * l1c_conf_f).astype(np.float32)
 
     out["l2_signal_strength_mean_abs"] = ((np.abs(l1c_dir_f) + np.abs(l1b_edge_f)) / 2.0).astype(np.float32)
     sig_stack = np.column_stack([l1c_dir_f.astype(np.float64), l1b_edge_f.astype(np.float64), l1b_dq_f.astype(np.float64)])
@@ -1510,6 +1797,7 @@ def train_l2_trade_decision(
         _extra = os.environ.get("L2_EXTRA_HARD_DROP", "").strip()
         if _extra:
             hard_drop |= {s.strip() for s in _extra.split(",") if s.strip()}
+        hard_drop |= _l2_dynamic_hard_drop_from_prev_model(feature_cols)
     hard_drop = frozenset(hard_drop)
     feature_cols, l2_dropped_features = _l2_select_features_for_training(
         X, feature_cols, train_mask, min_std=min_std, hard_drop=hard_drop
@@ -1849,12 +2137,32 @@ def train_l2_trade_decision(
     trade_p_all = _apply_binary_calibrator(gate_raw_all, gate_calibrator).astype(np.float32)
     direction_tune_mask = val_tune_mask & (y_dir_stage >= 0)
     direction_calibrator = _fit_binary_calibrator(y_dir_stage[direction_tune_mask], direction_raw_all[direction_tune_mask])
-    direction_p_all = _apply_binary_calibrator(direction_raw_all, direction_calibrator).astype(np.float32)
+    direction_p_cal = _apply_binary_calibrator(direction_raw_all, direction_calibrator).astype(np.float32)
+    train_long_prior = float(np.mean(y_dir_stage[active_train] == 1)) if np.any(active_train) else 0.5
+    target_long_prior = float(np.clip(float(os.environ.get("L2_DIRECTION_TARGET_LONG_PRIOR", "0.5")), 1e-4, 1.0 - 1e-4))
+    direction_p_all = _l2_direction_prior_corrected_prob(
+        direction_p_cal,
+        train_long_prior=train_long_prior,
+        target_long_prior=target_long_prior,
+    )
+    print(
+        f"  [L2] direction prior correction: train_long_prior={train_long_prior:.4f}  "
+        f"target_long_prior={target_long_prior:.4f}  mean_p_before={float(np.mean(direction_p_cal[active_val])):.4f}  "
+        f"mean_p_after={float(np.mean(direction_p_all[active_val])):.4f}",
+        flush=True,
+    )
     mfe_pred = _l2_positive_head_predict(mfe_model, X, mfe_head_prep, clip_max=5.0)
     mae_pred = _l2_positive_head_predict(mae_model, X, mae_head_prep, clip_max=4.0)
     trade_threshold = _search_l2_trade_threshold(
         trade_p_all[val_tune_mask],
         target_trade_rate=_l2_target_trade_rate(),
+    )
+    direction_abstain_target = float(np.clip(float(os.environ.get("L2_DIRECTION_ABSTAIN_RATE", "0.10")), 0.0, 0.5))
+    direction_abstain_margin = _search_l2_direction_abstain_margin(
+        trade_p_all[val_tune_mask],
+        direction_p_all[val_tune_mask],
+        trade_threshold=float(trade_threshold),
+        target_abstain_rate=direction_abstain_target,
     )
     _log_l2_two_stage_val_diagnostics(
         trade_p_all[val_report_mask],
@@ -1863,6 +2171,7 @@ def train_l2_trade_decision(
         y_dir_stage[val_report_mask],
         y_decision[val_report_mask],
         trade_threshold=float(trade_threshold),
+        direction_abstain_margin=float(direction_abstain_margin),
         split_label="val_report",
     )
     if test_mask.any():
@@ -1873,14 +2182,37 @@ def train_l2_trade_decision(
             y_dir_stage[test_mask],
             y_decision[test_mask],
             trade_threshold=float(trade_threshold),
+            direction_abstain_margin=float(direction_abstain_margin),
             split_label="holdout",
         )
     decision_probs = _l2_compose_probs_from_gate_dir(trade_p_all, direction_p_all)
-    size_pred = _l2_formula_size_from_context(
+    size_raw = _l2_formula_size_from_context(
         frame,
         trade_p_all,
         direction_p_all,
         trade_threshold=float(trade_threshold),
+    )
+    size_min_std = float(np.clip(float(os.environ.get("L2_SIZE_MIN_ACTIVE_STD", "0.02")), 1e-4, 0.5))
+    fit_active = val_tune_mask & (trade_p_all >= float(trade_threshold))
+    std_raw = float(np.std(size_raw[fit_active])) if np.any(fit_active) else float(np.std(size_raw))
+    size_mode = "formula"
+    size_bins: list[float] = []
+    size_levels: list[float] = []
+    if std_raw < size_min_std:
+        size_pred, size_bins, size_levels = _l2_bucketized_size_from_signals(
+            frame,
+            trade_p_all,
+            direction_p_all,
+            trade_threshold=float(trade_threshold),
+            fit_mask=val_tune_mask,
+        )
+        size_mode = "bucketized_fallback"
+    else:
+        size_pred = size_raw
+    print(
+        f"  [L2] size rebuild: mode={size_mode}  active_std_raw={std_raw:.5f}  "
+        f"min_active_std={size_min_std:.5f}  active_rows={int(np.sum(fit_active))}",
+        flush=True,
     )
     expected_edge_all = _l2_expected_edge_from_gate_dir(
         trade_p_all,
@@ -1888,12 +2220,19 @@ def train_l2_trade_decision(
         size_pred,
         trade_threshold=float(trade_threshold),
         direction_strength=frame.get("l1c_direction_strength"),
+        l1b_edge_proxy=frame.get("l1b_edge_pred"),
+        range_mass=(
+            pd.to_numeric(frame.get("l1a_regime_prob_range_conv", 0.0), errors="coerce").fillna(0.0)
+            + pd.to_numeric(frame.get("l1a_regime_prob_range_div", 0.0), errors="coerce").fillna(0.0)
+        ),
+        regime_entropy=frame.get("l1a_regime_entropy"),
     )
     hard_decision_class, decision_confidence = _l2_hard_decode_prob_aligned_outputs(
         trade_p_all,
         direction_p_all,
         decision_probs,
         trade_threshold=float(trade_threshold),
+        direction_abstain_margin=float(direction_abstain_margin),
     )
     _log_l2_extended_val_metrics(
         frame,
@@ -1912,6 +2251,13 @@ def train_l2_trade_decision(
         true_edge=edge,
         test_mask=test_mask,
     )
+    diag_branch = _l2_edge_diagnosis_branch(expected_edge_all, edge, y_decision, val_report_mask)
+    fail_fast_a3 = os.environ.get("L2_FAIL_FAST_ON_A3", "0").strip().lower() in {"1", "true", "yes"}
+    if diag_branch == "A3" and fail_fast_a3:
+        raise RuntimeError(
+            "L2 P0-A fail-fast triggered: diagnosis_branch=A3 (direction sign and edge formula look consistent, "
+            "but expected_edge remains anti-informative). Continue P0-B/P1-A in parallel and open L1c quality investigation."
+        )
     _log_l2_l1b_masking_audit(
         X,
         feature_cols,
@@ -1924,6 +2270,7 @@ def train_l2_trade_decision(
         gate_calibrator=gate_calibrator,
         direction_calibrator=direction_calibrator,
         trade_threshold=float(trade_threshold),
+        direction_abstain_margin=float(direction_abstain_margin),
     )
     _log_l2_l1b_gain_importance_by_group(gate_model, feature_cols, "trade_gate")
     _log_l2_l1b_gain_importance_by_group(direction_model, feature_cols, "direction")
@@ -1985,15 +2332,22 @@ def train_l2_trade_decision(
         "decision_tau_by_state": decision_tau_by_state,
         "trade_threshold": float(trade_threshold),
         "direction_threshold": 0.5,
+        "direction_abstain_margin": float(direction_abstain_margin),
+        "direction_train_long_prior": float(train_long_prior),
+        "direction_target_long_prior": float(target_long_prior),
         "direction_available": True,
         "direction_head_type": "binary_direction_classifier_conditioned_on_state_and_l1c",
         "confidence_semantics": "probability-aligned; confidence equals the chosen class probability under trade_gate plus binary direction decode",
         "decision_class_semantics": "first infer calibrated trade probability from the retained trade_gate, then choose long vs short from the calibrated binary direction head once the trade threshold is passed",
+        "decision_abstain_semantics": "if trade gate passes but direction confidence |2p-1| is below direction_abstain_margin, abstain to neutral",
         "size_semantics": "formula_from_trade_probability_direction_strength_and_state_context",
-        "expected_edge_semantics": "two-stage expected edge from trade probability, binary direction margin, formula size, and L1c direction strength",
+        "expected_edge_semantics": "two-stage expected edge from trade probability, binary direction margin, formula size, L1c strength, and regime-aware shrinkage (range mass + entropy + L1b edge proxy)",
         "feature_contract_semantics": {
             "state": "L1a contributes regime, volatility, persistence, and embedding context only",
-            "condition": "L1b contributes tradeability, quality, novelty, and cluster context only",
+            "condition": (
+                "L1b contributes tradeability, quality, novelty, and cluster context only; "
+                "no fixed L1B tau constant is assumed (edge features are scale-robust and can consume dynamic tau)"
+            ),
             "direction": "L1c is the only directional owner consumed by L2",
             "residual_other": "PA state and session context features remain as local execution context",
         },
@@ -2010,9 +2364,17 @@ def train_l2_trade_decision(
             "active_probability": "isotonic-calibrated trade_gate output",
             "direction_signal": "calibrated binary direction probability",
             "decode_threshold": float(trade_threshold),
+            "direction_abstain_margin": float(direction_abstain_margin),
         },
         "live_trade_calibration": {"type": "isotonic_trade_gate_only"},
-        "direction_calibration": {"type": "isotonic_binary_direction" if direction_calibrator is not None else "none"},
+        "direction_calibration": {
+            "type": "isotonic_binary_direction" if direction_calibrator is not None else "none",
+            "prior_correction": True,
+            "train_long_prior": float(train_long_prior),
+            "target_long_prior": float(target_long_prior),
+            "abstain_rate_target": float(direction_abstain_target),
+            "abstain_margin": float(direction_abstain_margin),
+        },
         "l2_aux_head_target_prep": {
             "mfe": mfe_head_prep,
             "mae": mae_head_prep,
@@ -2021,14 +2383,19 @@ def train_l2_trade_decision(
         "policy_search": {
             "trade_threshold": float(trade_threshold),
             "target_trade_rate": float(_l2_target_trade_rate()),
+            "direction_abstain_target": float(direction_abstain_target),
+            "direction_abstain_margin": float(direction_abstain_margin),
         },
         "two_stage_policy": {
             "decision_mode": "two_stage_trade_then_direction",
             "trade_threshold": float(trade_threshold),
             "direction_threshold": 0.5,
+            "direction_abstain_margin": float(direction_abstain_margin),
             "policy_search": {
                 "trade_threshold": float(trade_threshold),
                 "target_trade_rate": float(_l2_target_trade_rate()),
+                "direction_abstain_target": float(direction_abstain_target),
+                "direction_abstain_margin": float(direction_abstain_margin),
             },
         },
         "auxiliary_feature_semantics": "frozen L1 features, derived regime context, and explicit state/condition x L1c interactions feed one retained two-stage trade gate plus binary direction path; mfe/mae remain post-decision risk auxiliaries",
@@ -2066,8 +2433,50 @@ def train_l2_trade_decision(
             "trade_threshold": float(trade_threshold),
             "clip_max": 5.0,
             "inputs": ["trade_probability", "direction_margin", "l1c_direction_strength", "l1c_confidence", "l1a_vol_forecast", "l1a_state_persistence"],
+            "mode": size_mode,
+            "active_std_raw": float(std_raw),
+            "min_active_std": float(size_min_std),
+            "bucket_bins": [float(x) for x in size_bins],
+            "bucket_levels": [float(x) for x in size_levels],
+        },
+        "rollback_criteria": {
+            "p1a_abstain": {"rollback_if_gate_auc_drop_gt": 0.01},
+            "p1c_l3_data_expansion": {"rollback_if_exit_auc_drop_gt": 0.02},
+            "p2a_l1b_prune": {"rollback_if_sign_acc_drop_gt": 0.02},
         },
     }
+    meta = attach_threshold_registry(
+        meta,
+        "l2",
+        [
+            threshold_entry(
+                "trade_threshold",
+                float(trade_threshold),
+                category="adaptive_candidate",
+                role="active trade gate cutoff",
+                adaptive_hint="quantile by target trade rate",
+            ),
+            threshold_entry(
+                "direction_abstain_margin",
+                float(direction_abstain_margin),
+                category="adaptive_candidate",
+                role="direction abstain band",
+                adaptive_hint="quantile over active direction confidence",
+            ),
+            threshold_entry(
+                "L2_TARGET_TRADE_RATE",
+                float(_l2_target_trade_rate()),
+                category="adaptive_candidate",
+                role="target active coverage",
+            ),
+            threshold_entry(
+                "L2_SIZE_MIN_ACTIVE_STD",
+                float(size_min_std),
+                category="data_guardrail",
+                role="size collapse detector",
+            ),
+        ],
+    )
     with open(os.path.join(MODEL_DIR, L2_META_FILE), "wb") as f:
         pickle.dump(meta, f)
     cache_path = save_output_cache(outputs, L2_OUTPUT_CACHE_FILE)
@@ -2161,29 +2570,57 @@ def infer_l2_trade_decision(
         direction_m.predict(X).astype(np.float64),
         models.get("direction_calibrator"),
     ).astype(np.float32)
+    direction_p = _l2_direction_prior_corrected_prob(
+        direction_p,
+        train_long_prior=float(meta.get("direction_train_long_prior", 0.5)),
+        target_long_prior=float(meta.get("direction_target_long_prior", 0.5)),
+    )
     trade_thr = float((two_stage_cfg or {}).get("trade_threshold", meta.get("trade_threshold", 0.5)))
+    direction_abstain_margin = float(
+        (two_stage_cfg or {}).get("direction_abstain_margin", meta.get("direction_abstain_margin", 0.0))
+    )
     decision_probs = _l2_compose_probs_from_gate_dir(trade_p, direction_p)
     mfe_pred = _l2_positive_head_predict(models["mfe"], X, aux_prep.get("mfe"), clip_max=5.0)
     mae_pred = _l2_positive_head_predict(models["mae"], X, aux_prep.get("mae"), clip_max=4.0)
-    size_pred = _l2_formula_size_from_context(
+    size_cfg = meta.get("l2_size_formula_config") or {}
+    size_raw = _l2_formula_size_from_context(
         frame,
         trade_p,
         direction_p,
         trade_threshold=trade_thr,
-        clip_max=float((meta.get("l2_size_formula_config") or {}).get("clip_max", 5.0)),
+        clip_max=float(size_cfg.get("clip_max", 5.0)),
     )
+    if str(size_cfg.get("mode", "formula")) == "bucketized_fallback":
+        size_pred, _bins, _levels = _l2_bucketized_size_from_signals(
+            frame,
+            trade_p,
+            direction_p,
+            trade_threshold=trade_thr,
+            fit_mask=None,
+            bins=[float(x) for x in (size_cfg.get("bucket_bins") or [])],
+            levels=[float(x) for x in (size_cfg.get("bucket_levels") or [])] or None,
+        )
+    else:
+        size_pred = size_raw
     expected_edge = _l2_expected_edge_from_gate_dir(
         trade_p,
         direction_p,
         size_pred,
         trade_threshold=trade_thr,
         direction_strength=frame.get("l1c_direction_strength"),
+        l1b_edge_proxy=frame.get("l1b_edge_pred"),
+        range_mass=(
+            pd.to_numeric(frame.get("l1a_regime_prob_range_conv", 0.0), errors="coerce").fillna(0.0)
+            + pd.to_numeric(frame.get("l1a_regime_prob_range_div", 0.0), errors="coerce").fillna(0.0)
+        ),
+        regime_entropy=frame.get("l1a_regime_entropy"),
     )
     hard_decision_class, decision_confidence = _l2_hard_decode_prob_aligned_outputs(
         trade_p,
         direction_p,
         decision_probs,
         trade_threshold=trade_thr,
+        direction_abstain_margin=direction_abstain_margin,
     )
     outputs = df[["symbol", "time_key"]].copy()
     outputs["l2_decision_class"] = hard_decision_class

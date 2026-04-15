@@ -5,6 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from statistics import NormalDist
 from typing import Any
 
 import lightgbm as lgb
@@ -47,7 +48,6 @@ from core.trainers.lgbm_utils import (
     _lgbm_n_jobs,
     _mfe_mae_atr_arrays,
     _numeric_feature_cols_for_matrix,
-    _options_target_config,
 )
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_split
 from core.trainers.val_metrics_extra import brier_binary
@@ -57,6 +57,7 @@ from core.trainers.stack_v2_common import (
     log_label_baseline,
     save_output_cache,
 )
+from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 
 
 L1B_CLUSTER_COLS = [
@@ -88,8 +89,6 @@ L1B_DIRECT_SEMANTIC_COLS = [
 ]
 L1B_RETAINED_DIRECT_SEMANTIC_COLS = [
     "l1b_breakout_quality",
-    "l1b_follow_through_score",
-    "l1b_liquidity_score",
 ]
 L1B_DIAGNOSTIC_ONLY_DIRECT_COLS = [
     col for col in L1B_DIRECT_SEMANTIC_COLS if col not in L1B_RETAINED_DIRECT_SEMANTIC_COLS
@@ -110,7 +109,10 @@ L1B_ATOMIC_SUPERVISED_SOURCES: tuple[tuple[str, str], ...] = (
     ("l1b_atom_pa_hsmm_switch", "pa_hsmm_switch_hazard"),
 )
 L1B_UNSUPERVISED_COLS = list(L1B_CLUSTER_COLS) + list(L1B_LATENT_HEADS)
-L1B_BINARY_HEADS: tuple[str, ...] = ()
+L1B_EXPORT_UNSUPERVISED_COLS = list(L1B_CLUSTER_COLS) + [
+    "l1b_novelty_score",
+    "l1b_regime_change_score",
+]
 L1B_DIRECT_CONTEXT_COLS = [
     "l1b_sector_relative_strength",
     "l1b_correlation_regime",
@@ -120,8 +122,9 @@ L1B_DIRECT_CONTEXT_COLS = [
 L1B_RULE_DIRECT_COLS = list(L1B_DIRECT_SEMANTIC_COLS)
 L1B_EXPORT_DETERMINISTIC_COLS: tuple[str, ...] = tuple(L1B_RETAINED_DIRECT_SEMANTIC_COLS)
 L1B_OUTPUT_COLS = (
-    list(L1B_UNSUPERVISED_COLS)
+    list(L1B_EXPORT_UNSUPERVISED_COLS)
     + list(L1B_SUPERVISED_REGRESSOR_COLS)
+    + ["l1b_edge_candidate_tau"]
     + list(L1B_EXPORT_DETERMINISTIC_COLS)
 )
 
@@ -363,115 +366,6 @@ def _scale_by_train_quantiles(values: np.ndarray, fit_mask: np.ndarray, *, q_low
     lo, hi = _fit_train_quantile_range(values, fit_mask, q_low=q_low, q_high=q_high)
     arr = np.asarray(values, dtype=np.float32)
     return np.clip((arr - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
-
-
-def _build_l1b_candidate_scores(df: pd.DataFrame, direct_outputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    trend = np.maximum(_col_f32(df, "pa_ctx_setup_trend_long"), _col_f32(df, "pa_ctx_setup_trend_short"))
-    pullback = np.maximum(_col_f32(df, "pa_ctx_setup_pullback_long"), _col_f32(df, "pa_ctx_setup_pullback_short"))
-    follow = np.maximum(_col_f32(df, "pa_ctx_follow_through_long"), _col_f32(df, "pa_ctx_follow_through_short"))
-    failed = np.maximum(_col_f32(df, "pa_ctx_setup_failed_breakout_long"), _col_f32(df, "pa_ctx_setup_failed_breakout_short"))
-    premise_break = np.maximum(_col_f32(df, "pa_ctx_premise_break_long"), _col_f32(df, "pa_ctx_premise_break_short"))
-    structure_veto = _col_f32(df, "pa_ctx_structure_veto")
-    range_pressure = _col_f32(df, "pa_ctx_range_pressure")
-    inside = _clip01(_col_f32(df, "bo_inside_prior"))
-    wick = _clip01(_col_f32(df, "bo_wick_imbalance"))
-    close_ext = _clip01(_col_f32(df, "bo_close_extremity"))
-    vol_spike = _clip01(np.clip(_col_f32(df, "bo_vol_spike"), 0.0, 2.0) / 2.0)
-    atr_z = _clip01(np.clip(_col_f32(df, "bo_atr_zscore"), 0.0, 3.0) / 3.0)
-    garch_shock = _clip01(np.clip(_col_f32(df, "pa_garch_shock"), 0.0, 2.0) / 2.0)
-    downside = _clip01((np.clip(_col_f32(df, "pa_egarch_downside_vol_ratio"), 0.8, 2.0) - 0.8) / 1.2)
-    std_resid = _clip01(np.clip(np.abs(_col_f32(df, "pa_egarch_std_residual")), 0.0, 3.0) / 3.0)
-    vol_rvol = _clip01((np.clip(_col_f32(df, "pa_vol_rvol"), 0.5, 2.5) - 0.5) / 2.0)
-
-    pullback_score = _clip01(
-        0.34 * trend
-        + 0.24 * pullback
-        + 0.18 * follow
-        + 0.10 * direct_outputs["l1b_trend_strength"]
-        + 0.08 * inside
-        + 0.06 * (1.0 - 0.5 * structure_veto)
-    )
-    failure_score = _clip01(
-        0.28 * failed
-        + 0.24 * premise_break
-        + 0.18 * structure_veto
-        + 0.12 * wick
-        + 0.10 * garch_shock
-        + 0.08 * atr_z
-    )
-    shock_score = _clip01(
-        0.24 * garch_shock
-        + 0.18 * downside
-        + 0.18 * std_resid
-        + 0.15 * vol_spike
-        + 0.13 * atr_z
-        + 0.12 * vol_rvol
-    )
-    return {
-        "l1b_pullback_setup": pullback_score.astype(np.float32, copy=False),
-        "l1b_failure_risk": failure_score.astype(np.float32, copy=False),
-        "l1b_shock_risk": shock_score.astype(np.float32, copy=False),
-    }
-
-
-def _build_l1b_semantic_binary_targets(
-    raw_targets: dict[str, np.ndarray],
-    candidate_scores: dict[str, np.ndarray],
-    *,
-    train_mask: np.ndarray,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict[str, float]]]:
-    cfg = {
-        "l1b_pullback_setup": {"cand_thr": 0.30, "pos_frac": 0.35},
-        "l1b_failure_risk": {"cand_thr": 0.25, "pos_frac": 0.30},
-        "l1b_shock_risk": {"cand_thr": 0.20, "pos_frac": 0.20},
-    }
-    labels: dict[str, np.ndarray] = {}
-    candidate_masks: dict[str, np.ndarray] = {}
-    meta: dict[str, dict[str, float]] = {}
-    train = np.asarray(train_mask, dtype=bool).ravel()
-    for name, raw in raw_targets.items():
-        cand_score = np.asarray(candidate_scores[name], dtype=np.float32).ravel()
-        cand_thr = float(cfg[name]["cand_thr"])
-        pos_frac = float(cfg[name]["pos_frac"])
-        cand_mask = cand_score >= cand_thr
-        raw_arr = np.asarray(raw, dtype=np.float32).ravel()
-        fit = cand_mask & train & np.isfinite(raw_arr)
-        fit_idx = np.flatnonzero(fit)
-        fit_vals = raw_arr[fit]
-        if fit_vals.size < 50:
-            labels[name] = np.zeros(len(cand_score), dtype=np.float32)
-            candidate_masks[name] = cand_mask.astype(bool)
-            meta[name] = {
-                "candidate_threshold": cand_thr,
-                "positive_fraction": pos_frac,
-                "raw_positive_threshold": float("nan"),
-                "candidate_train_coverage": float(np.mean(cand_mask[train])) if train.any() else 0.0,
-                "candidate_train_rows": float(fit_vals.size),
-                "positive_rate_in_candidate_train": 0.0,
-            }
-            continue
-
-        pos_count = int(round(fit_vals.size * pos_frac))
-        pos_count = int(np.clip(pos_count, 1, max(1, fit_vals.size - 1)))
-        # Break large weak-label ties deterministically so we keep both classes inside the candidate set.
-        order = np.lexsort((fit_idx.astype(np.int64), cand_score[fit], raw_arr[fit]))
-        pos_idx = fit_idx[order[-pos_count:]]
-        y = np.zeros(len(cand_score), dtype=np.float32)
-        y[pos_idx] = 1.0
-        y[~cand_mask] = 0.0
-
-        raw_pos_cutoff = float(raw_arr[pos_idx].min()) if pos_idx.size else float("nan")
-        labels[name] = y
-        candidate_masks[name] = cand_mask.astype(bool)
-        meta[name] = {
-            "candidate_threshold": cand_thr,
-            "positive_fraction": pos_frac,
-            "raw_positive_threshold": raw_pos_cutoff,
-            "candidate_train_coverage": float(np.mean(cand_mask[train])) if train.any() else 0.0,
-            "candidate_train_rows": float(fit_vals.size),
-            "positive_rate_in_candidate_train": float(np.mean(y[fit])) if fit.any() else 0.0,
-        }
-    return labels, candidate_masks, meta
 
 
 def _fit_l1b_latent_block(
@@ -795,192 +689,8 @@ def _apply_l1b_unsupervised_block(df: pd.DataFrame, unsup_meta: dict[str, Any]) 
     return out
 
 
-def _candidate_mask_from_scores(head: str, candidate_scores: dict[str, np.ndarray], candidate_meta: dict[str, dict[str, float]]) -> np.ndarray:
-    score = np.asarray(candidate_scores.get(head, 0.0), dtype=np.float32).ravel()
-    head_meta = candidate_meta.get(head) or {}
-    cand_thr = float(head_meta.get("candidate_threshold", 0.5))
-    return (score >= cand_thr).astype(bool)
-
-
-def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str], bool]:
-    preferred = {
-        "l1b_breakout_quality": [
-            "bo_body_atr",
-            "bo_range_atr",
-            "bo_vol_spike",
-            "bo_close_extremity",
-            "bo_wick_imbalance",
-            "bo_body_growth",
-            "bo_gap_signal",
-            "bo_consec_dir",
-            "bo_or_dist",
-            "bo_atr_zscore",
-            "pa_ctx_follow_through_long",
-            "pa_ctx_follow_through_short",
-            "pa_vol_rvol",
-            "pa_hsmm_switch_hazard",
-            "pa_egarch_std_residual",
-        ],
-        "l1b_mean_reversion_setup": [
-            "pa_ctx_range_pressure",
-            "bo_inside_prior",
-            "bo_bb_width",
-            "bo_or_dist",
-            "pa_struct_swing_range_atr",
-            "pa_vol_zscore_20",
-            "pa_hsmm_duration_norm",
-            "pa_hsmm_switch_hazard",
-        ],
-        "l1b_trend_strength": [
-            "pa_ctx_follow_through_long",
-            "pa_ctx_follow_through_short",
-            "bo_consec_dir",
-            "bo_body_growth",
-            "bo_atr_zscore",
-            "pa_vol_momentum",
-            "pa_lead_macd_hist_slope",
-            "pa_hmm_transition_pressure",
-            "pa_hsmm_switch_hazard",
-        ],
-        "l1b_pullback_setup": [
-            "pa_ctx_setup_trend_long",
-            "pa_ctx_setup_trend_short",
-            "pa_ctx_follow_through_long",
-            "pa_ctx_follow_through_short",
-            "bo_or_dist",
-            "bo_inside_prior",
-            "pa_struct_swing_range_atr",
-            "pa_hsmm_remaining_duration",
-            "pa_ctx_range_pressure",
-            "bo_bb_width",
-            "pa_hmm_transition_pressure",
-            "pa_egarch_std_residual",
-        ],
-        "l1b_range_reversal_setup": [
-            "pa_ctx_range_pressure",
-            "bo_inside_prior",
-            "bo_bb_width",
-            "bo_or_dist",
-            "bo_close_extremity",
-            "pa_vol_absorption_bull",
-            "pa_vol_absorption_bear",
-            "pa_hsmm_duration_percentile",
-        ],
-        "l1b_failed_breakout_setup": [
-            "bo_wick_imbalance",
-            "bo_close_extremity",
-            "bo_gap_signal",
-            "pa_ctx_premise_break_long",
-            "pa_ctx_premise_break_short",
-            "pa_garch_shock",
-            "pa_egarch_vol_asymmetry",
-            "pa_hmm_transition_pressure",
-            "pa_ctx_structure_veto",
-        ],
-        "l1b_setup_alignment": [
-            "pa_ctx_setup_long",
-            "pa_ctx_setup_short",
-            "pa_ctx_follow_through_long",
-            "pa_ctx_follow_through_short",
-            "pa_ctx_premise_break_long",
-            "pa_ctx_premise_break_short",
-            "pa_ctx_structure_veto",
-            "pa_hsmm_switch_hazard",
-            "pa_hsmm_remaining_duration",
-            "pa_egarch_std_residual",
-        ],
-        "l1b_follow_through_score": [
-            "bo_consec_dir",
-            "bo_body_growth",
-            "bo_close_extremity",
-            "pa_vol_rvol",
-            "pa_vol_momentum",
-            "pa_lead_macd_hist_slope",
-            "pa_hsmm_switch_hazard",
-            "pa_egarch_std_residual",
-            "bo_gap_signal",
-            "bo_body_atr",
-        ],
-        "l1b_failure_risk": [
-            "pa_ctx_premise_break_long",
-            "pa_ctx_premise_break_short",
-            "pa_ctx_structure_veto",
-            "pa_ctx_range_pressure",
-            "bo_wick_imbalance",
-            "pa_garch_shock",
-            "pa_egarch_downside_vol_ratio",
-            "pa_hsmm_switch_hazard",
-            "pa_hmm_transition_pressure",
-            "bo_atr_zscore",
-        ],
-        "l1b_shock_risk": [
-            "pa_garch_shock",
-            "pa_garch_vol",
-            "pa_garch_vol_of_vol",
-            "pa_egarch_leverage_effect",
-            "pa_egarch_downside_vol_ratio",
-            "pa_egarch_vol_asymmetry",
-            "pa_egarch_std_residual",
-            "pa_hsmm_switch_hazard",
-            "pa_hsmm_duration_norm",
-            "bo_atr_zscore",
-            "bo_vol_spike",
-            "pa_vol_zscore_20",
-            "pa_hmm_transition_pressure",
-            "pa_vol_evr_ratio",
-            "bo_range_atr",
-            "bo_body_atr",
-            "pa_vol_rvol",
-            "pa_vol_momentum",
-            "pa_ctx_range_pressure",
-            "pa_ctx_structure_veto",
-            "pa_ctx_premise_break_long",
-            "pa_ctx_premise_break_short",
-        ],
-        "l1b_liquidity_score": [
-            "pa_vol_rvol",
-            "bo_wick_imbalance",
-            "bo_body_atr",
-            "bo_range_atr",
-            "bo_close_extremity",
-            "pa_vol_absorption_bull",
-            "pa_vol_absorption_bear",
-            "pa_vol_evr_ratio",
-            "pa_vol_exhaustion_climax",
-            "pa_egarch_std_residual",
-        ],
-    }.get(head)
-    if preferred is None:
-        return list(feature_cols), False
-    chosen = [c for c in preferred if c in feature_cols]
-    min_features = min(8, max(5, len(preferred) // 2))
-    if len(chosen) >= min_features:
-        return chosen, False
-    safe_fallback = [
-        c
-        for c in feature_cols
-        if c
-        not in {
-            "pa_ctx_setup_long",
-            "pa_ctx_setup_short",
-            "pa_ctx_setup_trend_long",
-            "pa_ctx_setup_trend_short",
-            "pa_ctx_setup_pullback_long",
-            "pa_ctx_setup_pullback_short",
-            "pa_ctx_setup_range_long",
-            "pa_ctx_setup_range_short",
-            "pa_ctx_setup_failed_breakout_long",
-            "pa_ctx_setup_failed_breakout_short",
-            "pa_ctx_follow_through_long",
-            "pa_ctx_follow_through_short",
-        }
-    ]
-    augmented = list(dict.fromkeys(chosen + safe_fallback[: max(0, min_features - len(chosen) + 4)]))
-    return augmented, True
-
-
 def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
-    """Heuristic PA/BO condition composites exported as L1b condition heads."""
+    """Heuristic PA/BO condition composites; only a slim tradeability subset is exported."""
     setup_long = _col_f32(df, "pa_ctx_setup_long")
     setup_short = _col_f32(df, "pa_ctx_setup_short")
     trend_long = _col_f32(df, "pa_ctx_setup_trend_long")
@@ -1045,80 +755,6 @@ def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray
         "l1b_follow_through_score": follow_through_score.astype(np.float32, copy=False),
         "l1b_liquidity_score": liquidity_score.astype(np.float32, copy=False),
     }
-
-
-def _build_l1b_targets(
-    df: pd.DataFrame,
-    *,
-    fit_mask: np.ndarray | None = None,
-) -> tuple[
-    dict[str, np.ndarray],
-    dict[str, np.ndarray],
-    dict[str, np.ndarray],
-    dict[str, np.ndarray],
-    dict[str, dict[str, float]],
-    dict[str, np.ndarray],
-    pd.DataFrame,
-]:
-    direct_outputs = _build_l1b_direct_semantic_outputs(df)
-    edge = np.clip(_decision_edge_atr_array(df), -4.0, 4.0).astype(np.float32)
-    mfe, mae = _mfe_mae_atr_arrays(df)
-    mfe = np.clip(mfe, 0.0, 5.0).astype(np.float32)
-    mae = np.clip(mae, 0.0, 4.0).astype(np.float32)
-    cfg = _options_target_config()
-    horizon = float(max(int(cfg["decision_horizon_bars"]), 1))
-    if "decision_peak_bar" in df.columns:
-        peak_bar = pd.to_numeric(df["decision_peak_bar"], errors="coerce").fillna(horizon).to_numpy(dtype=np.float32)
-    else:
-        peak_bar = np.full(len(df), horizon, dtype=np.float32)
-    peak_bar = np.clip(peak_bar, 1.0, horizon)
-    peak_frac = np.clip(peak_bar / horizon, 0.0, 1.0).astype(np.float32)
-    late_peak_bonus = np.clip((peak_frac - 0.25) / 0.75, 0.0, 1.0).astype(np.float32)
-    early_peak_bonus = np.clip(1.0 - peak_frac, 0.0, 1.0).astype(np.float32)
-    rr = mfe / np.maximum(mae, 0.10)
-    pullback_raw = (
-        0.52 * np.clip(edge, -1.0, 3.0)
-        + 0.18 * np.clip(rr - 1.0, -1.0, 2.0)
-        + 0.15 * late_peak_bonus
-        - 0.20 * np.clip(mae, 0.0, 3.0)
-        + 0.08 * np.clip(mfe, 0.0, 4.0)
-    ).astype(np.float32)
-    failure_raw = (
-        0.54 * np.clip(-edge, -1.0, 3.0)
-        + 0.24 * np.clip(mae, 0.0, 3.0)
-        + 0.14 * np.clip(1.25 - rr, -1.0, 1.5)
-        + 0.08 * early_peak_bonus
-        + 0.06 * np.clip(np.abs(edge), 0.0, 3.0)
-    ).astype(np.float32)
-    shock_raw = (
-        0.32 * np.clip(mfe + mae, 0.0, 6.0)
-        + 0.24 * np.clip(np.abs(edge), 0.0, 4.0)
-        + 0.18 * np.clip(mae, 0.0, 4.0)
-        + 0.15 * early_peak_bonus
-        + 0.11 * np.clip(np.abs(mfe - mae), 0.0, 4.0)
-    ).astype(np.float32)
-    raw_targets = {
-        "l1b_pullback_setup": pullback_raw,
-        "l1b_failure_risk": failure_raw,
-        "l1b_shock_risk": shock_raw,
-    }
-    fit = np.asarray(fit_mask if fit_mask is not None else np.ones(len(df), dtype=bool), dtype=bool)
-    candidate_scores = _build_l1b_candidate_scores(df, direct_outputs)
-    targets, candidate_masks, target_meta = _build_l1b_semantic_binary_targets(
-        raw_targets,
-        candidate_scores,
-        train_mask=fit,
-    )
-    cross = compute_cross_asset_context(df)
-    cross.index = df.index
-    cross = cross.rename(
-        columns={
-            "sector_relative_strength": "l1b_sector_relative_strength",
-            "correlation_regime": "l1b_correlation_regime",
-            "market_breadth": "l1b_market_breadth",
-        }
-    )
-    return raw_targets, targets, candidate_scores, candidate_masks, target_meta, direct_outputs, cross
 
 
 def _compute_l1b_deterministic_outputs(
@@ -1232,134 +868,6 @@ def _log_l1b_semantic_head_diagnostics(
             _one_split(col, hv, val, "val")
 
 
-def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray, *, binary: bool | None = None) -> None:
-    """Validation metrics on calibration split (train=pre-CAL_END, val=cal window)."""
-    y_t = np.asarray(y_t, dtype=np.float64).ravel()
-    y_p = np.asarray(y_p, dtype=np.float64).ravel()
-    n = len(y_t)
-    print(f"\n  [L1b] val — {head}  (n={n:,})", flush=True)
-    if n < 5:
-        print("    (skip: too few val rows)", flush=True)
-        return
-
-    if binary is None:
-        binary = head in L1B_BINARY_HEADS
-
-    if binary:
-        yi = np.clip(np.round(y_t), 0, 1).astype(np.int32)
-        y_pc = np.clip(y_p, 1e-7, 1.0 - 1e-7)
-        try:
-            auc = float(roc_auc_score(yi, y_p))
-        except ValueError:
-            auc = float("nan")
-        try:
-            ll = float(log_loss(yi, y_pc))
-        except ValueError:
-            ll = float("nan")
-        yhat = (y_p >= 0.5).astype(np.int32)
-        cm = confusion_matrix(yi, yhat, labels=[0, 1])
-        br = brier_binary(yi.astype(np.float64), y_p)
-        print(
-            f"    AUC={auc:.4f}  log_loss={ll:.4f}  Brier={br:.4f}  acc@0.5={accuracy_score(yi, yhat):.4f}  "
-            f"precision={precision_score(yi, yhat, zero_division=0):.4f}  "
-            f"recall={recall_score(yi, yhat, zero_division=0):.4f}  "
-            f"F1={f1_score(yi, yhat, zero_division=0):.4f}",
-            flush=True,
-        )
-        print(f"    confusion [[TN FP][FN TP]]:\n    {cm}", flush=True)
-        return
-
-    mae = float(mean_absolute_error(y_t, y_p))
-    rmse = float(np.sqrt(mean_squared_error(y_t, y_p)))
-    r2 = float(r2_score(y_t, y_p)) if len(np.unique(y_t)) > 1 else float("nan")
-    cor = _corr1d(y_t, y_p)
-    print(f"    MAE={mae:.4f}  RMSE={rmse:.4f}  R2={r2:.4f}  corr(y,pred)={cor:.4f}", flush=True)
-
-
-def _log_l1b_target_diagnostics(
-    head: str,
-    raw_target: np.ndarray,
-    shaped_target: np.ndarray,
-    *,
-    train_mask: np.ndarray,
-) -> None:
-    def _summarize(arr: np.ndarray, *, decimals: int = 6) -> tuple[int, int, float, float, list[tuple[float, float]]]:
-        vals = np.asarray(arr, dtype=np.float64).ravel()
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            return 0, 0, 0.0, 0.0, []
-        rounded = np.round(vals, decimals=decimals)
-        uniq_exact = int(np.unique(vals).size)
-        uniq_round = int(np.unique(rounded).size)
-        uniq_vals, counts = np.unique(rounded, return_counts=True)
-        order = np.argsort(counts)[::-1]
-        counts = counts[order]
-        uniq_vals = uniq_vals[order]
-        top1_share = float(counts[0] / vals.size) if counts.size else 0.0
-        top3_share = float(counts[:3].sum() / vals.size) if counts.size else 0.0
-        top_vals = [
-            (float(uniq_vals[i]), float(counts[i] / vals.size))
-            for i in range(min(3, counts.size))
-        ]
-        return uniq_exact, uniq_round, top1_share, top3_share, top_vals
-
-    tm = np.asarray(train_mask, dtype=bool).ravel()
-    raw = np.asarray(raw_target, dtype=np.float32).ravel()[tm]
-    shaped = np.asarray(shaped_target, dtype=np.float32).ravel()[tm]
-    raw_unique, raw_round_unique, raw_top1, raw_top3, raw_top_vals = _summarize(raw)
-    shp_unique, shp_round_unique, shp_top1, shp_top3, shp_top_vals = _summarize(shaped)
-    print(f"  [L1b] target diagnostic — {head} [train]", flush=True)
-    print(
-        f"    raw:    unique={raw_unique:,}  rounded6_unique={raw_round_unique:,}  "
-        f"top1_share={raw_top1:.3f}  top3_share={raw_top3:.3f}",
-        flush=True,
-    )
-    if raw_top_vals:
-        print(
-            f"    raw top rounded values: {[(round(v, 6), round(s, 3)) for v, s in raw_top_vals]}",
-            flush=True,
-        )
-    print(
-        f"    shaped: unique={shp_unique:,}  rounded6_unique={shp_round_unique:,}  "
-        f"top1_share={shp_top1:.3f}  top3_share={shp_top3:.3f}",
-        flush=True,
-    )
-    if shp_top_vals:
-        print(
-            f"    shaped top rounded values: {[(round(v, 6), round(s, 3)) for v, s in shp_top_vals]}",
-            flush=True,
-        )
-    if shp_round_unique <= 8 or shp_top3 >= 0.80:
-        print(
-            "    WARNING: shaped target is highly concentrated; consider classification/ordinal labels or less aggressive shaping.",
-            flush=True,
-        )
-
-
-def _log_l1b_candidate_diagnostics(
-    head: str,
-    candidate_score: np.ndarray,
-    candidate_mask: np.ndarray,
-    labels: np.ndarray,
-    *,
-    train_mask: np.ndarray,
-) -> None:
-    train = np.asarray(train_mask, dtype=bool).ravel()
-    cand = np.asarray(candidate_mask, dtype=bool).ravel()
-    score = np.asarray(candidate_score, dtype=np.float32).ravel()
-    y = np.asarray(labels, dtype=np.float32).ravel()
-    cand_train = cand & train
-    coverage = float(np.mean(cand_train)) if train.any() else 0.0
-    pos_rate = float(np.mean(y[cand_train])) if cand_train.any() else 0.0
-    score_pcts = np.percentile(score[train], [5, 25, 50, 75, 95]).tolist() if train.any() else [0.0] * 5
-    print(f"  [L1b] candidate diagnostic — {head} [train]", flush=True)
-    print(
-        f"    coverage={coverage:.3f}  candidate_rows={int(np.sum(cand_train)):,}  "
-        f"positive_rate_in_candidate={pos_rate:.3f}  score_pcts={np.round(score_pcts, 4).tolist()}",
-        flush=True,
-    )
-
-
 def _l1b_edge_dq_lgb_params() -> dict[str, Any]:
     fast = FAST_TRAIN_MODE
     return {
@@ -1377,6 +885,126 @@ def _l1b_edge_dq_lgb_params() -> dict[str, Any]:
         "verbosity": -1,
         "seed": 42,
         "n_jobs": _lgbm_n_jobs(),
+    }
+
+
+def _l1b_edge_candidate_tau() -> float:
+    return float(np.clip(float(os.environ.get("L1B_EDGE_CANDIDATE_TAU", "0.05")), 0.0, 1.0))
+
+
+def _l1b_robust_sigma(values: np.ndarray) -> tuple[float, float, float]:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0, 0.0, 0.0
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med)))
+    sigma = float(mad / 0.67448975) if mad > 0 else 0.0
+    return med, mad, sigma
+
+
+def _l1b_excess_kurtosis(values: np.ndarray) -> float:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size < 8:
+        return float("nan")
+    centered = vals - float(np.mean(vals))
+    v2 = float(np.mean(centered ** 2))
+    if not np.isfinite(v2) or v2 <= 1e-12:
+        return float("nan")
+    v4 = float(np.mean(centered ** 4))
+    return float(v4 / (v2 * v2) - 3.0)
+
+
+def _l1b_signflip_bootstrap_tau(values: np.ndarray, *, alpha: float, rounds: int) -> float:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0
+    rng = np.random.default_rng(int(os.environ.get("L1B_EDGE_TAU_BOOTSTRAP_SEED", "42")))
+    stats = np.empty(max(100, rounds), dtype=np.float64)
+    abs_vals = np.abs(vals)
+    for i in range(stats.size):
+        signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float64), size=vals.size, replace=True)
+        shuffled = abs_vals * signs
+        _, _, sigma = _l1b_robust_sigma(shuffled)
+        stats[i] = max(0.0, float(np.mean(np.abs(shuffled)) + sigma))
+    q = float(np.quantile(stats[np.isfinite(stats)], max(0.50, 1.0 - alpha))) if np.isfinite(stats).any() else 0.0
+    return float(max(0.0, q))
+
+
+def _l1b_formula_edge_tau(values: np.ndarray) -> tuple[float, dict[str, Any]]:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    mode = (os.environ.get("L1B_EDGE_TAU_MODE", "hybrid") or "hybrid").strip().lower()
+    alpha = float(np.clip(float(os.environ.get("L1B_EDGE_TAU_ALPHA", "0.05")), 1e-4, 0.20))
+    min_n = int(max(50, round(float(os.environ.get("L1B_EDGE_TAU_MIN_N", "200")))))
+    rounds = int(max(100, round(float(os.environ.get("L1B_EDGE_TAU_BOOTSTRAP_ROUNDS", "600")))))
+    kurt_thr = float(max(0.0, float(os.environ.get("L1B_EDGE_TAU_HEAVY_TAIL_KURT", "8.0"))))
+    p_thr = float(np.clip(float(os.environ.get("L1B_EDGE_TAU_KURTOSIS_P", "0.05")), 1e-4, 0.20))
+    meta: dict[str, Any] = {
+        "edge_candidate_tau_mode": mode,
+        "edge_candidate_tau_alpha": float(alpha),
+        "edge_candidate_tau_fit_samples": int(vals.size),
+        "edge_candidate_tau_bootstrap_rounds": int(rounds),
+    }
+    if vals.size == 0:
+        meta.update({"edge_candidate_tau_method": "fixed", "edge_candidate_tau_fallback_reason": "no_finite_values"})
+        return _l1b_edge_candidate_tau(), meta
+    _, mad, sigma = _l1b_robust_sigma(vals)
+    z = float(NormalDist().inv_cdf(1.0 - alpha / 2.0))
+    mad_tau = float(np.clip(z * max(sigma, 1e-8), 1e-6, 5.0))
+    ex_kurt = _l1b_excess_kurtosis(vals)
+    jb_stat = float(vals.size / 24.0 * (ex_kurt ** 2)) if np.isfinite(ex_kurt) else float("nan")
+    jb_p = float(np.exp(-0.5 * jb_stat)) if np.isfinite(jb_stat) else float("nan")
+    heavy_tail = bool((np.isfinite(ex_kurt) and ex_kurt > kurt_thr) or (np.isfinite(jb_p) and jb_p < p_thr))
+    low_n = vals.size < min_n
+    use_bootstrap = mode == "bootstrap" or (mode == "hybrid" and (low_n or heavy_tail))
+    if mode == "mad_z":
+        use_bootstrap = False
+    tau = _l1b_signflip_bootstrap_tau(vals, alpha=alpha, rounds=rounds) if use_bootstrap else mad_tau
+    if mode == "hybrid" and use_bootstrap:
+        reason = "low_n" if low_n else "heavy_tail"
+    elif mode == "bootstrap":
+        reason = "forced_bootstrap"
+    elif mode == "mad_z":
+        reason = "forced_mad_z"
+    else:
+        reason = "mad_z_ok"
+    meta.update(
+        {
+            "edge_candidate_tau_method": "bootstrap" if use_bootstrap else "mad_z",
+            "edge_candidate_tau": float(np.clip(tau, 1e-6, 5.0)),
+            "edge_candidate_tau_fallback_reason": reason,
+            "edge_candidate_tau_sigma_robust": float(sigma),
+            "edge_candidate_tau_mad": float(mad),
+            "edge_candidate_tau_z": float(z),
+            "edge_candidate_tau_excess_kurtosis": float(ex_kurt) if np.isfinite(ex_kurt) else float("nan"),
+            "edge_candidate_tau_kurtosis_pvalue": float(jb_p) if np.isfinite(jb_p) else float("nan"),
+            "edge_candidate_tau_statistical_principle": "two_sided_significance_with_robust_scale",
+        }
+    )
+    return float(np.clip(tau, 1e-6, 5.0)), meta
+
+
+def _l1b_edge_candidate_lgb_params() -> dict[str, Any]:
+    fast = FAST_TRAIN_MODE
+    return {
+        "objective": "binary",
+        "metric": ["auc", "binary_logloss"],
+        "learning_rate": 0.08 if fast else 0.05,
+        "num_leaves": 31 if fast else 63,
+        "max_depth": -1,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "min_child_samples": 25 if fast else 40,
+        "lambda_l1": 0.1,
+        "lambda_l2": 1.0,
+        "verbosity": -1,
+        "seed": 42,
+        "n_jobs": _lgbm_n_jobs(),
+        "is_unbalance": True,
     }
 
 
@@ -1495,6 +1123,92 @@ def _l1b_fit_lgb_regressor(
     return booster
 
 
+def _l1b_fit_lgb_binary_classifier(
+    label: str,
+    y: np.ndarray,
+    X: np.ndarray,
+    feature_cols: list[str],
+    *,
+    train_mask: np.ndarray,
+    val_mask: np.ndarray,
+    out_path: str,
+    label_row_ok: np.ndarray | None = None,
+    sample_weight: np.ndarray | None = None,
+) -> lgb.Booster:
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    val = np.asarray(val_mask, dtype=bool).ravel()
+    y = np.asarray(y, dtype=np.int32).ravel()
+    if label_row_ok is None:
+        label_row_ok = np.ones(len(y), dtype=bool)
+    else:
+        label_row_ok = np.asarray(label_row_ok, dtype=bool).ravel()
+    row_ok = np.all(np.isfinite(X), axis=1) & label_row_ok & np.isfinite(y.astype(np.float64))
+    if sample_weight is None:
+        sample_weight = np.ones(len(y), dtype=np.float32)
+    else:
+        sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
+        if sample_weight.shape[0] != len(y):
+            raise ValueError(f"L1b {label}: sample_weight length mismatch.")
+    fit_tr = train & row_ok
+    fit_val = val & row_ok
+    rounds, es_rounds = _l1b_edge_dq_train_config()
+    params = _l1b_edge_candidate_lgb_params()
+    if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_val)) < 20:
+        raise RuntimeError(
+            f"L1b {label}: insufficient rows for binary classifier "
+            f"(train={int(np.sum(fit_tr))}, val={int(np.sum(fit_val))})."
+        )
+    dtrain = lgb.Dataset(
+        X[fit_tr],
+        label=y[fit_tr],
+        weight=sample_weight[fit_tr],
+        feature_name=feature_cols,
+        free_raw_data=False,
+    )
+    dval = lgb.Dataset(
+        X[fit_val],
+        label=y[fit_val],
+        weight=sample_weight[fit_val],
+        feature_name=feature_cols,
+        free_raw_data=False,
+    )
+    cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds, f"[L1b] {label}", first_metric_only=True)
+    try:
+        booster = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=rounds,
+            valid_sets=[dval],
+            callbacks=cbs,
+        )
+    finally:
+        for fn in cl:
+            fn()
+    booster.save_model(out_path)
+    pred_v = np.clip(booster.predict(X[fit_val]).astype(np.float64), 1e-7, 1.0 - 1e-7)
+    y_v = y[fit_val].astype(np.int32)
+    try:
+        auc = float(roc_auc_score(y_v, pred_v))
+    except ValueError:
+        auc = float("nan")
+    try:
+        ll = float(log_loss(y_v, pred_v))
+    except ValueError:
+        ll = float("nan")
+    yhat = (pred_v >= 0.5).astype(np.int32)
+    br = brier_binary(y_v.astype(np.float64), pred_v)
+    print(
+        f"  [L1b] {label} booster: val_AUC={auc:.4f}  val_log_loss={ll:.4f}  Brier={br:.4f}  "
+        f"val_acc@0.5={accuracy_score(y_v, yhat):.4f}  "
+        f"precision={precision_score(y_v, yhat, zero_division=0):.4f}  "
+        f"recall={recall_score(y_v, yhat, zero_division=0):.4f}  "
+        f"F1={f1_score(y_v, yhat, zero_division=0):.4f}  val_n={int(np.sum(fit_val)):,}  "
+        f"train_n={int(np.sum(fit_tr)):,}  -> {out_path}",
+        flush=True,
+    )
+    return booster
+
+
 def _fit_l1b_edge_dq_boosters(
     work: pd.DataFrame,
     feature_cols: list[str],
@@ -1504,6 +1218,44 @@ def _fit_l1b_edge_dq_boosters(
 ) -> tuple[dict[str, lgb.Booster], dict[str, str], dict[str, np.ndarray], dict[str, Any]]:
     edge_signed = np.clip(_decision_edge_atr_array(work), -5.0, 5.0).astype(np.float64)
     edge_tgt = np.abs(edge_signed).astype(np.float64)
+    tm = np.asarray(train_mask, dtype=bool).ravel()
+    fit = tm & np.isfinite(edge_tgt)
+    fit_n = int(np.sum(fit))
+    legacy_mode = (os.environ.get("L1B_EDGE_CANDIDATE_TAU_MODE", "") or "").strip().lower()
+    tau_meta: dict[str, Any]
+    if legacy_mode == "quantile":
+        edge_candidate_tau = _l1b_edge_candidate_tau()
+        q = float(np.clip(float(os.environ.get("L1B_EDGE_CANDIDATE_TAU_Q", "0.70")), 0.50, 0.95))
+        if np.any(fit):
+            edge_candidate_tau = float(np.quantile(edge_tgt[fit], q))
+            edge_candidate_tau = float(np.clip(edge_candidate_tau, 0.01, 1.0))
+        tau_meta = {
+            "edge_candidate_tau_mode": "quantile",
+            "edge_candidate_tau_method": "quantile",
+            "edge_candidate_tau_alpha": float("nan"),
+            "edge_candidate_tau_fit_samples": fit_n,
+            "edge_candidate_tau_bootstrap_rounds": 0,
+            "edge_candidate_tau_fallback_reason": "legacy_quantile_mode",
+            "edge_candidate_tau_sigma_robust": float("nan"),
+            "edge_candidate_tau_mad": float("nan"),
+            "edge_candidate_tau_z": float("nan"),
+            "edge_candidate_tau_excess_kurtosis": float("nan"),
+            "edge_candidate_tau_kurtosis_pvalue": float("nan"),
+            "edge_candidate_tau_statistical_principle": "quantile_clip",
+        }
+        print(
+            f"  [L1b] edge candidate tau: mode=quantile  q={q:.3f}  tau={edge_candidate_tau:.4f}",
+            flush=True,
+        )
+    else:
+        edge_candidate_tau, tau_meta = _l1b_formula_edge_tau(edge_tgt[fit])
+        print(
+            f"  [L1b] edge candidate tau: mode={tau_meta.get('edge_candidate_tau_mode')}  "
+            f"method={tau_meta.get('edge_candidate_tau_method')}  tau={edge_candidate_tau:.4f}  "
+            f"fit_n={fit_n:,}  fallback={tau_meta.get('edge_candidate_tau_fallback_reason')}",
+            flush=True,
+        )
+    edge_candidate_tgt = (edge_tgt > edge_candidate_tau).astype(np.int32)
     mfe, mae = _mfe_mae_atr_arrays(work)
     mode = (os.environ.get("L1B_DQ_TARGET_MODE", "path_balance") or "path_balance").strip().lower()
     mfe_c = np.clip(np.asarray(mfe, dtype=np.float64), 0.0, 8.0)
@@ -1535,21 +1287,35 @@ def _fit_l1b_edge_dq_boosters(
             "target_semantics='absolute edge magnitude only'",
             flush=True,
         )
+    log_label_baseline("l1b_edge_candidate", edge_candidate_tgt[tm & edge_label_ok], task="cls")
     log_label_baseline("l1b_edge_target", edge_tgt[tm & edge_label_ok], task="reg")
     log_label_baseline("l1b_dq_target", dq_tgt[tm & dq_label_ok], task="reg")
     models: dict[str, lgb.Booster] = {}
     model_files: dict[str, str] = {}
-    edge_path = os.path.join(MODEL_DIR, L1B_EDGE_PRED_FILE)
+    edge_candidate_row_ok = edge_label_ok & np.isfinite(edge_tgt)
+    edge_quality_row_ok = edge_label_ok & np.isfinite(edge_tgt) & (edge_tgt > edge_candidate_tau)
+    edge_candidate_path = os.path.join(MODEL_DIR, "l1b_edge_candidate.txt")
+    edge_quality_path = os.path.join(MODEL_DIR, L1B_EDGE_PRED_FILE)
     dq_path = os.path.join(MODEL_DIR, L1B_DQ_PRED_FILE)
-    models["l1b_edge_pred"] = _l1b_fit_lgb_regressor(
-        "l1b_edge_pred",
+    models["l1b_edge_candidate_model"] = _l1b_fit_lgb_binary_classifier(
+        "l1b_edge_candidate",
+        edge_candidate_tgt,
+        X,
+        feature_cols,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        out_path=edge_candidate_path,
+        label_row_ok=edge_candidate_row_ok,
+    )
+    models["l1b_edge_quality_model"] = _l1b_fit_lgb_regressor(
+        "l1b_edge_quality",
         edge_tgt,
         X,
         feature_cols,
         train_mask=train_mask,
         val_mask=val_mask,
-        out_path=edge_path,
-        label_row_ok=edge_label_ok,
+        out_path=edge_quality_path,
+        label_row_ok=edge_quality_row_ok,
     )
     models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
         "l1b_dq_pred",
@@ -1561,22 +1327,65 @@ def _fit_l1b_edge_dq_boosters(
         out_path=dq_path,
         label_row_ok=dq_label_ok,
     )
-    model_files["l1b_edge_pred"] = L1B_EDGE_PRED_FILE
+    model_files["l1b_edge_candidate_model"] = "l1b_edge_candidate.txt"
+    model_files["l1b_edge_quality_model"] = L1B_EDGE_PRED_FILE
     model_files["l1b_dq_pred"] = L1B_DQ_PRED_FILE
+    edge_candidate_prob = np.clip(models["l1b_edge_candidate_model"].predict(X).astype(np.float64), 0.0, 1.0)
+    edge_quality_pred = np.clip(models["l1b_edge_quality_model"].predict(X).astype(np.float64), edge_candidate_tau, 5.0)
+    edge_tradeability = np.clip(edge_candidate_prob * edge_quality_pred, 0.0, 5.0)
     preds = {
-        "l1b_edge_pred": np.clip(models["l1b_edge_pred"].predict(X), 0.0, 5.0).astype(np.float32),
+        "l1b_edge_pred": edge_tradeability.astype(np.float32),
         "l1b_dq_pred": np.clip(
             models["l1b_dq_pred"].predict(X).astype(np.float64),
             dq_clip_lo,
             dq_clip_hi,
         ).astype(np.float32),
+        "l1b_edge_candidate_tau": np.full(len(work), float(edge_candidate_tau), dtype=np.float32),
     }
+    vm_edge = np.asarray(val_mask, dtype=bool).ravel() & edge_label_ok & np.isfinite(edge_tgt)
+    vm_pos = vm_edge & (edge_tgt > edge_candidate_tau)
+    if int(np.sum(vm_edge)) >= 30:
+        combined_corr = _corr1d(edge_tgt[vm_edge], edge_tradeability[vm_edge])
+        print(
+            f"  [L1b] l1b_edge_pred staged val: all_rows={int(np.sum(vm_edge)):,}  "
+            f"corr={combined_corr:.4f}  candidate_tau={edge_candidate_tau:.4f}",
+            flush=True,
+        )
+    if int(np.sum(vm_pos)) >= 30:
+        quality_corr = _corr1d(edge_tgt[vm_pos], edge_quality_pred[vm_pos])
+        combined_pos_corr = _corr1d(edge_tgt[vm_pos], edge_tradeability[vm_pos])
+        candidate_recall = float(np.mean(edge_candidate_prob[vm_pos] >= 0.5))
+        print(
+            f"  [L1b] l1b_edge_pred staged val (true_edge>tau): rows={int(np.sum(vm_pos)):,}  "
+            f"quality_corr={quality_corr:.4f}  blended_corr={combined_pos_corr:.4f}  "
+            f"candidate_recall@0.5={candidate_recall:.4f}",
+            flush=True,
+        )
     block_meta = {
         "targets": {
-            "l1b_edge_pred": "clip(abs(decision_net_edge_atr or mfe*theta - penalty*mae), 0..5) ATR opportunity magnitude",
+            "l1b_edge_candidate_model": f"1[clip(abs(edge),0..5) > {edge_candidate_tau:g}] opportunity candidate classifier",
+            "l1b_edge_quality_model": f"clip(abs(edge),0..5) ATR opportunity magnitude on candidate rows edge>{edge_candidate_tau:g}",
+            "l1b_edge_pred": f"P(edge>{edge_candidate_tau:g}) * E[abs(edge)|candidate] staged tradeability score",
             "l1b_dq_pred": dq_desc,
         },
-        "edge_target_semantics": "absolute edge magnitude only; no directional sign",
+        "edge_target_semantics": "staged tradeability score = opportunity probability times positive-edge magnitude; no directional sign",
+        "edge_model_type": "staged_tradeability",
+        "edge_candidate_tau": float(edge_candidate_tau),
+        "edge_candidate_tau_mode": str(tau_meta.get("edge_candidate_tau_mode", "hybrid")),
+        "edge_candidate_tau_method": str(tau_meta.get("edge_candidate_tau_method", "mad_z")),
+        "edge_candidate_tau_alpha": float(tau_meta.get("edge_candidate_tau_alpha", float("nan"))),
+        "edge_candidate_tau_fit_samples": int(tau_meta.get("edge_candidate_tau_fit_samples", fit_n)),
+        "edge_candidate_tau_bootstrap_rounds": int(tau_meta.get("edge_candidate_tau_bootstrap_rounds", 0)),
+        "edge_candidate_tau_fallback_reason": str(tau_meta.get("edge_candidate_tau_fallback_reason", "")),
+        "edge_candidate_tau_sigma_robust": float(tau_meta.get("edge_candidate_tau_sigma_robust", float("nan"))),
+        "edge_candidate_tau_mad": float(tau_meta.get("edge_candidate_tau_mad", float("nan"))),
+        "edge_candidate_tau_z": float(tau_meta.get("edge_candidate_tau_z", float("nan"))),
+        "edge_candidate_tau_excess_kurtosis": float(tau_meta.get("edge_candidate_tau_excess_kurtosis", float("nan"))),
+        "edge_candidate_tau_kurtosis_pvalue": float(tau_meta.get("edge_candidate_tau_kurtosis_pvalue", float("nan"))),
+        "edge_candidate_tau_statistical_principle": str(
+            tau_meta.get("edge_candidate_tau_statistical_principle", "two_sided_significance_with_robust_scale")
+        ),
+        "edge_pred_clip": [0.0, 5.0],
         "dq_target_mode": mode,
         "dq_pred_clip": [dq_clip_lo, dq_clip_hi],
         "boost_rounds_env": "L1B_EDGE_DQ_BOOST_ROUNDS",
@@ -1655,14 +1464,14 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     )
     print(
         f"  [L1b] note: {len(L1B_RULE_DIRECT_COLS)} direct condition + {len(L1B_DIRECT_CONTEXT_COLS)} cross-asset ctx columns are logged as diagnostics; "
-        f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (unsup + edge/dq + retained tradeability heads).",
+        f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (clusters + novelty/regime_change + staged edge/dq + retained tradeability heads).",
         flush=True,
     )
     _log_l1b_semantic_head_diagnostics(work, rule_diag, train_mask=train_mask, val_mask=val_mask)
     unsup_outputs, unsup_meta = _fit_l1b_unsupervised_block(work, feature_cols, train_mask=train_mask)
     outputs = pd.concat([outputs, unsup_outputs.reset_index(drop=True)], axis=1)
     print(f"  [L1b] cluster heads: {L1B_CLUSTER_COLS}", flush=True)
-    print(f"  [L1b] latent heads: {L1B_LATENT_HEADS}", flush=True)
+    print(f"  [L1b] latent heads (internal diagnostics): {L1B_LATENT_HEADS}", flush=True)
     print(f"  [L1b] retained direct condition heads: {L1B_RETAINED_DIRECT_SEMANTIC_COLS}", flush=True)
     print(f"  [L1b] diagnostics-only direct heads: {L1B_DIAGNOSTIC_ONLY_DIRECT_COLS}", flush=True)
     print(f"  [L1b] rule diagnostic context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
@@ -1708,35 +1517,103 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "output_cols": L1B_OUTPUT_COLS,
         "model_output_cols": list(L1B_SUPERVISED_REGRESSOR_COLS),
         "cluster_output_cols": list(L1B_CLUSTER_COLS),
-        "latent_output_cols": list(L1B_LATENT_HEADS),
-        "unsupervised_output_cols": list(L1B_UNSUPERVISED_COLS),
+        "latent_output_cols": list(L1B_LATENT_EMBED_COLS),
+        "internal_unsupervised_cols": list(L1B_UNSUPERVISED_COLS),
+        "unsupervised_output_cols": list(L1B_EXPORT_UNSUPERVISED_COLS),
         "direct_output_cols": sorted(L1B_EXPORT_DETERMINISTIC_COLS),
         "deterministic_output_cols": list(L1B_EXPORT_DETERMINISTIC_COLS),
         "diagnostic_only_direct_cols": list(L1B_DIAGNOSTIC_ONLY_DIRECT_COLS),
         "rule_diagnostic_cols": sorted(L1B_RULE_DIRECT_COLS + L1B_DIRECT_CONTEXT_COLS),
-        "deprecated_output_cols": ["l1b_pullback_setup", "l1b_failure_risk", "l1b_shock_risk"],
+        "deprecated_output_cols": [
+            "l1b_pullback_setup",
+            "l1b_failure_risk",
+            "l1b_shock_risk",
+            "l1b_latent_0",
+            "l1b_latent_1",
+            "l1b_latent_2",
+            "l1b_latent_3",
+            "l1b_follow_through_score",
+            "l1b_liquidity_score",
+        ],
         "constant_output_values": {},
         "model_files": dict(edge_dq_model_files),
-        "head_feature_cols": {h: list(supervised_feature_cols) for h in L1B_SUPERVISED_REGRESSOR_COLS},
+        "head_feature_cols": {
+            "l1b_edge_candidate_model": list(supervised_feature_cols),
+            "l1b_edge_quality_model": list(supervised_feature_cols),
+            "l1b_dq_pred": list(supervised_feature_cols),
+            "l1b_edge_pred": list(supervised_feature_cols),
+        },
         "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": (
-            "Binary pullback/failure/shock targets still use candidate scores from full internal rule dict; "
-            "exported L1b cache is unsupervised + l1b_edge_pred/l1b_dq_pred + retained tradeability heads only."
+            "Legacy binary pullback/failure/shock scaffolding removed; exported L1b cache is clusters + novelty/regime_change + "
+            "staged l1b_edge_pred/l1b_dq_pred + retained tradeability heads only."
         ),
         "unsupervised_semantics": (
-            "deterministic direct descriptors plus denoising-autoencoder latent embeddings, soft cluster posteriors, "
-            "novelty from nonlinear reconstruction error, and regime-change from cluster posterior turnover"
+            "exported unsupervised contract = soft cluster posteriors + novelty + regime-change; "
+            "latent embeddings remain internal diagnostics and are not exported to L2 by default"
         ),
         "latent_head_meta": unsup_meta["latent_head_meta"],
         "unsupervised_block_meta": unsup_meta,
         "supervised_edge_dq_block_meta": edge_dq_block_meta,
         "supervised_edge_dq_semantics": (
-            "Independent LightGBM regressors only: l1b_edge_pred ~ clipped absolute edge magnitude (0..5 ATR opportunity size only); "
-            "l1b_dq_pred ~ path-balance (mfe−mae)/(mfe+mae) in ±1 by default (env L1B_DQ_TARGET_MODE=legacy for mfe−mae). "
+            "Staged tradeability supervision: l1b_edge_pred = P(edge>tau) × positive-edge magnitude; "
+            "l1b_dq_pred = path-balance (mfe−mae)/(mfe+mae) in ±1 by default (env L1B_DQ_TARGET_MODE=legacy for mfe−mae). "
             "Supervised inputs = tabular base + l1b_atom_* columns (not passed to L2)."
         ),
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
+    edge_meta = meta.get("supervised_edge_dq_block_meta") or {}
+    adaptive_min_samples = int(os.environ.get("ADAPTIVE_THRESHOLD_MIN_SAMPLES", "500"))
+    meta = attach_threshold_registry(
+        meta,
+        "l1b",
+        [
+            threshold_entry(
+                "L1B_EDGE_CANDIDATE_TAU",
+                float(edge_meta.get("edge_candidate_tau", _l1b_edge_candidate_tau())),
+                category="adaptive_candidate",
+                role="edge candidate gating tau",
+                adaptive_hint="MAD+z default; bootstrap fallback on low-n/heavy-tail",
+                n_samples_used=int(edge_meta.get("edge_candidate_tau_fit_samples", 0)),
+                min_reliable_samples=adaptive_min_samples,
+                statistical_principle=str(edge_meta.get("edge_candidate_tau_statistical_principle", "")),
+                alpha=float(edge_meta.get("edge_candidate_tau_alpha", float("nan"))),
+                method_selected=str(edge_meta.get("edge_candidate_tau_method", "")),
+                fallback_reason=str(edge_meta.get("edge_candidate_tau_fallback_reason", "")),
+            ),
+            threshold_entry(
+                "L1B_EDGE_CANDIDATE_TAU_MODE",
+                str(edge_meta.get("edge_candidate_tau_mode", "hybrid")),
+                category="adaptive_candidate",
+                role="tau estimation mode",
+                statistical_principle="estimator_selection",
+                method_selected=str(edge_meta.get("edge_candidate_tau_mode", "hybrid")),
+            ),
+            threshold_entry(
+                "L1B_EDGE_CANDIDATE_TAU_METHOD",
+                str(edge_meta.get("edge_candidate_tau_method", "mad_z")),
+                category="adaptive_candidate",
+                role="selected tau estimator for this run",
+                method_selected=str(edge_meta.get("edge_candidate_tau_method", "mad_z")),
+            ),
+            threshold_entry(
+                "L1B_EDGE_TAU_ALPHA",
+                float(edge_meta.get("edge_candidate_tau_alpha", float(np.clip(float(os.environ.get("L1B_EDGE_TAU_ALPHA", "0.05")), 1e-4, 0.20)))),
+                category="adaptive_candidate",
+                role="significance level for tau formula",
+                statistical_principle="two_sided_significance_level",
+                alpha=float(edge_meta.get("edge_candidate_tau_alpha", float(np.clip(float(os.environ.get("L1B_EDGE_TAU_ALPHA", "0.05")), 1e-4, 0.20)))),
+            ),
+            threshold_entry(
+                "L1B_EDGE_DQ_ES_ROUNDS",
+                int(os.environ.get("L1B_EDGE_DQ_ES_ROUNDS", str(35 if FAST_TRAIN_MODE else 70))),
+                category="data_guardrail",
+                role="lgb early stopping rounds",
+            ),
+        ],
+    )
+    for w in meta.get("threshold_registry", {}).get("warnings", []):
+        print(f"  [L1b][warn] {w}", flush=True)
     with open(os.path.join(MODEL_DIR, L1B_META_FILE), "wb") as f:
         pickle.dump(meta, f)
     cache_path = save_output_cache(outputs, L1B_OUTPUT_CACHE_FILE)
@@ -1778,6 +1655,8 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
     dq_meta = meta.get("supervised_edge_dq_block_meta") or {}
     dq_lo, dq_hi = dq_meta.get("dq_pred_clip", [-5.0, 5.0])
     dq_lo, dq_hi = float(dq_lo), float(dq_hi)
+    edge_clip = dq_meta.get("edge_pred_clip", [0.0, 5.0])
+    edge_lo, edge_hi = float(edge_clip[0]), float(edge_clip[1])
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     direct_outputs = _build_l1b_direct_semantic_outputs(work)
     cross = compute_cross_asset_context(work)
@@ -1807,15 +1686,25 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
         if col not in work.columns:
             work[col] = 0.0
     X_inf = work[sup_cols].to_numpy(dtype=np.float64, copy=False)
-    for head in L1B_SUPERVISED_REGRESSOR_COLS:
-        mdl = models.get(head)
+    edge_model_type = str(dq_meta.get("edge_model_type", "") or "")
+    tau = float(dq_meta.get("edge_candidate_tau", _l1b_edge_candidate_tau()))
+    if edge_model_type == "staged_tradeability":
+        cand_mdl = models.get("l1b_edge_candidate_model")
+        qual_mdl = models.get("l1b_edge_quality_model")
+        if cand_mdl is not None and qual_mdl is not None:
+            cand_p = np.clip(cand_mdl.predict(X_inf).astype(np.float64), 0.0, 1.0)
+            qual_pred = np.clip(qual_mdl.predict(X_inf).astype(np.float64), tau, edge_hi)
+            outputs["l1b_edge_pred"] = np.clip(cand_p * qual_pred, edge_lo, edge_hi).astype(np.float32)
+    else:
+        mdl = models.get("l1b_edge_pred")
         if mdl is not None:
-            pred = mdl.predict(X_inf).astype(np.float64)
-            if head == "l1b_dq_pred":
-                pred = np.clip(pred, dq_lo, dq_hi)
-            else:
-                pred = np.clip(pred, 0.0, 5.0)
-            outputs[head] = pred.astype(np.float32)
+            pred = np.clip(mdl.predict(X_inf).astype(np.float64), edge_lo, edge_hi)
+            outputs["l1b_edge_pred"] = pred.astype(np.float32)
+    outputs["l1b_edge_candidate_tau"] = np.full(len(outputs), float(tau), dtype=np.float32)
+    dq_mdl = models.get("l1b_dq_pred")
+    if dq_mdl is not None:
+        dq_pred = np.clip(dq_mdl.predict(X_inf).astype(np.float64), dq_lo, dq_hi)
+        outputs["l1b_dq_pred"] = dq_pred.astype(np.float32)
     out_cols = list(meta.get("output_cols", L1B_OUTPUT_COLS))
     for col in out_cols:
         if col not in outputs.columns:

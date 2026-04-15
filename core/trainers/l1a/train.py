@@ -5,6 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from statistics import NormalDist
 from typing import Any
 
 import numpy as np
@@ -51,6 +52,7 @@ from core.trainers.stack_v2_common import (
     log_label_baseline,
     save_output_cache,
 )
+from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.tcn_constants import DEVICE, SEQ_LEN
 
 
@@ -310,7 +312,82 @@ def _select_l1a_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str
     return cols
 
 
-def _build_l1a_targets(df: pd.DataFrame) -> dict[str, np.ndarray]:
+def _robust_sigma_from_values(values: np.ndarray) -> tuple[float, float, float]:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0, 0.0, 0.0
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med)))
+    sigma = float(mad / 0.67448975) if mad > 0 else 0.0
+    return med, mad, sigma
+
+
+def _l1a_clip_upper(
+    values: np.ndarray,
+    *,
+    mode: str,
+    quantile_q: float,
+    alpha: float,
+    floor: float,
+    ceiling: float,
+) -> tuple[float, dict[str, Any]]:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals)]
+    meta: dict[str, Any] = {
+        "mode": str(mode),
+        "fit_n": int(vals.size),
+        "alpha": float(alpha),
+        "quantile_q": float(quantile_q),
+    }
+    if vals.size == 0:
+        clip = float(np.clip(ceiling, floor, ceiling))
+        meta["fallback_reason"] = "no_finite_values"
+        meta["clip"] = float(clip)
+        return clip, meta
+    if mode == "mad_z":
+        med, mad, sigma = _robust_sigma_from_values(vals)
+        if not np.isfinite(sigma) or sigma <= 1e-8:
+            clip_q = float(np.quantile(vals, quantile_q))
+            clip = float(np.clip(clip_q, floor, ceiling))
+            meta.update(
+                {
+                    "statistical_principle": "quantile_clip_fallback_from_zero_mad",
+                    "fallback_reason": "mad_or_sigma_zero",
+                    "median": float(med),
+                    "mad": float(mad),
+                    "sigma_robust": float(sigma),
+                    "clip": float(clip),
+                }
+            )
+            return clip, meta
+        z = float(NormalDist().inv_cdf(1.0 - alpha / 2.0))
+        clip = float(np.clip(med + z * max(sigma, 1e-8), floor, ceiling))
+        meta.update(
+            {
+                "statistical_principle": "robust_median_mad_significance",
+                "median": float(med),
+                "mad": float(mad),
+                "sigma_robust": float(sigma),
+                "z_value": float(z),
+                "clip": float(clip),
+            }
+        )
+        return clip, meta
+    clip_q = float(np.quantile(vals, quantile_q))
+    clip = float(np.clip(clip_q, floor, ceiling))
+    meta.update(
+        {
+            "statistical_principle": "quantile_clip",
+            "clip": float(clip),
+        }
+    )
+    return clip, meta
+
+
+def _build_l1a_targets(
+    df: pd.DataFrame, *, fit_mask: np.ndarray | None = None
+) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
     cfg = _options_target_config()
     horizon = int(cfg["decision_horizon_bars"])
     safe_atr = np.where(pd.to_numeric(df["lbl_atr"], errors="coerce").fillna(0.0).to_numpy() > 1e-3, df["lbl_atr"].to_numpy(dtype=np.float64), 1e-3)
@@ -320,20 +397,62 @@ def _build_l1a_targets(df: pd.DataFrame) -> dict[str, np.ndarray]:
     state = pd.to_numeric(df["state_label"], errors="coerce").fillna(4).to_numpy(dtype=np.int64)
 
     transition_risk = compute_transition_event_labels(state, symbols, horizon=horizon)
-    range_norm = np.clip((high - low) / safe_atr, 0.0, 5.0)
+    range_raw = np.clip((high - low) / safe_atr, 0.0, np.inf)
+    clip_q = float(np.clip(float(os.environ.get("L1A_RANGE_NORM_CLIP_Q", "0.995")), 0.90, 1.0))
+    clip_mode = (os.environ.get("L1A_CLIP_MODE", "mad_z") or "mad_z").strip().lower()
+    clip_alpha = float(np.clip(float(os.environ.get("L1A_CLIP_ALPHA", "0.01")), 1e-4, 0.20))
+    fit = np.isfinite(range_raw)
+    if fit_mask is not None:
+        fit &= np.asarray(fit_mask, dtype=bool).ravel()
+    fit_vals = range_raw[fit]
+    if fit_vals.size == 0:
+        fit_vals = range_raw[np.isfinite(range_raw)]
+    range_clip, range_meta = _l1a_clip_upper(
+        fit_vals,
+        mode=clip_mode,
+        quantile_q=clip_q,
+        alpha=clip_alpha,
+        floor=1.0,
+        ceiling=8.0,
+    )
+    range_norm = np.clip(range_raw, 0.0, range_clip)
     vol_forecast = _future_mean_by_symbol(range_norm, symbols, horizon=horizon)
     lag = int(os.environ.get("L1A_VOL_TREND_LAG", "5"))
     vol_trend = _per_symbol_lag_diff(range_norm, symbols, lag=lag)
+    vt_q = float(np.clip(float(os.environ.get("L1A_VOL_TREND_CLIP_Q", "0.995")), 0.90, 1.0))
+    vt_fit = np.isfinite(vol_trend)
+    if fit_mask is not None:
+        vt_fit &= np.asarray(fit_mask, dtype=bool).ravel()
+    vt_abs = np.abs(vol_trend[vt_fit])
+    if vt_abs.size == 0:
+        vt_abs = np.abs(vol_trend[np.isfinite(vol_trend)])
+    vt_cap, vt_meta = _l1a_clip_upper(
+        vt_abs,
+        mode=clip_mode,
+        quantile_q=vt_q,
+        alpha=clip_alpha,
+        floor=0.5,
+        ceiling=8.0,
+    )
+    vol_trend = np.clip(vol_trend, -vt_cap, vt_cap).astype(np.float32)
     cap = int(os.environ.get("L1A_TIME_IN_REGIME_CAP", "120"))
     time_in_regime = _time_in_regime_fraction(state, symbols, cap=cap)
 
-    return {
-        "regime": state,
-        "transition_risk": transition_risk.astype(np.float32),
-        "vol_forecast": vol_forecast.astype(np.float32),
-        "vol_trend": vol_trend,
-        "time_in_regime": time_in_regime,
-    }
+    return (
+        {
+            "regime": state,
+            "transition_risk": transition_risk.astype(np.float32),
+            "vol_forecast": vol_forecast.astype(np.float32),
+            "vol_trend": vol_trend,
+            "time_in_regime": time_in_regime,
+        },
+        {
+            "range_norm": range_meta,
+            "vol_trend": vt_meta,
+            "clip_mode": clip_mode,
+            "clip_alpha": float(clip_alpha),
+        },
+    )
 
 
 def _build_symbol_windows(df: pd.DataFrame, feature_cols: list[str], seq_len: int) -> tuple[np.ndarray, np.ndarray]:
@@ -956,7 +1075,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     if len(end_idx) == 0:
         raise RuntimeError("L1a: no valid sequence windows were created.")
 
-    targets = _build_l1a_targets(work)
+    targets, clip_meta = _build_l1a_targets(work, fit_mask=splits.train)
     window_train = splits.train_mask[end_idx]
     window_cal = splits.cal_mask[end_idx]
     window_val = splits.l2_val_mask[end_idx]
@@ -1156,7 +1275,78 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "l1a_patience": int(patience),
         "l1a_early_stop_min_delta": float(min_delta),
         "l1a_regime_label_smoothing": float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1")),
+        "l1a_clip_mode": str(clip_meta.get("clip_mode", "mad_z")),
+        "l1a_clip_alpha": float(clip_meta.get("clip_alpha", 0.01)),
+        "l1a_clip_stats": {
+            "range_norm": dict(clip_meta.get("range_norm") or {}),
+            "vol_trend": dict(clip_meta.get("vol_trend") or {}),
+        },
     }
+    adaptive_min_samples = int(os.environ.get("ADAPTIVE_THRESHOLD_MIN_SAMPLES", "500"))
+    fit_n = int(np.sum(np.asarray(splits.train, dtype=bool)))
+    meta = attach_threshold_registry(
+        meta,
+        "l1a",
+        [
+            threshold_entry(
+                "l1a_range_norm_clip_upper",
+                float((clip_meta.get("range_norm") or {}).get("clip", 8.0)),
+                category="adaptive_candidate",
+                role="range_norm upper clip derived from robust significance",
+                adaptive_hint="median + z(alpha/2) * MAD/0.6745 (quantile fallback)",
+                n_samples_used=int((clip_meta.get("range_norm") or {}).get("fit_n", fit_n)),
+                min_reliable_samples=adaptive_min_samples,
+                statistical_principle=str((clip_meta.get("range_norm") or {}).get("statistical_principle", "unknown")),
+                alpha=float((clip_meta.get("range_norm") or {}).get("alpha", clip_meta.get("clip_alpha", 0.01))),
+                method_selected=str((clip_meta.get("range_norm") or {}).get("mode", clip_meta.get("clip_mode", "unknown"))),
+                fallback_reason=str((clip_meta.get("range_norm") or {}).get("fallback_reason", "")),
+            ),
+            threshold_entry(
+                "l1a_vol_trend_clip_cap",
+                float((clip_meta.get("vol_trend") or {}).get("clip", 8.0)),
+                category="adaptive_candidate",
+                role="vol-trend symmetric clip cap from robust significance",
+                adaptive_hint="median + z(alpha/2) * MAD/0.6745 on |vol_trend|",
+                n_samples_used=int((clip_meta.get("vol_trend") or {}).get("fit_n", fit_n)),
+                min_reliable_samples=adaptive_min_samples,
+                statistical_principle=str((clip_meta.get("vol_trend") or {}).get("statistical_principle", "unknown")),
+                alpha=float((clip_meta.get("vol_trend") or {}).get("alpha", clip_meta.get("clip_alpha", 0.01))),
+                method_selected=str((clip_meta.get("vol_trend") or {}).get("mode", clip_meta.get("clip_mode", "unknown"))),
+                fallback_reason=str((clip_meta.get("vol_trend") or {}).get("fallback_reason", "")),
+            ),
+            threshold_entry(
+                "L1A_CLIP_MODE",
+                str(clip_meta.get("clip_mode", "mad_z")),
+                category="adaptive_candidate",
+                role="L1a clipping estimator mode",
+                adaptive_hint="mad_z default with quantile fallback support",
+                statistical_principle="estimator_selection",
+                method_selected=str(clip_meta.get("clip_mode", "mad_z")),
+            ),
+            threshold_entry(
+                "L1A_CLIP_ALPHA",
+                float(clip_meta.get("clip_alpha", 0.01)),
+                category="adaptive_candidate",
+                role="type-I error control for robust clip",
+                statistical_principle="two_sided_significance_level",
+                alpha=float(clip_meta.get("clip_alpha", 0.01)),
+            ),
+            threshold_entry(
+                "L1A_TIME_IN_REGIME_CAP",
+                int(os.environ.get("L1A_TIME_IN_REGIME_CAP", "120")),
+                category="data_guardrail",
+                role="run-length normalization cap",
+            ),
+            threshold_entry(
+                "L1A_PATIENCE",
+                int(patience),
+                category="data_guardrail",
+                role="early-stop patience",
+            ),
+        ],
+    )
+    for w in meta.get("threshold_registry", {}).get("warnings", []):
+        print(f"  [L1a][warn] {w}", flush=True)
     with open(os.path.join(MODEL_DIR, L1A_META_FILE), "wb") as f:
         pickle.dump(meta, f)
     cache_path = save_output_cache(outputs, L1A_OUTPUT_CACHE_FILE)

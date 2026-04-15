@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -47,7 +48,7 @@ def _coverage_accuracy_table(
     prob: np.ndarray,
     y_int: np.ndarray,
     *,
-    thresholds: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25),
+    thresholds: tuple[float, ...] | None = None,
 ) -> list[dict[str, float]]:
     rows: list[dict[str, float]] = []
     pred_int = (np.asarray(prob, dtype=np.float64).ravel() >= 0.5).astype(np.int64)
@@ -55,6 +56,9 @@ def _coverage_accuracy_table(
     p = np.asarray(prob, dtype=np.float64).ravel()
     conf = np.abs(p - 0.5)
     n = len(p)
+    if thresholds is None:
+        qs = [0.50, 0.65, 0.75, 0.85, 0.90]
+        thresholds = tuple(float(np.quantile(conf, q)) for q in qs) if conf.size else (0.05, 0.10, 0.15, 0.20, 0.25)
     for thr in thresholds:
         mask = conf > float(thr)
         cnt = int(np.sum(mask))
@@ -183,7 +187,29 @@ def evaluate_l1c(
     strong = abs_ret > med
     strong_n = int(np.sum(strong))
     acc_strong = float(np.mean(pred_int[strong] == y_int[strong])) if strong_n > 0 else float("nan")
-    confident = np.abs(prob - 0.5) > 0.2
+    conf_abs = np.abs(prob - 0.5)
+    conf_target = float(np.clip(float(os.environ.get("L1C_CONFIDENT_COVERAGE_TARGET", "0.20")), 0.05, 0.80))
+    conf_min_margin = float(np.clip(float(os.environ.get("L1C_CONFIDENT_MIN_MARGIN", "0.05")), 0.01, 0.25))
+    conf_mode = (os.environ.get("L1C_CONF_MODE", "cost_based") or "cost_based").strip().lower()
+    conf_thr_q = float(np.quantile(conf_abs, 1.0 - conf_target)) if conf_abs.size else 0.2
+    avg_move = float(np.median(np.abs(y_ret[np.isfinite(y_ret)]))) if np.isfinite(y_ret).any() else 0.0
+    tx_cost = float(max(0.0, float(os.environ.get("L1C_TX_COST_RATE", "0.0005"))))
+    win_move = float(np.median(y_ret[y_ret > 0])) if np.any(y_ret > 0) else avg_move
+    loss_move = float(np.median(np.abs(y_ret[y_ret < 0]))) if np.any(y_ret < 0) else avg_move
+    if not np.isfinite(win_move) or win_move <= 1e-8:
+        win_move = max(avg_move, 1e-6)
+    if not np.isfinite(loss_move) or loss_move <= 1e-8:
+        loss_move = max(avg_move, 1e-6)
+    cost_based_thr = float(np.clip((loss_move + tx_cost) / max(win_move + loss_move, 1e-8), 0.5, 0.99))
+    conf_thr_cost = float(max(conf_min_margin, cost_based_thr - 0.5))
+    conf_thr = float(max(conf_thr_q, conf_min_margin))
+    conf_fallback_reason = ""
+    if avg_move <= 1e-6 or (win_move + loss_move) <= 2e-6:
+        conf_fallback_reason = "near_zero_move_use_coverage"
+        conf_thr = float(max(conf_thr_q, conf_min_margin))
+    if conf_mode == "cost_based":
+        conf_thr = float(max(conf_thr_cost, conf_min_margin)) if not conf_fallback_reason else float(max(conf_thr_q, conf_min_margin))
+    confident = conf_abs > conf_thr
     conf_n = int(np.sum(confident))
     acc_conf = float(np.mean(pred_int[confident] == y_int[confident])) if conf_n > 0 else float("nan")
     conf_table = _coverage_accuracy_table(prob, y_int)
@@ -205,6 +231,17 @@ def evaluate_l1c(
         "acc_prob_confident": acc_conf,
         "n_prob_confident": conf_n,
         "coverage_prob_confident": float(conf_n / len(prob)) if len(prob) > 0 else float("nan"),
+        "confident_threshold": float(conf_thr),
+        "confident_threshold_quantile": float(conf_thr_q),
+        "confident_min_margin": float(conf_min_margin),
+        "confident_mode": str(conf_mode),
+        "confident_threshold_cost_based": float(conf_thr_cost),
+        "cost_based_probability_threshold": float(conf_thr_cost + 0.5),
+        "confident_fallback_reason": str(conf_fallback_reason),
+        "tx_cost_rate": float(tx_cost),
+        "avg_move": float(avg_move),
+        "win_move": float(win_move),
+        "loss_move": float(loss_move),
         "confidence_threshold_table": conf_table,
         "probability_bin_table": prob_bin_table,
         "probability_quintiles": quintiles,
@@ -228,8 +265,23 @@ def print_l1c_eval_report(metrics: dict[str, Any]) -> None:
     print(
         f"  [L1c] val subsets: acc(|ret|>median)={metrics.get('acc_abs_ret_gt_median', float('nan')):.4f}  "
         f"n={metrics.get('n_abs_ret_gt_median', 0):,}  "
-        f"acc(|p-0.5|>0.2)={metrics.get('acc_prob_confident', float('nan')):.4f}  "
+        f"acc(|p-0.5|>{metrics.get('confident_threshold', 0.2):.4f})={metrics.get('acc_prob_confident', float('nan')):.4f}  "
         f"n={metrics.get('n_prob_confident', 0):,}  coverage={metrics.get('coverage_prob_confident', float('nan')):.2%}",
+        flush=True,
+    )
+    print(
+        f"  [L1c] confident threshold policy: quantile_thr={metrics.get('confident_threshold_quantile', float('nan')):.4f}  "
+        f"min_margin={metrics.get('confident_min_margin', float('nan')):.4f}  "
+        f"cost_thr={metrics.get('confident_threshold_cost_based', float('nan')):.4f}  "
+        f"mode={metrics.get('confident_mode', 'coverage')}",
+        flush=True,
+    )
+    print(
+        f"  [L1c] confidence economics: tx_cost={metrics.get('tx_cost_rate', float('nan')):.6f}  "
+        f"avg_move={metrics.get('avg_move', float('nan')):.6f}  "
+        f"win={metrics.get('win_move', float('nan')):.6f}  loss={metrics.get('loss_move', float('nan')):.6f}  "
+        f"p_thr={metrics.get('cost_based_probability_threshold', float('nan')):.4f}  "
+        f"fallback={metrics.get('confident_fallback_reason', '')}",
         flush=True,
     )
     conf_rows = metrics.get("confidence_threshold_table") or []

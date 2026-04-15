@@ -292,13 +292,17 @@ def run_single_symbol(
     _sidx = {c: i for i, c in enumerate(static_l3_names)}
     exit_model = l3_models["exit"]
     value_model = l3_models.get("value")
+    value_nonzero_model = l3_models.get("value_nonzero")
+    value_hurdle_power = float(l3_meta.get("l3_value_hurdle_prob_power", 1.0))
     if l3_meta.get("l3_value_mode") == "disabled" or l3_meta.get("l3_value_disabled"):
         value_model = None
+        value_nonzero_model = None
     exit_calibrator = l3_models.get("exit_calibrator")
     dev = torch_device if torch_device is not None else TORCH_DEVICE
     hybrid = l3_traj_enc is not None and l3_traj_cfg is not None
     traj_buf: L3TrajRollingState | None = None
     max_hold = int(l3_meta.get("l3_target_horizon_bars", 30))
+    l2_abstain_margin = float((l2_meta.get("two_stage_policy") or l2_meta).get("direction_abstain_margin", 0.0))
     trades: list[dict[str, object]] = []
     exit_infer_state = L3ExitInferenceState()
     peak_unreal_atr = float("-inf")
@@ -395,9 +399,21 @@ def run_single_symbol(
                 exit_prob = float(np.clip(exit_calibrator.predict(np.asarray([exit_raw], dtype=np.float64))[0], 0.0, 1.0))
             else:
                 exit_prob = float(np.clip(exit_raw, 0.0, 1.0))
-            value_left = 0.0 if value_model is None else float(value_model.predict(feat_vec)[0])
+            if value_model is None:
+                value_left = 0.0
+            elif value_nonzero_model is None:
+                value_left = float(value_model.predict(feat_vec)[0])
+            else:
+                mu = float(value_model.predict(feat_vec)[0])
+                p_nz = float(np.clip(value_nonzero_model.predict(feat_vec)[0], 0.0, 1.0))
+                value_left = float(mu * (p_nz ** float(np.clip(value_hurdle_power, 0.5, 2.0))))
             flip = int(l2_out.loc[i, "l2_decision_class"])
-            flip_against = (in_pos == 1 and flip == 2) or (in_pos == -1 and flip == 0)
+            p_long = float(l2_out.loc[i, "l2_decision_long"]) if "l2_decision_long" in l2_out.columns else 0.0
+            p_short = float(l2_out.loc[i, "l2_decision_short"]) if "l2_decision_short" in l2_out.columns else 0.0
+            directional_mass = max(p_long + p_short, 1e-6)
+            directional_conf = abs(p_long - p_short) / directional_mass
+            abstain_like = (flip == 1) or (directional_conf < l2_abstain_margin)
+            flip_against = (not abstain_like) and ((in_pos == 1 and flip == 2) or (in_pos == -1 and flip == 0))
             exit_state_probs = l1a_out.loc[i, L1A_REGIME_COLS].to_numpy(dtype=np.float32)
             exit_state_vol = float(l1a_out.loc[i, "l1a_vol_forecast"])
             pa_state = df.loc[i, PA_STATE_FEATURES] if all(col in df.columns for col in PA_STATE_FEATURES) else None

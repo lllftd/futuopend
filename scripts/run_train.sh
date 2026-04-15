@@ -71,4 +71,15 @@ if [[ -z "$PY" ]]; then
 fi
 echo "  Python: $PY"
 
+if [[ "$START_LAYER" == "layer3" || "$START_LAYER" == "layer2" || "$START_LAYER" == "layer1" || "$START_LAYER" == "layer1a" || "$START_LAYER" == "layer1b" ]]; then
+  if "$PY" - <<'PYEOF' >/dev/null 2>&1
+import lifelines  # noqa: F401
+PYEOF
+  then
+    echo "  [L3] Cox dependency check: lifelines available"
+  else
+    echo "  [L3] Cox dependency check: lifelines missing (run: $PY -m pip install -r requirements.txt)"
+  fi
+fi
+
 FORCE_TQDM=1 "$PY" -u -m backtests.train_pipeline --start-from "$START_LAYER"
