@@ -3,6 +3,7 @@
 # Usage: ./scripts/run_train.sh [layer_name]
 #   layer1 | layer1a — train L1a → L1b → L2 → L3
 #   layer1b — load l1a_outputs.pkl, train L1b → L2 → L3
+#   layer1c — prepared dataset cache + train L1c only
 #   layer2 — load l1a + l1b caches, train L2 → L3
 #   layer3 — load l1a + l2 caches, train L3 only
 
@@ -11,18 +12,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 START_LAYER="${1:-layer1}"
-VALID_LAYERS="layer1 layer1a layer1b layer2 layer3"
+VALID_LAYERS="layer1 layer1a layer1b layer1c layer2 layer3"
 
 if [[ ! " $VALID_LAYERS " =~ " $START_LAYER " ]]; then
     echo "Error: Invalid start layer '$START_LAYER'."
-    echo "Valid options: layer1, layer1a, layer1b, layer2, layer3"
+    echo "Valid options: layer1, layer1a, layer1b, layer1c, layer2, layer3"
     exit 1
 fi
 
 echo "================================================================="
 echo "  Starting Dual-View Training Pipeline from: $START_LAYER"
 echo "  Logs (overwrite for stages that run, under $ROOT/logs/):"
-echo "    layer1a.log layer1b.log layer2.log layer3.log"
+echo "    layer1a.log layer1b.log layer1c.log layer2.log layer3.log"
 echo "================================================================="
 
 mkdir -p "$ROOT/logs"
@@ -31,13 +32,18 @@ case "$START_LAYER" in
   layer1|layer1a)
     : > "$ROOT/logs/layer1a.log"
     : > "$ROOT/logs/layer1b.log"
+    : > "$ROOT/logs/layer1c.log"
     : > "$ROOT/logs/layer2.log"
     : > "$ROOT/logs/layer3.log"
     ;;
   layer1b)
     : > "$ROOT/logs/layer1b.log"
+    : > "$ROOT/logs/layer1c.log"
     : > "$ROOT/logs/layer2.log"
     : > "$ROOT/logs/layer3.log"
+    ;;
+  layer1c)
+    : > "$ROOT/logs/layer1c.log"
     ;;
   layer2)
     : > "$ROOT/logs/layer2.log"

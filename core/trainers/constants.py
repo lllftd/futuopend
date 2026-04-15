@@ -64,25 +64,45 @@ PA_CTX_FEATURES = [
     "pa_ctx_premise_break_short",
 ]
 
+PA_STATE_FEATURES = [
+    "pa_state_trend_strength",
+    "pa_state_followthrough_quality",
+    "pa_state_range_risk",
+    "pa_state_pullback_exhaustion",
+    "pa_state_breakout_failure_risk",
+    "pa_state_always_in_bias",
+]
+
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 
 # New dual-view stack schema versions
-L1A_SCHEMA_VERSION = "1.2.0"
-L1B_SCHEMA_VERSION = "1.7.0"
-L2_SCHEMA_VERSION = "1.9.0"
-L3_SCHEMA_VERSION = "1.7.5"
+L1A_SCHEMA_VERSION = "1.15.0"
+L1B_SCHEMA_VERSION = "1.11.0"
+L2_SCHEMA_VERSION = "1.22.0"
+L3_SCHEMA_VERSION = "1.11.0"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"
 L1A_META_FILE = "l1a_market_tcn_meta.pkl"
 L1A_OUTPUT_CACHE_FILE = "l1a_outputs.pkl"
 
+# L1a l1a_dir_*: regime-geometry from regime probs + transition/vol; not a learned return head.
+L1A_DIR_STRENGTH_SCALE = 1.0
+
 L1B_META_FILE = "l1b_descriptor_meta.pkl"
 L1B_OUTPUT_CACHE_FILE = "l1b_outputs.pkl"
+L1B_EDGE_PRED_FILE = "l1b_edge_pred.txt"
+L1B_DQ_PRED_FILE = "l1b_dq_pred.txt"
+
+L1C_SCHEMA_VERSION = "1.2.0"
+L1C_MODEL_FILE = "l1c_direction.pt"
+L1C_META_FILE = "l1c_direction_meta.pkl"
+L1C_OUTPUT_CACHE_FILE = "l1c_outputs.pkl"
 
 L2_DECISION_FILE = "l2_decision.txt"
 L2_GATE_FILE = "l2_trade_gate.txt"
 L2_DIRECTION_FILE = "l2_direction.txt"
+L2_SIGNED_EDGE_FILE = "l2_signed_edge.txt"
 L2_SIZE_FILE = "l2_size.txt"
 L2_MFE_FILE = "l2_mfe.txt"
 L2_MAE_FILE = "l2_mae.txt"
@@ -94,6 +114,7 @@ L3_VALUE_FILE = "l3_value.txt"
 L3_META_FILE = "l3_exit_meta.pkl"
 L3_TRAJECTORY_ENCODER_FILE = "l3_trajectory_encoder.pt"
 L3_POLICY_DATASET_CACHE_FILE = "l3_policy_dataset.pkl"
+L3_COX_FILE = "l3_cox_time_varying.pkl"
 PREPARED_DATASET_CACHE_FILE = "prepared_lgbm_dataset.pkl"
 
 # New stack feature / contract names

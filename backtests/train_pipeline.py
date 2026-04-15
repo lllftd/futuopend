@@ -8,6 +8,7 @@ import torch
 from core.trainers.constants import (
     L1A_OUTPUT_CACHE_FILE,
     L1B_OUTPUT_CACHE_FILE,
+    L1C_OUTPUT_CACHE_FILE,
     L2_OUTPUT_CACHE_FILE,
     MODEL_DIR,
     PREPARED_DATASET_CACHE_FILE,
@@ -24,6 +25,7 @@ from core.trainers.layer1b_descriptor import (
     train_l1b_market_descriptor,
 )
 from core.trainers.layer2_decision import infer_l2_trade_decision, load_l2_trade_decision, train_l2_trade_decision
+from core.trainers.l1c.train import train_l1c_direction
 from core.trainers.layer3_exit import train_l3_exit_manager
 from core.trainers.lgbm_utils import configure_compute_threads, _lgbm_n_jobs
 from core.trainers.stack_v2_common import load_output_cache, save_output_cache
@@ -46,6 +48,7 @@ class Logger:
         if message and "\r" in message:
             return
         self.log.write(message)
+        self.log.flush()
 
     def flush(self):
         self.terminal.flush()
@@ -63,6 +66,7 @@ class Logger:
 _LAYER_LOG_FILES = {
     "layer1a": "layer1a.log",
     "layer1b": "layer1b.log",
+    "layer1c": "layer1c.log",
     "layer2": "layer2.log",
     "layer3": "layer3.log",
 }
@@ -75,8 +79,9 @@ def setup_logger(layer_key: str):
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, _LAYER_LOG_FILES[layer_key])
+    lg = Logger(log_file)
     print(f"\n>> Layer log (overwrite): {log_file}")
-    return Logger(log_file)
+    return lg
 
 
 def _prepared_dataset_cache_path() -> str:
@@ -127,11 +132,38 @@ def _artifact_inferred_l1b_outputs(df):
     return outputs
 
 
-def _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs):
+def _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs, l1c_outputs=None):
     models, meta = load_l2_trade_decision()
-    outputs = infer_l2_trade_decision(models, meta, df, l1a_outputs, l1b_outputs)
+    outputs = infer_l2_trade_decision(models, meta, df, l1a_outputs, l1b_outputs, l1c_outputs)
     save_output_cache(outputs, L2_OUTPUT_CACHE_FILE)
     return outputs
+
+
+def _resolve_l1c_outputs_for_pipeline(df, feat_cols: list[str], sf: str):
+    """Train L1c after L1a/L1b when running those stages; otherwise load cache if present."""
+    import os
+
+    skip = os.environ.get("L1C_SKIP_PIPELINE", "").strip().lower() in {"1", "true", "yes"}
+    cache_path = os.path.join(MODEL_DIR, L1C_OUTPUT_CACHE_FILE)
+    if skip:
+        if os.path.exists(cache_path):
+            print(f"\n[*] L1C_SKIP_PIPELINE: loading {L1C_OUTPUT_CACHE_FILE} ...")
+            return load_output_cache(L1C_OUTPUT_CACHE_FILE)
+        print("\n[*] L1C_SKIP_PIPELINE: no L1c cache; L2 will run without l1c_* features.")
+        return None
+    if sf in ("layer1a", "layer1b"):
+        logger = setup_logger("layer1c")
+        try:
+            print("\n[1c] --- Training L1c (causal direction) ---")
+            train_l1c_direction(df, feat_cols)
+        finally:
+            logger.close()
+        return load_output_cache(L1C_OUTPUT_CACHE_FILE)
+    if os.path.exists(cache_path):
+        print(f"\n[*] start-from={sf}: loading L1c outputs from {L1C_OUTPUT_CACHE_FILE} ...")
+        return load_output_cache(L1C_OUTPUT_CACHE_FILE)
+    print("\n[*] No L1c output cache; training L2 without l1c_* features (train L1c separately if needed).")
+    return None
 
 
 def run_lgbm_layers(start_from: str = "layer1"):
@@ -146,6 +178,19 @@ def run_lgbm_layers(start_from: str = "layer1"):
     sf = start_from.strip().lower()
     if sf == "layer1":
         sf = "layer1a"
+
+    if sf == "layer1c":
+        df, feat_cols = _prepare_or_load_lgbm_dataset(["QQQ", "SPY"], prefer_cache=True)
+        logger = setup_logger("layer1c")
+        try:
+            print("\n[1c] --- Training L1c (causal direction) only ---")
+            train_l1c_direction(df, feat_cols)
+        finally:
+            logger.close()
+        print("\n" + "=" * 70)
+        print("  DONE — L1c artifacts saved in lgbm_models/")
+        print("=" * 70)
+        return
 
     df, feat_cols = _prepare_or_load_lgbm_dataset(["QQQ", "SPY"], prefer_cache=(sf != "layer1a"))
 
@@ -190,14 +235,16 @@ def run_lgbm_layers(start_from: str = "layer1"):
         print(f"\n[*] start-from={sf}: loading L1b outputs from {L1B_OUTPUT_CACHE_FILE} ...")
         l1b_outputs = load_output_cache(L1B_OUTPUT_CACHE_FILE)
 
+    l1c_outputs = _resolve_l1c_outputs_for_pipeline(df, feat_cols, sf)
+
     logger = setup_logger("layer2")
     try:
         print("\n[2] --- Training L2 (Trade Decision) ---")
-        train_l2_trade_decision(df, l1a_outputs, l1b_outputs)
+        train_l2_trade_decision(df, l1a_outputs, l1b_outputs, l1c_outputs)
     finally:
         logger.close()
     print("\n[*] Recomputing downstream-facing L2 outputs from frozen artifact ...")
-    l2_outputs = _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs)
+    l2_outputs = _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs, l1c_outputs)
 
     logger = setup_logger("layer3")
     try:
@@ -216,10 +263,11 @@ def main():
     parser.add_argument(
         "--start-from",
         type=str,
-        choices=["layer1", "layer1a", "layer1b", "layer2", "layer3"],
+        choices=["layer1", "layer1a", "layer1b", "layer1c", "layer2", "layer3"],
         default="layer1",
-        help="layer1/layer1a: L1a→L3. layer1b: needs l1a_outputs.pkl, then L1b→L3. "
-        "layer2: needs l1a_outputs.pkl + l1b_outputs.pkl, then L2→L3. "
+        help="layer1/layer1a: L1a→L1b→L1c→L2→L3 (set L1C_SKIP_PIPELINE=1 to skip L1c train). "
+        "layer1b: needs l1a_outputs.pkl, then L1b→L1c→L2→L3. layer1c: prepared cache + L1c only. "
+        "layer2: needs l1a/l1b caches; loads l1c_outputs.pkl if present. "
         "layer3: needs l1a_outputs.pkl + l2_outputs.pkl, L3 only.",
     )
     args = parser.parse_args()

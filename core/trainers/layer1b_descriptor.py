@@ -25,6 +25,8 @@ from tqdm.auto import tqdm
 from core.trainers.constants import (
     CAL_END,
     FAST_TRAIN_MODE,
+    L1B_DQ_PRED_FILE,
+    L1B_EDGE_PRED_FILE,
     L1B_META_FILE,
     L1B_OUTPUT_CACHE_FILE,
     L1B_SCHEMA_VERSION,
@@ -79,6 +81,29 @@ L1B_DIRECT_SEMANTIC_COLS = [
     "l1b_follow_through_score",
     "l1b_liquidity_score",
 ]
+L1B_DIRECTIONAL_SEMANTIC_COLS = [
+    "l1b_trend_direction",
+    "l1b_breakout_direction",
+    "l1b_mean_reversion_direction",
+    "l1b_failed_breakout_direction",
+    "l1b_follow_through_direction",
+    "l1b_weighted_direction",
+]
+L1B_SUPERVISED_REGRESSOR_COLS = ("l1b_edge_pred", "l1b_dq_pred")
+
+# Extra PA/BO columns appended only for L1b supervised heads (not exported to L2). Source col must exist on frame.
+L1B_ATOMIC_SUPERVISED_SOURCES: tuple[tuple[str, str], ...] = (
+    ("l1b_atom_bo_range_compress", "bo_range_compress"),
+    ("l1b_atom_bo_body_growth", "bo_body_growth"),
+    ("l1b_atom_bo_bb_width", "bo_bb_width"),
+    ("l1b_atom_bo_gap_signal", "bo_gap_signal"),
+    ("l1b_atom_bo_consec_dir", "bo_consec_dir"),
+    ("l1b_atom_pa_ctx_pullback_long", "pa_ctx_setup_pullback_long"),
+    ("l1b_atom_pa_ctx_pullback_short", "pa_ctx_setup_pullback_short"),
+    ("l1b_atom_pa_ctx_range_long", "pa_ctx_setup_range_long"),
+    ("l1b_atom_pa_ctx_range_short", "pa_ctx_setup_range_short"),
+    ("l1b_atom_pa_hsmm_switch", "pa_hsmm_switch_hazard"),
+)
 L1B_UNSUPERVISED_COLS = list(L1B_CLUSTER_COLS) + list(L1B_LATENT_HEADS)
 L1B_BINARY_HEADS: tuple[str, ...] = ()
 L1B_DIRECT_CONTEXT_COLS = [
@@ -86,7 +111,15 @@ L1B_DIRECT_CONTEXT_COLS = [
     "l1b_correlation_regime",
     "l1b_market_breadth",
 ]
-L1B_OUTPUT_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_UNSUPERVISED_COLS) + list(L1B_DIRECT_CONTEXT_COLS)
+# Full rule-based scalars/directions (train-time diagnostics only; not written to L1B cache by default).
+L1B_RULE_DIRECT_AND_DIRECTION_COLS = list(L1B_DIRECT_SEMANTIC_COLS) + list(L1B_DIRECTIONAL_SEMANTIC_COLS)
+# Exported deterministic L1b column for L2 (fused direction); rule scalars dropped as redundant vs unsup + edge/dq.
+L1B_EXPORT_DETERMINISTIC_COLS: tuple[str, ...] = ("l1b_weighted_direction",)
+L1B_OUTPUT_COLS = (
+    list(L1B_UNSUPERVISED_COLS)
+    + list(L1B_SUPERVISED_REGRESSOR_COLS)
+    + list(L1B_EXPORT_DETERMINISTIC_COLS)
+)
 
 
 @dataclass
@@ -97,6 +130,7 @@ class L1BTrainingBundle:
 
 
 def _select_l1b_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str]:
+    """Numeric PA / BO / orthogonal-stat columns only; does not include ``decision_*`` labels or raw OHLCV."""
     keep = []
     orthogonal_stat_cols = [
         "pa_hmm_state",
@@ -160,11 +194,47 @@ def _select_l1b_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str
     ]
     keep.extend([c for c in base_pref if c in df.columns])
     keep.extend([c for c in orthogonal_stat_cols if c in feat_cols and c in df.columns])
+    _optional_structure = [
+        "pa_struct_score",
+        "pa_struct_break_up",
+        "pa_struct_break_down",
+        "pa_struct_leg_count",
+        "pa_structure_clarity",
+        "pa_struct_hh_count",
+        "pa_struct_hl_count",
+        "pa_struct_lh_count",
+        "pa_struct_ll_count",
+    ]
+    keep.extend([c for c in _optional_structure if c in df.columns and c not in keep])
+    _allow = os.environ.get("L1B_EXTRA_FEATURE_ALLOWLIST", "").strip()
+    if _allow:
+        feat_set = set(feat_cols)
+        for name in [s.strip() for s in _allow.split(",") if s.strip()]:
+            if name in df.columns and name not in keep and name in feat_set:
+                keep.append(name)
     ts = pd.to_datetime(df["time_key"])
     minutes = (ts.dt.hour * 60 + ts.dt.minute).astype(np.float32)
     df["l1b_session_progress"] = (minutes / (24.0 * 60.0)).astype(np.float32)
     keep.append("l1b_session_progress")
     return _numeric_feature_cols_for_matrix(df, keep)
+
+
+def _l1b_attach_atomic_supervised_columns(df: pd.DataFrame, base_feature_cols: list[str]) -> list[str]:
+    """PA/BO atomics for edge/dq boosters only. Skips sources already in ``base_feature_cols`` (no duplicates)."""
+    base_set = set(base_feature_cols)
+    added: list[str] = []
+    for out_name, src in L1B_ATOMIC_SUPERVISED_SOURCES:
+        if src in base_set or src not in df.columns:
+            continue
+        df[out_name] = pd.to_numeric(df[src], errors="coerce").fillna(0.0).astype(np.float32)
+        added.append(out_name)
+    if len(added) < 4 and {"bo_range_atr", "bo_body_atr"}.issubset(df.columns):
+        if "l1b_atom_range_over_body" not in df.columns and "l1b_atom_range_over_body" not in base_set:
+            body = np.abs(pd.to_numeric(df["bo_body_atr"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+            rng = pd.to_numeric(df["bo_range_atr"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            df["l1b_atom_range_over_body"] = (rng / np.maximum(body, 1e-6)).clip(0.0, 50.0).astype(np.float32)
+            added.append("l1b_atom_range_over_body")
+    return added
 
 
 def _l1b_cross_context_reliable(df: pd.DataFrame) -> bool:
@@ -838,6 +908,13 @@ def _l1b_head_feature_cols(head: str, feature_cols: list[str]) -> tuple[list[str
 
 
 def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Heuristic PA/BO composites for training diagnostics and fused ``l1b_weighted_direction``.
+
+    These are not supervised targets. P1 roadmap: optional LightGBM heads with proper labels + OOF,
+    or backtest-validated formulas; keep this block as a cheap prior until then.
+    """
+    setup_long = _col_f32(df, "pa_ctx_setup_long")
+    setup_short = _col_f32(df, "pa_ctx_setup_short")
     trend_long = _col_f32(df, "pa_ctx_setup_trend_long")
     trend_short = _col_f32(df, "pa_ctx_setup_trend_short")
     pullback_long = _col_f32(df, "pa_ctx_setup_pullback_long")
@@ -860,13 +937,25 @@ def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray
         + 0.18 * np.clip(_col_f32(df, "bo_vol_spike"), 0.0, 2.0) / 2.0
         + 0.14 * np.clip(_col_f32(df, "bo_close_extremity"), 0.0, 1.0)
         + 0.12 * np.maximum(follow_long, follow_short)
-        + 0.10 * np.maximum(_col_f32(df, "pa_ctx_setup_long"), _col_f32(df, "pa_ctx_setup_short"))
+        + 0.10 * np.maximum(setup_long, setup_short)
         - 0.10 * structure_veto
         - 0.08 * np.maximum(premise_break_long, premise_break_short)
     )
     mean_reversion_setup = _clip01(np.maximum(range_long, range_short))
     trend_strength = _clip01(np.maximum(trend_long, trend_short))
-    range_reversal_setup = _clip01(np.maximum(range_long, range_short))
+    absorb_mx = np.maximum(_col_f32(df, "pa_vol_absorption_bull"), _col_f32(df, "pa_vol_absorption_bear"))
+    close_ext = _clip01(_col_f32(df, "bo_close_extremity"))
+    wick_abs = _clip01(np.abs(wick_imbalance))
+    failed_mx = np.maximum(failed_breakout_long, failed_breakout_short)
+    range_pressure = _clip01(_col_f32(df, "pa_ctx_range_pressure"))
+    reversal_micro = _clip01(
+        0.28 * absorb_mx
+        + 0.22 * close_ext
+        + 0.20 * failed_mx
+        + 0.18 * wick_abs
+        + 0.12 * range_pressure
+    )
+    range_reversal_setup = _clip01(mean_reversion_setup * (0.35 + 0.65 * reversal_micro))
     failed_breakout_setup = _clip01(np.maximum(failed_breakout_long, failed_breakout_short))
 
     long_continuation = np.maximum(trend_long, pullback_long) * follow_long * (1.0 - premise_break_long)
@@ -876,6 +965,51 @@ def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray
     setup_alignment = _clip01(np.maximum.reduce([long_continuation, short_continuation, long_reversal, short_reversal]))
     follow_through_score = _clip01(np.maximum(follow_long, follow_short))
     liquidity_score = _clip01(0.5 + 0.15 * vol_rvol - 0.10 * wick_imbalance)
+    range_skew = np.clip(range_long - range_short, -1.0, 1.0)
+    trend_direction = np.clip(
+        (trend_long - trend_short) * (1.0 - 0.50 * np.clip(np.abs(range_skew), 0.0, 1.0)),
+        -1.0,
+        1.0,
+    ).astype(np.float32)
+    breakout_raw = (
+        0.55 * (setup_long - setup_short)
+        + 0.30 * (follow_long - follow_short)
+        + 0.15 * np.clip(_col_f32(df, "bo_pressure_diff"), -1.0, 1.0)
+    )
+    breakout_direction = np.clip(breakout_raw - 0.12 * trend_direction, -1.0, 1.0).astype(np.float32)
+    mean_reversion_direction = range_skew.astype(np.float32)
+    failed_breakout_direction = np.clip(failed_breakout_long - failed_breakout_short, -1.0, 1.0).astype(np.float32)
+    trend_leg_gate = _clip01(
+        np.maximum.reduce([trend_long, trend_short, pullback_long, pullback_short])
+    )
+    follow_through_direction = np.clip(
+        (follow_long - follow_short) * (0.55 + 0.45 * trend_leg_gate),
+        -1.0,
+        1.0,
+    ).astype(np.float32)
+    directions = np.stack(
+        [
+            trend_direction,
+            breakout_direction,
+            mean_reversion_direction,
+            follow_through_direction,
+            failed_breakout_direction,
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    mr_strength = np.sqrt(np.maximum(mean_reversion_setup * range_reversal_setup, 0.0)).astype(np.float32)
+    strengths = np.stack(
+        [
+            trend_strength,
+            breakout_quality,
+            mr_strength,
+            follow_through_score,
+            failed_breakout_setup,
+        ],
+        axis=-1,
+    ).astype(np.float32, copy=False)
+    weights = strengths / np.maximum(strengths.sum(axis=-1, keepdims=True), 1e-6)
+    weighted_direction = np.clip(np.sum(directions * weights, axis=-1), -1.0, 1.0).astype(np.float32, copy=False)
 
     return {
         "l1b_breakout_quality": breakout_quality.astype(np.float32, copy=False),
@@ -886,6 +1020,12 @@ def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray
         "l1b_setup_alignment": setup_alignment.astype(np.float32, copy=False),
         "l1b_follow_through_score": follow_through_score.astype(np.float32, copy=False),
         "l1b_liquidity_score": liquidity_score.astype(np.float32, copy=False),
+        "l1b_trend_direction": trend_direction,
+        "l1b_breakout_direction": breakout_direction,
+        "l1b_mean_reversion_direction": mean_reversion_direction,
+        "l1b_failed_breakout_direction": failed_breakout_direction,
+        "l1b_follow_through_direction": follow_through_direction,
+        "l1b_weighted_direction": weighted_direction,
     }
 
 
@@ -969,9 +1109,26 @@ def _compute_l1b_deterministic_outputs(
     *,
     cross_context_reliable: bool,
 ) -> pd.DataFrame:
+    """Columns merged into the L1b cache / L2 merge: slim deterministic export only."""
+    del cross_context_reliable
     n_rows = len(cross.index)
     out = pd.DataFrame(index=cross.index)
-    for col in L1B_DIRECT_SEMANTIC_COLS:
+    for col in L1B_EXPORT_DETERMINISTIC_COLS:
+        values = np.asarray(direct_outputs.get(col, np.zeros(n_rows, dtype=np.float32)), dtype=np.float32).ravel()
+        out[col] = values
+    return out
+
+
+def _l1b_rule_diagnostics_frame(
+    direct_outputs: dict[str, np.ndarray],
+    cross: pd.DataFrame,
+    *,
+    cross_context_reliable: bool,
+) -> pd.DataFrame:
+    """Full rule-based heads + cross-asset context for train/val correlation logging."""
+    n_rows = len(cross.index)
+    out = pd.DataFrame(index=cross.index)
+    for col in L1B_RULE_DIRECT_AND_DIRECTION_COLS:
         values = np.asarray(direct_outputs.get(col, np.zeros(n_rows, dtype=np.float32)), dtype=np.float32).ravel()
         out[col] = values
     for col in L1B_DIRECT_CONTEXT_COLS:
@@ -988,6 +1145,56 @@ def _corr1d(a: np.ndarray, b: np.ndarray) -> float:
     if np.std(a) < 1e-12 or np.std(b) < 1e-12:
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
+
+
+def _log_l1b_semantic_head_diagnostics(
+    work: pd.DataFrame,
+    outputs: pd.DataFrame,
+    *,
+    train_mask: np.ndarray,
+    val_mask: np.ndarray,
+) -> None:
+    """Train/val distribution and correlation with realized decision-window edge (ATR). Heads are rule-based [0,1] or [-1,1]."""
+    fwd = _decision_edge_atr_array(work).astype(np.float64)
+    label_ok = _l1b_edge_label_valid(work)
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    val = np.asarray(val_mask, dtype=bool).ravel()
+    print(
+        "  [L1b] semantic head diagnostics (deterministic PA/BO rules; corr vs raw decision edge, finite labels only)",
+        flush=True,
+    )
+
+    def _one_split(head: str, hv: np.ndarray, split: np.ndarray, name: str) -> None:
+        hv = np.asarray(hv, dtype=np.float64).ravel()
+        dist_m = split & np.isfinite(hv)
+        corr_m = split & label_ok & np.isfinite(hv) & np.isfinite(fwd)
+        n_d = int(np.sum(dist_m))
+        n_c = int(np.sum(corr_m))
+        if n_d < 1:
+            print(f"    [{name}] {head}: (no rows)", flush=True)
+            return
+        xs = hv[dist_m]
+        p5, p50, p95 = np.percentile(xs, [5.0, 50.0, 95.0]).tolist()
+        cor = _corr1d(hv[corr_m], fwd[corr_m]) if n_c >= 30 else float("nan")
+        cor_s = f"{cor:.4f}" if np.isfinite(cor) else "nan"
+        print(
+            f"    [{name}] {head}: n_dist={n_d:,}  mean={float(np.mean(xs)):.4f}  std={float(np.std(xs)):.4f}  "
+            f"p5/p50/p95={p5:.4f}/{p50:.4f}/{p95:.4f}  corr(edge)_n={n_c:,}  corr={cor_s}",
+            flush=True,
+        )
+
+    for group_name, cols in (
+        ("direct [0,1]", list(L1B_DIRECT_SEMANTIC_COLS)),
+        ("directional [-1,1]", list(L1B_DIRECTIONAL_SEMANTIC_COLS)),
+    ):
+        print(f"  [L1b] — {group_name} —", flush=True)
+        for col in cols:
+            if col not in outputs.columns:
+                print(f"    [train] {col}: (missing column)", flush=True)
+                continue
+            hv = outputs[col].to_numpy(dtype=np.float64, copy=False)
+            _one_split(col, hv, train, "train")
+            _one_split(col, hv, val, "val")
 
 
 def _l1b_val_report(head: str, y_t: np.ndarray, y_p: np.ndarray, *, binary: bool | None = None) -> None:
@@ -1118,6 +1325,195 @@ def _log_l1b_candidate_diagnostics(
     )
 
 
+def _l1b_edge_dq_lgb_params() -> dict[str, Any]:
+    fast = FAST_TRAIN_MODE
+    return {
+        "objective": "regression",
+        "metric": "l2",
+        "learning_rate": 0.08 if fast else 0.05,
+        "num_leaves": 31 if fast else 63,
+        "max_depth": -1,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "min_child_samples": 25 if fast else 40,
+        "lambda_l1": 0.1,
+        "lambda_l2": 1.0,
+        "verbosity": -1,
+        "seed": 42,
+        "n_jobs": _lgbm_n_jobs(),
+    }
+
+
+def _l1b_edge_dq_train_config() -> tuple[int, int]:
+    rounds = int(os.environ.get("L1B_EDGE_DQ_BOOST_ROUNDS", str(250 if FAST_TRAIN_MODE else 800)))
+    es = int(os.environ.get("L1B_EDGE_DQ_ES_ROUNDS", str(45 if FAST_TRAIN_MODE else 110)))
+    return max(50, rounds), max(20, es)
+
+
+def _l1b_edge_label_valid(work: pd.DataFrame) -> np.ndarray:
+    """Rows with a realizable edge label (raw label finite). Excludes tail/invalid rows where label_v2 left NaN (``fillna(0)`` in helpers would otherwise fake a target)."""
+    if "decision_net_edge_atr" in work.columns:
+        v = pd.to_numeric(work["decision_net_edge_atr"], errors="coerce").to_numpy(dtype=np.float64)
+        return np.isfinite(v)
+    if {"decision_mfe_atr", "decision_mae_atr"}.issubset(work.columns):
+        mfe = pd.to_numeric(work["decision_mfe_atr"], errors="coerce").to_numpy(dtype=np.float64)
+        mae = pd.to_numeric(work["decision_mae_atr"], errors="coerce").to_numpy(dtype=np.float64)
+        return np.isfinite(mfe) & np.isfinite(mae)
+    return np.ones(len(work), dtype=bool)
+
+
+def _l1b_dq_label_valid(work: pd.DataFrame) -> np.ndarray:
+    if {"decision_mfe_atr", "decision_mae_atr"}.issubset(work.columns):
+        mfe = pd.to_numeric(work["decision_mfe_atr"], errors="coerce").to_numpy(dtype=np.float64)
+        mae = pd.to_numeric(work["decision_mae_atr"], errors="coerce").to_numpy(dtype=np.float64)
+        return np.isfinite(mfe) & np.isfinite(mae)
+    return np.ones(len(work), dtype=bool)
+
+
+def _l1b_fit_lgb_regressor(
+    label: str,
+    y: np.ndarray,
+    X: np.ndarray,
+    feature_cols: list[str],
+    *,
+    train_mask: np.ndarray,
+    val_mask: np.ndarray,
+    out_path: str,
+    label_row_ok: np.ndarray | None = None,
+) -> lgb.Booster:
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    val = np.asarray(val_mask, dtype=bool).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+    if label_row_ok is None:
+        label_row_ok = np.ones(len(y), dtype=bool)
+    else:
+        label_row_ok = np.asarray(label_row_ok, dtype=bool).ravel()
+    row_ok = np.all(np.isfinite(X), axis=1) & label_row_ok & np.isfinite(y)
+    fit_tr = train & row_ok
+    fit_val = val & row_ok
+    rounds, es_rounds = _l1b_edge_dq_train_config()
+    params = _l1b_edge_dq_lgb_params()
+    if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_val)) < 20:
+        raise RuntimeError(
+            f"L1b {label}: insufficient rows for edge/dq regressor "
+            f"(train={int(np.sum(fit_tr))}, val={int(np.sum(fit_val))})."
+        )
+    dtrain = lgb.Dataset(X[fit_tr], label=y[fit_tr], feature_name=feature_cols, free_raw_data=False)
+    dval = lgb.Dataset(X[fit_val], label=y[fit_val], feature_name=feature_cols, free_raw_data=False)
+    cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds, f"[L1b] {label}", first_metric_only=True)
+    try:
+        booster = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=rounds,
+            valid_sets=[dval],
+            callbacks=cbs,
+        )
+    finally:
+        for fn in cl:
+            fn()
+    booster.save_model(out_path)
+    pred_tr = booster.predict(X[fit_tr]).astype(np.float64)
+    y_tr = y[fit_tr]
+    mae_tr = float(mean_absolute_error(y_tr, pred_tr))
+    std_tr = float(np.std(y_tr)) if y_tr.size > 1 else 0.0
+    pred_v = booster.predict(X[fit_val]).astype(np.float64)
+    y_v = y[fit_val]
+    mae_v = float(mean_absolute_error(y_v, pred_v))
+    std_v = float(np.std(y_v)) if y_v.size > 1 else 0.0
+    cor_v = _corr1d(y_v, pred_v)
+    gap = mae_v - mae_tr
+    print(
+        f"  [L1b] {label} booster: train_MAE={mae_tr:.4f}  val_MAE={mae_v:.4f}  gap={gap:+.4f}  "
+        f"val_corr={cor_v:.4f}  val_n={int(np.sum(fit_val)):,}  val_target_std={std_v:.4f}  "
+        f"train_n={int(np.sum(fit_tr)):,}  train_target_std={std_tr:.4f}  -> {out_path}",
+        flush=True,
+    )
+    return booster
+
+
+def _fit_l1b_edge_dq_boosters(
+    work: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    train_mask: np.ndarray,
+    val_mask: np.ndarray,
+) -> tuple[dict[str, lgb.Booster], dict[str, str], dict[str, np.ndarray], dict[str, Any]]:
+    edge_tgt = np.clip(_decision_edge_atr_array(work), -5.0, 5.0).astype(np.float64)
+    mfe, mae = _mfe_mae_atr_arrays(work)
+    mode = (os.environ.get("L1B_DQ_TARGET_MODE", "path_balance") or "path_balance").strip().lower()
+    mfe_c = np.clip(np.asarray(mfe, dtype=np.float64), 0.0, 8.0)
+    mae_c = np.clip(np.asarray(mae, dtype=np.float64), 0.0, 8.0)
+    if mode in {"legacy", "mfe_minus_mae"}:
+        dq_tgt = np.clip(mfe_c - mae_c, -5.0, 5.0).astype(np.float64)
+        dq_desc = "clip(mfe-mae,±5) ATR [legacy]"
+        dq_clip_lo, dq_clip_hi = -5.0, 5.0
+    else:
+        dq_tgt = (mfe_c - mae_c) / np.maximum(mfe_c + mae_c, 1e-6)
+        dq_tgt = np.clip(dq_tgt, -1.0, 1.0).astype(np.float64)
+        dq_desc = "clip((mfe-mae)/(mfe+mae),±1) path-balance (orthogonal to edge construction)"
+        dq_clip_lo, dq_clip_hi = -1.0, 1.0
+    X = work[feature_cols].to_numpy(dtype=np.float64, copy=False)
+    edge_label_ok = _l1b_edge_label_valid(work)
+    dq_label_ok = _l1b_dq_label_valid(work)
+    tm = np.asarray(train_mask, dtype=bool).ravel()
+    ok_both = tm & edge_label_ok & dq_label_ok & np.isfinite(edge_tgt) & np.isfinite(dq_tgt)
+    if int(np.sum(ok_both)) > 50:
+        c_ed = _corr1d(edge_tgt[ok_both], dq_tgt[ok_both])
+        print(
+            f"  [L1b] edge vs dq_target train corr (finite rows n={int(np.sum(ok_both)):,})={c_ed:.4f}  dq_mode={mode!r}",
+            flush=True,
+        )
+    log_label_baseline("l1b_edge_target", edge_tgt[tm & edge_label_ok], task="reg")
+    log_label_baseline("l1b_dq_target", dq_tgt[tm & dq_label_ok], task="reg")
+    models: dict[str, lgb.Booster] = {}
+    model_files: dict[str, str] = {}
+    edge_path = os.path.join(MODEL_DIR, L1B_EDGE_PRED_FILE)
+    dq_path = os.path.join(MODEL_DIR, L1B_DQ_PRED_FILE)
+    models["l1b_edge_pred"] = _l1b_fit_lgb_regressor(
+        "l1b_edge_pred",
+        edge_tgt,
+        X,
+        feature_cols,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        out_path=edge_path,
+        label_row_ok=edge_label_ok,
+    )
+    models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
+        "l1b_dq_pred",
+        dq_tgt,
+        X,
+        feature_cols,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        out_path=dq_path,
+        label_row_ok=dq_label_ok,
+    )
+    model_files["l1b_edge_pred"] = L1B_EDGE_PRED_FILE
+    model_files["l1b_dq_pred"] = L1B_DQ_PRED_FILE
+    preds = {
+        "l1b_edge_pred": np.clip(models["l1b_edge_pred"].predict(X), -5.0, 5.0).astype(np.float32),
+        "l1b_dq_pred": np.clip(
+            models["l1b_dq_pred"].predict(X).astype(np.float64),
+            dq_clip_lo,
+            dq_clip_hi,
+        ).astype(np.float32),
+    }
+    block_meta = {
+        "targets": {
+            "l1b_edge_pred": "clip(decision_net_edge_atr or mfe*theta - penalty*mae, ±5) ATR units",
+            "l1b_dq_pred": dq_desc,
+        },
+        "dq_target_mode": mode,
+        "dq_pred_clip": [dq_clip_lo, dq_clip_hi],
+        "boost_rounds_env": "L1B_EDGE_DQ_BOOST_ROUNDS",
+        "early_stopping_env": "L1B_EDGE_DQ_ES_ROUNDS",
+    }
+    return models, model_files, preds, block_meta
+
+
 def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTrainingBundle:
     work = df.copy()
     feature_cols = _select_l1b_feature_cols(work, feat_cols)
@@ -1152,7 +1548,14 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     )
     log_numpy_x_stats("L1b", X[train_mask], label="X[train]")
     print(f"  [L1b] target/output schema L1B_OUTPUT_COLS count={len(L1B_OUTPUT_COLS)}: {L1B_OUTPUT_COLS}", flush=True)
-    print(f"  [L1b] input feature count: {len(feature_cols)}", flush=True)
+    atomic_supervised = _l1b_attach_atomic_supervised_columns(work, feature_cols)
+    supervised_feature_cols = list(feature_cols) + atomic_supervised
+    print(f"  [L1b] input feature count (unsupervised PCA/KMeans): {len(feature_cols)}", flush=True)
+    print(
+        f" supervised augment: +{len(atomic_supervised)} atom cols (internal only; not in L1B_OUTPUT_COLS)  "
+        f"examples={atomic_supervised[:5]}{'...' if len(atomic_supervised) > 5 else ''}",
+        flush=True,
+    )
     print(f"  [L1b] artifact dir: {MODEL_DIR}", flush=True)
     print(f"  [L1b] will write meta/cache: {artifact_path(L1B_META_FILE)} | {artifact_path(L1B_OUTPUT_CACHE_FILE)}", flush=True)
     print(
@@ -1171,12 +1574,22 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         ],
         axis=1,
     )
+    rule_diag = _l1b_rule_diagnostics_frame(
+        direct_outputs, cross, cross_context_reliable=cross_context_reliable
+    )
+    print(
+        "  [L1b] note: 8 direct + 6 directional + 3 cross-asset ctx columns are rule diagnostics only; "
+        f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (unsup + edge/dq + "
+        f"{', '.join(L1B_EXPORT_DETERMINISTIC_COLS)}).",
+        flush=True,
+    )
+    _log_l1b_semantic_head_diagnostics(work, rule_diag, train_mask=train_mask, val_mask=val_mask)
     unsup_outputs, unsup_meta = _fit_l1b_unsupervised_block(work, feature_cols, train_mask=train_mask)
     outputs = pd.concat([outputs, unsup_outputs.reset_index(drop=True)], axis=1)
     print(f"  [L1b] cluster heads: {L1B_CLUSTER_COLS}", flush=True)
     print(f"  [L1b] latent heads: {L1B_LATENT_HEADS}", flush=True)
-    print(f"  [L1b] direct semantic heads: {L1B_DIRECT_SEMANTIC_COLS}", flush=True)
-    print(f"  [L1b] direct context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
+    print(f"  [L1b] rule diagnostic direct heads: {L1B_DIRECT_SEMANTIC_COLS}", flush=True)
+    print(f"  [L1b] rule diagnostic context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
     print(
         f"  [L1b] latent explained_variance_ratio="
         f"{np.round(np.asarray(unsup_meta['latent_head_meta']['explained_variance_ratio'], dtype=np.float32), 4).tolist()}  "
@@ -1185,7 +1598,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     )
     if not cross_context_reliable:
         print(
-            "  [L1b] cross-asset context deemed unreliable (need at least 2 aligned symbols/200 rows); direct context heads will be zeroed.",
+            "  [L1b] cross-asset context unreliable for diagnostics (need ≥2 symbols & 200 rows); "
+            "rule_diag context columns zeroed (not exported to L1b cache).",
             flush=True,
         )
     _log_l1b_unsupervised_diagnostics(
@@ -1195,28 +1609,39 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         cluster_cols=list(L1B_CLUSTER_COLS),
         latent_cols=list(L1B_LATENT_EMBED_COLS),
     )
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    l1b_supervised_models, edge_dq_model_files, edge_dq_preds, edge_dq_block_meta = _fit_l1b_edge_dq_boosters(
+        work, supervised_feature_cols, train_mask=train_mask, val_mask=val_mask
+    )
+    for k, arr in edge_dq_preds.items():
+        outputs[k] = arr
     for col in L1B_OUTPUT_COLS:
         if col not in outputs.columns:
             outputs[col] = 0.0
+    _out_keep = ["symbol", "time_key"] + [c for c in L1B_OUTPUT_COLS if c in outputs.columns]
+    outputs = outputs[_out_keep]
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
     meta = {
         "schema_version": L1B_SCHEMA_VERSION,
         "feature_cols": feature_cols,
+        "supervised_feature_cols": supervised_feature_cols,
+        "supervised_atomic_cols": atomic_supervised,
         "output_cols": L1B_OUTPUT_COLS,
-        "model_output_cols": [],
+        "model_output_cols": list(L1B_SUPERVISED_REGRESSOR_COLS),
         "cluster_output_cols": list(L1B_CLUSTER_COLS),
         "latent_output_cols": list(L1B_LATENT_HEADS),
         "unsupervised_output_cols": list(L1B_UNSUPERVISED_COLS),
-        "direct_output_cols": sorted(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
-        "deterministic_output_cols": list(L1B_DIRECT_SEMANTIC_COLS + L1B_DIRECT_CONTEXT_COLS),
+        "direct_output_cols": sorted(L1B_EXPORT_DETERMINISTIC_COLS),
+        "deterministic_output_cols": list(L1B_EXPORT_DETERMINISTIC_COLS),
+        "rule_diagnostic_cols": sorted(L1B_RULE_DIRECT_AND_DIRECTION_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deprecated_output_cols": ["l1b_pullback_setup", "l1b_failure_risk", "l1b_shock_risk"],
         "constant_output_values": {},
-        "model_files": {},
-        "head_feature_cols": {},
+        "model_files": dict(edge_dq_model_files),
+        "head_feature_cols": {h: list(supervised_feature_cols) for h in L1B_SUPERVISED_REGRESSOR_COLS},
         "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": (
-            "retired: supervised semantic heads removed in favor of unsupervised cluster and latent features"
+            "Binary pullback/failure/shock targets still use candidate scores from full internal rule dict; "
+            "exported L1b cache is unsupervised + l1b_edge_pred/l1b_dq_pred + l1b_weighted_direction only."
         ),
         "unsupervised_semantics": (
             "deterministic direct descriptors plus train-only PCA embeddings, soft cluster posteriors, "
@@ -1224,6 +1649,12 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         ),
         "latent_head_meta": unsup_meta["latent_head_meta"],
         "unsupervised_block_meta": unsup_meta,
+        "supervised_edge_dq_block_meta": edge_dq_block_meta,
+        "supervised_edge_dq_semantics": (
+            "Independent LightGBM regressors: l1b_edge_pred ~ clipped net edge (±5 ATR); "
+            "l1b_dq_pred ~ path-balance (mfe−mae)/(mfe+mae) in ±1 by default (env L1B_DQ_TARGET_MODE=legacy for mfe−mae). "
+            "Supervised inputs = tabular base + l1b_atom_* columns (not passed to L2)."
+        ),
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
     with open(os.path.join(MODEL_DIR, L1B_META_FILE), "wb") as f:
@@ -1231,7 +1662,7 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     cache_path = save_output_cache(outputs, L1B_OUTPUT_CACHE_FILE)
     print(f"  [L1b] meta saved  -> {os.path.join(MODEL_DIR, L1B_META_FILE)}", flush=True)
     print(f"  [L1b] cache saved -> {cache_path}", flush=True)
-    return L1BTrainingBundle(models={}, meta=meta, outputs=outputs)
+    return L1BTrainingBundle(models=l1b_supervised_models, meta=meta, outputs=outputs)
 
 
 def load_l1b_market_descriptor() -> tuple[dict[str, lgb.Booster], dict[str, Any]]:
@@ -1255,6 +1686,11 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
     for col in feature_cols:
         if col not in work.columns:
             work[col] = 0.0
+    _l1b_attach_atomic_supervised_columns(work, feature_cols)
+    sup_cols = list(meta.get("supervised_feature_cols") or feature_cols)
+    dq_meta = meta.get("supervised_edge_dq_block_meta") or {}
+    dq_lo, dq_hi = dq_meta.get("dq_pred_clip", [-5.0, 5.0])
+    dq_lo, dq_hi = float(dq_lo), float(dq_hi)
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     direct_outputs = _build_l1b_direct_semantic_outputs(work)
     cross = compute_cross_asset_context(work)
@@ -1280,7 +1716,22 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
     unsup_meta = meta.get("unsupervised_block_meta") or {}
     if unsup_meta:
         outputs = pd.concat([outputs, _apply_l1b_unsupervised_block(work, unsup_meta).reset_index(drop=True)], axis=1)
-    for col in meta.get("output_cols", L1B_OUTPUT_COLS):
+    for col in sup_cols:
+        if col not in work.columns:
+            work[col] = 0.0
+    X_inf = work[sup_cols].to_numpy(dtype=np.float64, copy=False)
+    for head in L1B_SUPERVISED_REGRESSOR_COLS:
+        mdl = models.get(head)
+        if mdl is not None:
+            pred = mdl.predict(X_inf).astype(np.float64)
+            if head == "l1b_dq_pred":
+                pred = np.clip(pred, dq_lo, dq_hi)
+            else:
+                pred = np.clip(pred, -5.0, 5.0)
+            outputs[head] = pred.astype(np.float32)
+    out_cols = list(meta.get("output_cols", L1B_OUTPUT_COLS))
+    for col in out_cols:
         if col not in outputs.columns:
             outputs[col] = 0.0
-    return outputs
+    _keep = ["symbol", "time_key"] + out_cols
+    return outputs[_keep]

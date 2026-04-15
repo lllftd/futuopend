@@ -30,17 +30,31 @@ class FocalLoss(nn.Module):
     Focal Loss for multi-class classification.
     gamma=0 退化为标准 weighted CE。
     """
-    def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0, reduction: str = 'mean'):
+    def __init__(
+        self,
+        alpha: torch.Tensor | None = None,
+        gamma: float = 2.0,
+        reduction: str = 'mean',
+        *,
+        label_smoothing: float = 0.0,
+    ):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
+        self.label_smoothing = float(label_smoothing)
         if alpha is not None:
             self.register_buffer('alpha', alpha.float())
         else:
             self.alpha = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+        ce = F.cross_entropy(
+            logits,
+            targets,
+            weight=self.alpha,
+            reduction='none',
+            label_smoothing=self.label_smoothing,
+        )
         pt = torch.exp(-ce)
         focal_term = (1.0 - pt) ** self.gamma
         loss = focal_term * ce
@@ -114,6 +128,77 @@ class TemporalBlock(nn.Module):
         res = self.downsample(x) if self.downsample is not None else x
         # Scale by sqrt(0.5) to prevent exploding activations in deeper layers 
         # (variance compensation for residual connections with weightnorm)
+        return (out + res) * 0.70710678
+
+
+class ChannelSE1d(nn.Module):
+    """Squeeze-and-Excitation over channel dim for (B, C, T)."""
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(channels // int(reduction), 8)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.pool(x).squeeze(-1)
+        w = self.fc(w).unsqueeze(-1)
+        return x * w
+
+
+class L1AGatedTemporalBlock(nn.Module):
+    """
+    L1a backbone only: GLU (value * sigmoid(gate)), GroupNorm (groups=1), optional SE.
+    Causal conv + residual scaling match TemporalBlock training stability.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+        *,
+        use_se: bool = True,
+    ):
+        super().__init__()
+        self.conv1 = CausalConv1d(in_ch, out_ch * 2, kernel_size, dilation)
+        weight_norm(self.conv1.conv)
+        self.conv2 = CausalConv1d(out_ch, out_ch * 2, kernel_size, dilation)
+        weight_norm(self.conv2.conv)
+        if self.conv1.conv.bias is not None:
+            nn.init.constant_(self.conv1.conv.bias[out_ch:], 1.0)
+        if self.conv2.conv.bias is not None:
+            nn.init.constant_(self.conv2.conv.bias[out_ch:], 1.0)
+        self.gn1 = nn.GroupNorm(1, out_ch)
+        self.gn2 = nn.GroupNorm(1, out_ch)
+        self.spatial_drop = SpatialDropout1d(dropout)
+        self.drop = nn.Dropout(dropout)
+        self.se = ChannelSE1d(out_ch) if use_se else nn.Identity()
+        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+        if self.downsample is not None:
+            self.downsample = weight_norm(self.downsample)
+
+    @staticmethod
+    def _glu(x: torch.Tensor) -> torch.Tensor:
+        value, gate = x.chunk(2, dim=1)
+        return value * torch.sigmoid(gate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.downsample(x) if self.downsample is not None else x
+        out = self._glu(self.conv1(x))
+        out = self.gn1(out)
+        out = self.spatial_drop(out)
+        out = self._glu(self.conv2(out))
+        out = self.gn2(out)
+        out = self.drop(out)
+        out = self.se(out)
         return (out + res) * 0.70710678
 
 

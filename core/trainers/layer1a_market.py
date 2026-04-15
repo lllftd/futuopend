@@ -22,10 +22,11 @@ from sklearn.metrics import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import trange, tqdm
 
-from core.tcn_pa_state import FocalLoss, TemporalAttentionReadout, TemporalBlock
+from core.tcn_pa_state import FocalLoss, L1AGatedTemporalBlock, TemporalAttentionReadout
 from core.trainers.constants import (
     FAST_TRAIN_MODE,
     L1A_META_FILE,
@@ -37,6 +38,7 @@ from core.trainers.constants import (
     NUM_REGIME_CLASSES,
     REGIME_NOW_PROB_COLS,
 )
+
 from core.trainers.data_prep import _create_tcn_windows
 from core.trainers.lgbm_utils import TQDM_FILE, _lgb_round_tqdm_enabled, _lgbm_n_jobs, _options_target_config
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_arrays
@@ -54,16 +56,69 @@ def _bounded_scalar_cols() -> list[str]:
     return ["l1a_transition_risk"]
 
 
-def l1a_output_columns() -> list[str]:
+def _l1a_direction_cols() -> list[str]:
+    return [
+        "l1a_dir_bull_minus_bear",
+        "l1a_dir_confidence",
+        "l1a_dir_normalized",
+        "l1a_bull_convergence",
+        "l1a_bear_convergence",
+        "l1a_dir_x_vol",
+        "l1a_dir_x_stability",
+    ]
+
+
+def _l1a_embed_dim() -> int:
+    return max(4, int(os.environ.get("L1A_EMBED_DIM", "8")))
+
+
+def l1a_output_columns_with_embed_dim(embed_dim: int) -> list[str]:
+    d = max(4, int(embed_dim))
     return (
         list(L1A_REGIME_COLS)
         + [
             "l1a_transition_risk",
             "l1a_vol_forecast",
+            "l1a_vol_trend",
+            "l1a_time_in_regime",
         ]
-        + [f"l1a_market_embed_{idx}" for idx in range(16)]
+        + _l1a_direction_cols()
+        + [f"l1a_market_embed_{idx}" for idx in range(d)]
         + ["l1a_is_warm"]
     )
+
+
+def l1a_output_columns() -> list[str]:
+    return l1a_output_columns_with_embed_dim(_l1a_embed_dim())
+
+
+def _derive_l1a_direction_features(
+    regime_probs: np.ndarray,
+    transition_risk: np.ndarray,
+    vol_forecast: np.ndarray,
+) -> dict[str, np.ndarray]:
+    regime = np.asarray(regime_probs, dtype=np.float32)
+    if regime.ndim != 2 or regime.shape[1] != NUM_REGIME_CLASSES:
+        raise ValueError(
+            f"L1a direction features expect regime_probs shape (n, {NUM_REGIME_CLASSES}), got {regime.shape!r}."
+        )
+    transition = np.clip(np.asarray(transition_risk, dtype=np.float32).ravel(), 0.0, 1.0)
+    vol = np.clip(np.asarray(vol_forecast, dtype=np.float32).ravel(), 0.0, 5.0)
+    bull = regime[:, 0] + regime[:, 1]
+    bear = regime[:, 2] + regime[:, 3]
+    range_mass = regime[:, 4] + regime[:, 5]
+    directional_mass = np.maximum(bull + bear, 1e-6)
+    dir_signal = np.clip(bull - bear, -1.0, 1.0)
+    dir_conf = np.clip(1.0 - range_mass, 0.0, 1.0)
+    return {
+        "l1a_dir_bull_minus_bear": dir_signal.astype(np.float32, copy=False),
+        "l1a_dir_confidence": dir_conf.astype(np.float32, copy=False),
+        "l1a_dir_normalized": np.clip(dir_signal / directional_mass, -1.0, 1.0).astype(np.float32, copy=False),
+        "l1a_bull_convergence": np.clip(regime[:, 0] - regime[:, 1], -1.0, 1.0).astype(np.float32, copy=False),
+        "l1a_bear_convergence": np.clip(regime[:, 2] - regime[:, 3], -1.0, 1.0).astype(np.float32, copy=False),
+        "l1a_dir_x_vol": np.clip(dir_signal * vol, -5.0, 5.0).astype(np.float32, copy=False),
+        "l1a_dir_x_stability": np.clip(dir_signal * (1.0 - transition), -1.0, 1.0).astype(np.float32, copy=False),
+    }
 
 
 def _l1a_readout_type() -> str:
@@ -74,17 +129,46 @@ def _l1a_min_attention_seq_len() -> int:
     return max(1, int(os.environ.get("L1A_MIN_ATTENTION_SEQ_LEN", os.environ.get("TCN_MIN_ATTENTION_SEQ_LEN", "4"))))
 
 
+def _l1a_dataloader_workers(default: int) -> int:
+    raw = os.environ.get("L1A_DATALOADER_WORKERS", "").strip()
+    workers = int(raw) if raw else int(default)
+    return max(0, min(workers, 4))
+
+
+def _l1a_tcn_channels() -> list[int]:
+    raw = os.environ.get("L1A_TCN_CHANNELS", "").strip()
+    if raw:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    return [48, 48, 64]
+
+
+def _l1a_tcn_dropout() -> float:
+    return float(os.environ.get("L1A_TCN_DROPOUT", "0.3"))
+
+
+def _l1a_readout_dropout() -> float:
+    return float(os.environ.get("L1A_READOUT_DROPOUT", "0.25"))
+
+
+def _l1a_head_dropout() -> float:
+    return float(os.environ.get("L1A_HEAD_DROPOUT", "0.3"))
+
+
 def _l1a_loss_weights() -> dict[str, float]:
-    embed = float(os.environ.get("L1A_EMBED_RECON_WEIGHT", "0.05"))
-    transition = float(os.environ.get("L1A_TRANSITION_WEIGHT", "0.25"))
-    vol = float(os.environ.get("L1A_VOL_WEIGHT", "0.20"))
-    regime = float(os.environ.get("L1A_REGIME_WEIGHT", "0.50"))
-    total = max(regime + vol + transition + embed, 1e-8)
+    embed = float(os.environ.get("L1A_EMBED_RECON_WEIGHT", "0.22"))
+    transition = float(os.environ.get("L1A_TRANSITION_WEIGHT", "0.10"))
+    vol = float(os.environ.get("L1A_VOL_WEIGHT", "0.22"))
+    regime = float(os.environ.get("L1A_REGIME_WEIGHT", "0.36"))
+    vol_trend = float(os.environ.get("L1A_VOL_TREND_WEIGHT", "0.07"))
+    time_ir = float(os.environ.get("L1A_TIME_IN_REGIME_WEIGHT", "0.07"))
+    total = max(regime + vol + transition + embed + vol_trend + time_ir, 1e-8)
     return {
         "regime": regime / total,
         "vol": vol / total,
         "transition": transition / total,
         "embed_recon": embed / total,
+        "vol_trend": vol_trend / total,
+        "time_in_regime": time_ir / total,
     }
 
 
@@ -100,7 +184,29 @@ def _l1a_regime_loss(
     weights = inv / max(float(np.mean(inv)), 1e-8)
     alpha = torch.tensor(weights, dtype=torch.float32, device=device)
     gamma = float(os.environ.get("L1A_REGIME_FOCAL_GAMMA", "1.5"))
-    return FocalLoss(alpha=alpha, gamma=gamma, reduction="mean")
+    ls = float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1"))
+    return FocalLoss(alpha=alpha, gamma=gamma, reduction="mean", label_smoothing=ls)
+
+
+class _BCEFocalWithLogits(nn.Module):
+    """Binary focal loss on logits; targets in {0,1}."""
+
+    def __init__(self, *, gamma: float = 2.0, alpha: float = 0.75):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.alpha = float(alpha)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        t = targets.float().view(-1)
+        z = logits.view(-1)
+        log_p = F.logsigmoid(z)
+        log_1p = F.logsigmoid(-z)
+        ce = -t * log_p - (1.0 - t) * log_1p
+        prob = torch.exp(log_p)
+        p_t = prob * t + (1.0 - prob) * (1.0 - t)
+        alpha_t = self.alpha * t + (1.0 - self.alpha) * (1.0 - t)
+        loss = alpha_t * (1.0 - p_t).clamp_min(1e-6).pow(self.gamma) * ce
+        return loss.mean()
 
 
 def _l1a_transition_loss(
@@ -112,6 +218,11 @@ def _l1a_transition_loss(
     pos = float(np.sum(y > 0.5))
     neg = float(len(y) - pos)
     pos_weight = torch.tensor(max(neg / max(pos, 1.0), 1.0), dtype=torch.float32, device=device)
+    use_focal = os.environ.get("L1A_TRANSITION_USE_FOCAL", "0").strip().lower() in {"1", "true", "yes"}
+    if use_focal:
+        gamma = float(os.environ.get("L1A_TRANSITION_FOCAL_GAMMA", "2.0"))
+        alpha = float(os.environ.get("L1A_TRANSITION_FOCAL_ALPHA", "0.75"))
+        return _BCEFocalWithLogits(gamma=gamma, alpha=alpha).to(device)
     return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 
@@ -134,6 +245,44 @@ def _future_mean_by_symbol(values: np.ndarray, symbols: np.ndarray, horizon: int
         mean_vals = np.zeros(idx.size, dtype=np.float32)
         mean_vals[valid] = ((csum[end[valid]] - csum[start[valid]]) / counts[valid]).astype(np.float32)
         out[idx] = mean_vals
+    return out
+
+
+def _per_symbol_lag_diff(values: np.ndarray, symbols: np.ndarray, lag: int) -> np.ndarray:
+    lag = max(int(lag), 1)
+    out = np.zeros(len(values), dtype=np.float32)
+    values = np.asarray(values, dtype=np.float64)
+    symbols = np.asarray(symbols)
+    clip_lo = float(os.environ.get("L1A_VOL_TREND_CLIP_LO", "-3"))
+    clip_hi = float(os.environ.get("L1A_VOL_TREND_CLIP_HI", "3"))
+    for sym in pd.unique(symbols):
+        idx = np.flatnonzero(symbols == sym)
+        if idx.size <= lag:
+            continue
+        v = values[idx]
+        d = np.zeros(len(idx), dtype=np.float64)
+        d[lag:] = v[lag:] - v[:-lag]
+        out[idx] = np.clip(d, clip_lo, clip_hi).astype(np.float32)
+    return out
+
+
+def _time_in_regime_fraction(state: np.ndarray, symbols: np.ndarray, cap: int) -> np.ndarray:
+    cap = max(int(cap), 1)
+    out = np.zeros(len(state), dtype=np.float32)
+    state = np.asarray(state, dtype=np.int64)
+    symbols = np.asarray(symbols)
+    for sym in pd.unique(symbols):
+        idx = np.flatnonzero(symbols == sym)
+        if idx.size == 0:
+            continue
+        s = state[idx]
+        run = 0
+        for j in range(len(idx)):
+            if j == 0 or s[j] != s[j - 1]:
+                run = 1
+            else:
+                run += 1
+            out[idx[j]] = float(min(run, cap)) / float(cap)
     return out
 
 
@@ -191,11 +340,17 @@ def _build_l1a_targets(df: pd.DataFrame) -> dict[str, np.ndarray]:
     transition_risk = compute_transition_event_labels(state, symbols, horizon=horizon)
     range_norm = np.clip((high - low) / safe_atr, 0.0, 5.0)
     vol_forecast = _future_mean_by_symbol(range_norm, symbols, horizon=horizon)
+    lag = int(os.environ.get("L1A_VOL_TREND_LAG", "5"))
+    vol_trend = _per_symbol_lag_diff(range_norm, symbols, lag=lag)
+    cap = int(os.environ.get("L1A_TIME_IN_REGIME_CAP", "120"))
+    time_in_regime = _time_in_regime_fraction(state, symbols, cap=cap)
 
     return {
         "regime": state,
         "transition_risk": transition_risk.astype(np.float32),
         "vol_forecast": vol_forecast.astype(np.float32),
+        "vol_trend": vol_trend,
+        "time_in_regime": time_in_regime,
     }
 
 
@@ -215,21 +370,35 @@ def _build_symbol_windows(df: pd.DataFrame, feature_cols: list[str], seq_len: in
 
 
 class TaskHead(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, *, activation: str):
+    """Two-layer MLP readout; use identity for logits (CE / BCEWithLogits)."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        *,
+        activation: str = "identity",
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, output_dim),
         )
         self.activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = self.net(x)
+        y = self.net(x)
         if self.activation == "identity":
-            return logits
-        return logits
+            return y
+        if self.activation == "tanh":
+            return torch.tanh(y)
+        if self.activation == "sigmoid":
+            return torch.sigmoid(y)
+        raise ValueError(f"Unknown TaskHead activation: {self.activation}")
 
 
 class EmbedHead(nn.Module):
@@ -254,14 +423,26 @@ class L1AMarketTCN(nn.Module):
         seq_len: int = SEQ_LEN,
         readout_type: str | None = None,
         min_attention_seq_len: int | None = None,
+        tcn_dropout: float | None = None,
+        readout_dropout: float | None = None,
+        head_dropout: float | None = None,
+        embed_dim: int | None = None,
     ):
         super().__init__()
         if channels is None:
-            channels = [64, 64, 128]
+            channels = _l1a_tcn_channels()
+        td = float(tcn_dropout) if tcn_dropout is not None else _l1a_tcn_dropout()
+        rd = float(readout_dropout) if readout_dropout is not None else _l1a_readout_dropout()
+        hd_drop = float(head_dropout) if head_dropout is not None else _l1a_head_dropout()
         layers: list[nn.Module] = []
+        use_se = os.environ.get("L1A_TCN_USE_SE", "1").strip().lower() in {"1", "true", "yes"}
         for idx, out_ch in enumerate(channels):
             in_ch = input_dim if idx == 0 else channels[idx - 1]
-            layers.append(TemporalBlock(in_ch, out_ch, kernel_size=3, dilation=2**idx, dropout=0.15))
+            layers.append(
+                L1AGatedTemporalBlock(
+                    in_ch, out_ch, kernel_size=3, dilation=2**idx, dropout=td, use_se=use_se
+                )
+            )
         self.backbone = nn.Sequential(*layers)
         self.shared_dim = channels[-1]
         self.seq_len = seq_len
@@ -270,17 +451,23 @@ class L1AMarketTCN(nn.Module):
             int(min_attention_seq_len) if min_attention_seq_len is not None else _l1a_min_attention_seq_len()
         )
         if self.readout_type == "attention":
-            self.readout = TemporalAttentionReadout(self.shared_dim, dropout=0.10)
+            self.readout = TemporalAttentionReadout(self.shared_dim, dropout=rd)
         elif self.readout_type == "last_timestep":
             self.readout = None
         else:
             raise ValueError(f"Unsupported L1A readout_type: {self.readout_type}")
-        self.regime_head = TaskHead(self.shared_dim, 48, NUM_REGIME_CLASSES, activation="identity")
-        self.transition_head = TaskHead(self.shared_dim, 24, 1, activation="identity")
-        self.vol_head = TaskHead(self.shared_dim, 32, 1, activation="identity")
-        self.embed_head = EmbedHead(self.shared_dim, 16)
+        hd = max(self.shared_dim // 2, 32)
+        hd_small = max(hd // 2, 16)
+        ed = int(embed_dim) if embed_dim is not None else _l1a_embed_dim()
+        self.embed_dim = ed
+        self.regime_head = TaskHead(self.shared_dim, hd, NUM_REGIME_CLASSES, activation="identity", dropout=hd_drop)
+        self.transition_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
+        self.vol_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
+        self.vol_trend_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
+        self.time_in_regime_head = TaskHead(self.shared_dim, hd_small, 1, activation="sigmoid", dropout=hd_drop)
+        self.embed_head = EmbedHead(self.shared_dim, ed)
         self.embed_decoder = nn.Sequential(
-            nn.Linear(16, 64),
+            nn.Linear(ed, 64),
             nn.GELU(),
             nn.Linear(64, self.shared_dim),
         )
@@ -295,10 +482,13 @@ class L1AMarketTCN(nn.Module):
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         shared = self.shared_repr(x)
         embed = self.embed_head(shared)
+        regime_logits = self.regime_head(shared)
         return {
-            "regime_logits": self.regime_head(shared),
+            "regime_logits": regime_logits,
             "transition_logit": self.transition_head(shared).squeeze(-1),
             "vol_value": self.vol_head(shared).squeeze(-1),
+            "vol_trend_value": self.vol_trend_head(shared).squeeze(-1),
+            "time_in_regime_value": self.time_in_regime_head(shared).squeeze(-1),
             "market_embed": embed,
             "embed_recon": self.embed_decoder(embed),
             "shared_repr": shared,
@@ -345,27 +535,33 @@ def _train_epoch(
             mininterval=0.25,
             unit="batch",
         )
-    for xb, y_regime, y_transition, y_vol in it:
+    for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in it:
         xb = xb.to(device)
         y_regime = y_regime.to(device)
         y_transition = y_transition.to(device)
         y_vol = y_vol.to(device)
+        y_vol_trend = y_vol_trend.to(device)
+        y_time_ir = y_time_ir.to(device)
         out = model(xb)
         losses = {
             "regime": regime_loss(out["regime_logits"], y_regime),
             "vol": mse(out["vol_value"], y_vol),
+            "vol_trend": mse(out["vol_trend_value"], y_vol_trend),
+            "time_in_regime": mse(out["time_in_regime_value"], y_time_ir),
             "embed_recon": mse(out["embed_recon"], out["shared_repr"].detach()),
             "transition": transition_loss(out["transition_logit"], y_transition),
         }
         loss = (
             loss_weights["regime"] * losses["regime"]
             + loss_weights["vol"] * losses["vol"]
+            + loss_weights["vol_trend"] * losses["vol_trend"]
+            + loss_weights["time_in_regime"] * losses["time_in_regime"]
             + loss_weights["embed_recon"] * losses["embed_recon"]
             + loss_weights["transition"] * losses["transition"]
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), float(os.environ.get("L1A_MAX_GRAD_NORM", "1.0")))
         optimizer.step()
         total_loss += float(loss.item()) * len(xb)
         total_rows += len(xb)
@@ -396,15 +592,19 @@ def _eval_epoch(
             unit="batch",
         )
     with torch.no_grad():
-        for xb, y_regime, y_transition, y_vol in it:
+        for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in it:
             xb = xb.to(device)
             y_regime = y_regime.to(device)
             y_transition = y_transition.to(device)
             y_vol = y_vol.to(device)
+            y_vol_trend = y_vol_trend.to(device)
+            y_time_ir = y_time_ir.to(device)
             out = model(xb)
             loss = (
                 loss_weights["regime"] * regime_loss(out["regime_logits"], y_regime)
                 + loss_weights["vol"] * mse(out["vol_value"], y_vol)
+                + loss_weights["vol_trend"] * mse(out["vol_trend_value"], y_vol_trend)
+                + loss_weights["time_in_regime"] * mse(out["time_in_regime_value"], y_time_ir)
                 + loss_weights["embed_recon"] * mse(out["embed_recon"], out["shared_repr"].detach())
                 + loss_weights["transition"] * transition_loss(out["transition_logit"], y_transition)
             )
@@ -469,14 +669,20 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     y_prob_r: list[np.ndarray] = []
     vol_t: list[np.ndarray] = []
     vol_p: list[np.ndarray] = []
+    vt_t: list[np.ndarray] = []
+    vt_p: list[np.ndarray] = []
+    tir_t: list[np.ndarray] = []
+    tir_p: list[np.ndarray] = []
     tr_t, tr_s = [], []
     emb_mse: list[np.ndarray] = []
     with torch.no_grad():
-        for xb, y_regime, y_transition, y_vol in val_dl:
+        for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in val_dl:
             xb = xb.to(device)
             y_regime = y_regime.to(device)
             y_transition = y_transition.to(device)
             y_vol = y_vol.to(device)
+            y_vol_trend = y_vol_trend.to(device)
+            y_time_ir = y_time_ir.to(device)
             out = model(xb)
             y_true_r.append(y_regime.detach().cpu().numpy())
             regime_prob = torch.softmax(out["regime_logits"], dim=1)
@@ -484,6 +690,10 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
             y_pred_r.append(torch.argmax(regime_prob, dim=1).detach().cpu().numpy())
             vol_t.append(y_vol.detach().cpu().numpy())
             vol_p.append(out["vol_value"].detach().cpu().numpy())
+            vt_t.append(y_vol_trend.detach().cpu().numpy())
+            vt_p.append(out["vol_trend_value"].detach().cpu().numpy())
+            tir_t.append(y_time_ir.detach().cpu().numpy())
+            tir_p.append(out["time_in_regime_value"].detach().cpu().numpy())
             tr_t.append(y_transition.detach().cpu().numpy())
             tr_s.append(torch.sigmoid(out["transition_logit"]).detach().cpu().numpy())
             emb_mse.append(
@@ -515,6 +725,14 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     rmse_v = float(np.sqrt(mean_squared_error(vt, vp)))
     r2_v = float(r2_score(vt, vp)) if len(np.unique(vt)) > 1 else float("nan")
     corr_v = pearson_corr(vt, vp)
+    vtt = np.concatenate(vt_t)
+    vtp = np.concatenate(vt_p)
+    mae_vt = float(mean_absolute_error(vtt, vtp))
+    corr_vt = pearson_corr(vtt, vtp)
+    tirt = np.concatenate(tir_t)
+    tirpr = np.concatenate(tir_p)
+    mae_tir = float(mean_absolute_error(tirt, tirpr))
+    corr_tir = pearson_corr(tirt, tirpr)
     emb_mean = float(np.mean(np.concatenate(emb_mse)))
 
     print(f"\n  [L1a] ========== val ({label}) effectiveness report ==========", flush=True)
@@ -548,6 +766,18 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
         f"embed_recon_row_MSE={emb_mean:.6f}",
         flush=True,
     )
+    print(
+        f"  [L1a] vol_trend head:  MAE={mae_vt:.4f}  corr(y,p)={corr_vt:.4f}",
+        flush=True,
+    )
+    print(
+        f"  [L1a] time_in_regime head:  MAE={mae_tir:.4f}  corr(y,p)={corr_tir:.4f}",
+        flush=True,
+    )
+    print(
+        "  [L1a] l1a_dir_* at inference: regime-geometry only (no placeholder class probs / strength column).",
+        flush=True,
+    )
 
     _l1a_transition_val_block("transition_risk", np.concatenate(tr_t), np.concatenate(tr_s))
     print(f"  [L1a] ========== end val ({label}) report ==========\n", flush=True)
@@ -562,17 +792,20 @@ def materialize_l1a_outputs(
     std: np.ndarray,
     seq_len: int,
     device: torch.device,
+    embed_dim: int | None = None,
 ) -> pd.DataFrame:
     X = df[feature_cols].to_numpy(dtype=np.float32, copy=False)
     X = np.nan_to_num((X - mean) / std, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     windows, end_idx = _build_symbol_windows(pd.concat([df[["symbol", "time_key"]], pd.DataFrame(X, columns=feature_cols)], axis=1), feature_cols, seq_len)
+    ed = int(embed_dim) if embed_dim is not None else int(getattr(model, "embed_dim", _l1a_embed_dim()))
+    out_cols = l1a_output_columns_with_embed_dim(ed)
     outputs = pd.DataFrame(
         {
             "symbol": df["symbol"].values,
             "time_key": pd.to_datetime(df["time_key"]),
         }
     )
-    for col in l1a_output_columns():
+    for col in out_cols:
         outputs[col] = 0.0
     outputs[L1A_REGIME_COLS] = 1.0 / float(NUM_REGIME_CLASSES)
     outputs[_bounded_scalar_cols()] = 0.0
@@ -582,7 +815,7 @@ def materialize_l1a_outputs(
         return outputs
 
     ds = TensorDataset(torch.from_numpy(windows))
-    infer_workers = min(4, max(_lgbm_n_jobs(), 1))
+    infer_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
     dl_kwargs: dict[str, Any] = {
         "batch_size": 1024,
         "shuffle": False,
@@ -596,7 +829,7 @@ def materialize_l1a_outputs(
     if _lgb_round_tqdm_enabled():
         dl_it = tqdm(dl, desc="[L1a] materialize outputs", file=TQDM_FILE, mininterval=0.3, unit="batch")
     regime_rows: list[np.ndarray] = []
-    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol"]}
+    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol", "vol_trend", "time_ir"]}
     embeds: list[np.ndarray] = []
     model.eval()
     with torch.no_grad():
@@ -606,13 +839,34 @@ def materialize_l1a_outputs(
             regime_rows.append(torch.softmax(out["regime_logits"], dim=1).cpu().numpy())
             scalar_rows["transition"].append(torch.sigmoid(out["transition_logit"]).cpu().numpy())
             scalar_rows["vol"].append(out["vol_value"].cpu().numpy())
+            clip_lo = float(os.environ.get("L1A_VOL_TREND_CLIP_LO", "-3"))
+            clip_hi = float(os.environ.get("L1A_VOL_TREND_CLIP_HI", "3"))
+            scalar_rows["vol_trend"].append(
+                np.clip(out["vol_trend_value"].detach().cpu().numpy(), clip_lo, clip_hi)
+            )
+            scalar_rows["time_ir"].append(out["time_in_regime_value"].detach().cpu().numpy())
             embeds.append(out["market_embed"].cpu().numpy())
     regime = np.concatenate(regime_rows, axis=0)
     outputs.loc[end_idx, L1A_REGIME_COLS] = regime
     outputs.loc[end_idx, "l1a_transition_risk"] = np.concatenate(scalar_rows["transition"], axis=0)
     outputs.loc[end_idx, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, 5.0)
+    outputs.loc[end_idx, "l1a_vol_trend"] = np.concatenate(scalar_rows["vol_trend"], axis=0)
+    outputs.loc[end_idx, "l1a_time_in_regime"] = np.clip(
+        np.concatenate(scalar_rows["time_ir"], axis=0), 0.0, 1.0
+    )
+    direction_features = _derive_l1a_direction_features(
+        outputs.loc[end_idx, L1A_REGIME_COLS].to_numpy(dtype=np.float32, copy=False),
+        outputs.loc[end_idx, "l1a_transition_risk"].to_numpy(dtype=np.float32, copy=False),
+        outputs.loc[end_idx, "l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False),
+    )
+    for col, values in direction_features.items():
+        outputs.loc[end_idx, col] = values
     embed_mat = np.concatenate(embeds, axis=0)
-    embed_cols = [f"l1a_market_embed_{idx}" for idx in range(embed_mat.shape[1])]
+    if embed_mat.shape[1] != ed:
+        raise RuntimeError(
+            f"L1a embed width mismatch: model expects {ed} market_embed cols but forward returned {embed_mat.shape[1]}."
+        )
+    embed_cols = [f"l1a_market_embed_{idx}" for idx in range(ed)]
     outputs.loc[end_idx, embed_cols] = embed_mat
     outputs.loc[end_idx, "l1a_is_warm"] = 1.0
     return outputs
@@ -643,12 +897,14 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         torch.from_numpy(targets["regime"][end_idx].astype(np.int64)),
         torch.from_numpy(targets["transition_risk"][end_idx].astype(np.float32)),
         torch.from_numpy(targets["vol_forecast"][end_idx].astype(np.float32)),
+        torch.from_numpy(targets["vol_trend"][end_idx].astype(np.float32)),
+        torch.from_numpy(targets["time_in_regime"][end_idx].astype(np.float32)),
     )
     train_ds = TensorDataset(*[tensor[window_train] for tensor in ds.tensors])
     val_ds = TensorDataset(*[tensor[window_val] for tensor in ds.tensors])
     cal_ds = TensorDataset(*[tensor[window_cal] for tensor in ds.tensors])
     batch_size = 512 if FAST_TRAIN_MODE else 1024
-    loader_workers = min(4, max(_lgbm_n_jobs(), 1))
+    loader_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
     pin_memory = DEVICE.type == "cuda"
     loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
@@ -660,6 +916,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     train_dl = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_dl = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     cal_dl = DataLoader(cal_ds, shuffle=False, **loader_kwargs)
+
+    embed_dim = _l1a_embed_dim()
 
     log_layer_banner("[L1a] Sequence Market Encoder (TCN)")
     log_time_key_arrays(
@@ -682,8 +940,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         f"  [L1a] cold rows (no full window / is_warm=0): {n_row - n_warm:,} ({100.0 * (n_row - n_warm) / max(n_row, 1):.2f}%)",
         flush=True,
     )
-    out_cn = l1a_output_columns()
-    print(f"  [L1a] output column count: {len(out_cn)} (expect 25)", flush=True)
+    out_cn = l1a_output_columns_with_embed_dim(embed_dim)
+    print(f"  [L1a] output column count: {len(out_cn)} (expect {len(out_cn)})", flush=True)
     print(f"  [L1a] output columns: {out_cn}", flush=True)
     print(f"  [L1a] seq input: seq_len={SEQ_LEN}  input_feats={len(feature_cols)}", flush=True)
     print(f"  [L1a] artifact dir: {MODEL_DIR}", flush=True)
@@ -698,17 +956,33 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     log_label_baseline("l1a_regime", targets["regime"][end_idx][window_train], task="cls")
     log_label_baseline("l1a_transition_risk", targets["transition_risk"][end_idx][window_train], task="cls")
     log_label_baseline("l1a_vol_forecast", targets["vol_forecast"][end_idx][window_train], task="reg")
+    log_label_baseline("l1a_vol_trend", targets["vol_trend"][end_idx][window_train], task="reg")
+    log_label_baseline("l1a_time_in_regime", targets["time_in_regime"][end_idx][window_train], task="reg")
 
     loss_weights = _l1a_loss_weights()
     regime_loss = _l1a_regime_loss(targets["regime"][end_idx][window_train], device=DEVICE)
     transition_loss = _l1a_transition_loss(targets["transition_risk"][end_idx][window_train], device=DEVICE)
+    ch = _l1a_tcn_channels()
+    td = _l1a_tcn_dropout()
+    rd = _l1a_readout_dropout()
+    hd_drop = _l1a_head_dropout()
     model = L1AMarketTCN(
         len(feature_cols),
+        channels=ch,
         seq_len=SEQ_LEN,
         readout_type=_l1a_readout_type(),
         min_attention_seq_len=_l1a_min_attention_seq_len(),
+        tcn_dropout=td,
+        readout_dropout=rd,
+        head_dropout=hd_drop,
+        embed_dim=embed_dim,
     ).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    lr = float(os.environ.get("L1A_LR", "5e-4"))
+    wd = float(os.environ.get("L1A_WEIGHT_DECAY", "1e-3"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    T0 = max(1, int(os.environ.get("L1A_COS_T0", "5")))
+    Tm = max(1, int(os.environ.get("L1A_COS_T_MULT", "2")))
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
     max_epochs = 8 if FAST_TRAIN_MODE else 24
     patience = 4 if FAST_TRAIN_MODE else 8
     best_state: dict[str, torch.Tensor] | None = None
@@ -724,7 +998,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     )
     print(
         f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
-        f"loss_weights={loss_weights}",
+        f"tcn_channels={ch}  tcn_dropout={td}  "
+        f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  loss_weights={loss_weights}",
         flush=True,
     )
     for epoch in epoch_bar:
@@ -745,6 +1020,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             transition_loss=transition_loss,
             loss_weights=loss_weights,
         )
+        scheduler.step()
         if hasattr(epoch_bar, "set_postfix"):
             epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
         print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
@@ -763,7 +1039,9 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     if window_cal.sum() != window_val.sum():
         _log_l1a_val_metrics(model, cal_dl, DEVICE, label="cal_full")
 
-    outputs = materialize_l1a_outputs(model, work, feature_cols, mean=mean, std=std, seq_len=SEQ_LEN, device=DEVICE)
+    outputs = materialize_l1a_outputs(
+        model, work, feature_cols, mean=mean, std=std, seq_len=SEQ_LEN, device=DEVICE, embed_dim=model.embed_dim
+    )
     os.makedirs(MODEL_DIR, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(MODEL_DIR, L1A_MODEL_FILE))
     meta = {
@@ -774,12 +1052,28 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "min_attention_seq_len": model.min_attention_seq_len,
         "mean": mean,
         "std": std,
-        "output_cols": l1a_output_columns(),
+        "output_cols": l1a_output_columns_with_embed_dim(embed_dim),
         "device": str(DEVICE),
         "model_file": L1A_MODEL_FILE,
         "output_cache_file": L1A_OUTPUT_CACHE_FILE,
         "transition_target_semantics": "probability of any regime change within decision_horizon_bars",
+        "direction_target_semantics": (
+            "l1a_dir_* (bull/bear geometry) from regime probabilities + transition/vol; no placeholder sign probs."
+        ),
+        "l1a_vol_trend_target": f"per-symbol range_norm[t]-range_norm[t-{os.environ.get('L1A_VOL_TREND_LAG', '5')}], clipped",
+        "l1a_time_in_regime_target": f"min(run_length,cap)/cap from state_label runs; cap={os.environ.get('L1A_TIME_IN_REGIME_CAP', '120')}",
+        "embed_dim": int(embed_dim),
+        "l1a_direction_arch": "regime_derived_only",
         "loss_weights": loss_weights,
+        "tcn_channels": list(ch),
+        "tcn_dropout": float(td),
+        "readout_dropout": float(rd),
+        "head_dropout": float(hd_drop),
+        "l1a_lr": float(lr),
+        "l1a_weight_decay": float(wd),
+        "l1a_cosine_T0": int(T0),
+        "l1a_cosine_T_mult": int(Tm),
+        "l1a_regime_label_smoothing": float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1")),
     }
     with open(os.path.join(MODEL_DIR, L1A_META_FILE), "wb") as f:
         pickle.dump(meta, f)
@@ -799,11 +1093,25 @@ def load_l1a_market_encoder() -> tuple[L1AMarketTCN, dict[str, Any]]:
             f"Retrain L1a so artifacts match schema {L1A_SCHEMA_VERSION}."
         )
     feature_cols = list(meta["feature_cols"])
+    ch = meta.get("tcn_channels")
+    if ch is None:
+        ch = [64, 64, 128]
+    else:
+        ch = [int(x) for x in ch]
+    td = float(meta.get("tcn_dropout", 0.15))
+    rd = float(meta.get("readout_dropout", 0.10))
+    hd_drop = float(meta.get("head_dropout", 0.1))
+    embed_dim = int(meta.get("embed_dim", _l1a_embed_dim()))
     model = L1AMarketTCN(
         len(feature_cols),
+        channels=ch,
         seq_len=int(meta.get("seq_len", SEQ_LEN)),
         readout_type=str(meta.get("readout_type", _l1a_readout_type())),
         min_attention_seq_len=int(meta.get("min_attention_seq_len", _l1a_min_attention_seq_len())),
+        tcn_dropout=td,
+        readout_dropout=rd,
+        head_dropout=hd_drop,
+        embed_dim=embed_dim,
     ).to(DEVICE)
     state = torch.load(os.path.join(MODEL_DIR, meta.get("model_file", L1A_MODEL_FILE)), map_location=DEVICE)
     try:
@@ -827,4 +1135,6 @@ def infer_l1a_market_encoder(model: L1AMarketTCN, meta: dict[str, Any], df: pd.D
     mean = np.asarray(meta["mean"], dtype=np.float32)
     std = np.asarray(meta["std"], dtype=np.float32)
     seq_len = int(meta.get("seq_len", SEQ_LEN))
-    return materialize_l1a_outputs(model, work, feature_cols, mean=mean, std=std, seq_len=seq_len, device=DEVICE)
+    return materialize_l1a_outputs(
+        model, work, feature_cols, mean=mean, std=std, seq_len=seq_len, device=DEVICE, embed_dim=model.embed_dim
+    )

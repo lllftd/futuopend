@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import pickle
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -27,6 +28,7 @@ from core.trainers.constants import (
     L1A_REGIME_COLS,
     L2_META_FILE,
     L2_OUTPUT_CACHE_FILE,
+    L3_COX_FILE,
     L3_EXIT_FILE,
     L3_META_FILE,
     L3_POLICY_DATASET_CACHE_FILE,
@@ -34,8 +36,15 @@ from core.trainers.constants import (
     L3_TRAJECTORY_ENCODER_FILE,
     L3_VALUE_FILE,
     MODEL_DIR,
+    PA_STATE_FEATURES,
     TEST_END,
 )
+
+try:
+    from lifelines import CoxTimeVaryingFitter
+except ImportError:  # pragma: no cover
+    CoxTimeVaryingFitter = None  # type: ignore[misc, assignment]
+
 from core.trainers.lgbm_utils import (
     TQDM_FILE,
     _decision_edge_atr_array,
@@ -63,6 +72,13 @@ from core.trainers.l3_trajectory_hybrid import (
     l3_traj_step_features,
     train_l3_trajectory_encoder,
 )
+from core.trainers.pa_state_controls import (
+    ensure_pa_state_features,
+    pa_state_arrays_from_frame,
+    pa_state_bucket_label_from_mapping,
+    pa_state_bucket_labels_from_arrays,
+    pa_state_bucket_labels_from_frame,
+)
 from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 
 
@@ -70,6 +86,85 @@ from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 class L3TrainingBundle:
     models: dict[str, Any]
     meta: dict[str, Any]
+
+
+@dataclass
+class L3ExitInferenceState:
+    """Per-trade runtime for EMA + hysteresis (inference only). Reset on new entry."""
+
+    ema_prob: float | None = None
+    latch_exit: bool = False
+
+    def reset(self) -> None:
+        self.ema_prob = None
+        self.latch_exit = False
+
+
+def _l3_exit_infer_enabled(meta: Mapping[str, Any] | None) -> bool:
+    if meta and "l3_exit_infer_smooth" in meta:
+        return bool(meta["l3_exit_infer_smooth"])
+    return os.environ.get("L3_EXIT_INFER_SMOOTH", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _l3_exit_infer_params(meta: Mapping[str, Any] | None) -> dict[str, float]:
+    m = dict(meta or {})
+    return {
+        "ema_alpha": float(m.get("l3_exit_ema_alpha", float(os.environ.get("L3_EXIT_EMA_ALPHA", "0.3")))),
+        "enter_thr": float(m.get("l3_exit_hyst_enter", float(os.environ.get("L3_EXIT_HYST_ENTER", "0.55")))),
+        "leave_thr": float(m.get("l3_exit_hyst_leave", float(os.environ.get("L3_EXIT_HYST_LEAVE", "0.35")))),
+        "min_hold": float(m.get("l3_min_hold_bars", float(os.environ.get("L3_MIN_HOLD_BARS", "3")))),
+    }
+
+
+def l3_exit_decision_live(
+    exit_prob_calibrated: float,
+    value_left: float,
+    state: L3ExitInferenceState,
+    hold_bars: int,
+    *,
+    exit_prob_threshold: float,
+    value_left_threshold: float,
+    value_policy_mode: str,
+    value_tie_margin: float,
+    meta: Mapping[str, Any] | None = None,
+) -> tuple[bool, L3ExitInferenceState]:
+    """Exit decision for live/backtest: optional EMA + hysteresis + min-hold; else legacy policy.
+
+    EMA: first in-trade update sets ``ema_prob`` to the **current** raw calibrated ``p_exit`` (not 0);
+    later bars use exponential smoothing. ``min_hold`` only suppresses *exit* and hysteresis until
+    ``hold_bars >= min_hold``; EMA still updates on earlier bars so the first post-min_hold decision
+    uses a smoothed history.
+    """
+    p_raw = float(np.clip(exit_prob_calibrated, 0.0, 1.0))
+    ip = _l3_exit_infer_params(meta)
+    min_hold = int(max(0, round(ip["min_hold"])))
+    if _l3_exit_infer_enabled(meta):
+        alpha = float(np.clip(ip["ema_alpha"], 0.01, 0.99))
+        if state.ema_prob is None:
+            state.ema_prob = p_raw
+        else:
+            state.ema_prob = alpha * p_raw + (1.0 - alpha) * float(state.ema_prob)
+        if hold_bars < min_hold:
+            return False, state
+        p_s = float(state.ema_prob)
+        ent = float(ip["enter_thr"])
+        lev = float(ip["leave_thr"])
+        if not state.latch_exit:
+            if p_s >= ent:
+                state.latch_exit = True
+        else:
+            if p_s <= lev:
+                state.latch_exit = False
+        return bool(state.latch_exit), state
+    ex = l3_should_exit_by_policy(
+        p_raw,
+        value_left,
+        exit_prob_threshold=exit_prob_threshold,
+        value_left_threshold=value_left_threshold,
+        value_policy_mode=value_policy_mode,
+        value_tie_margin=value_tie_margin,
+    )
+    return ex, state
 
 
 def _l3_policy_dataset_cache_path() -> str:
@@ -111,8 +206,13 @@ def _l3_policy_dataset_fingerprint(
             "L3_ENTRY_POLICY_MIN_STATE_ROWS": os.environ.get("L3_ENTRY_POLICY_MIN_STATE_ROWS", ""),
             "L3_HORIZON_MIN_STATE_ROWS": os.environ.get("L3_HORIZON_MIN_STATE_ROWS", ""),
             "L3_TRAJ_GRU": os.environ.get("L3_TRAJ_GRU", ""),
+            "L3_EXIT_STATE_GRANULARITY": os.environ.get("L3_EXIT_STATE_GRANULARITY", ""),
+            "L3_VALUE_MODE": os.environ.get("L3_VALUE_MODE", ""),
+            "L3_EXIT_INFER_SMOOTH": os.environ.get("L3_EXIT_INFER_SMOOTH", ""),
+            "L3_MIN_HOLD_BARS": os.environ.get("L3_MIN_HOLD_BARS", ""),
+            "L3_EXIT_BOOST_ROUNDS": os.environ.get("L3_EXIT_BOOST_ROUNDS", ""),
         },
-        "df_hash": _hash_frame_columns(df, ["symbol", "time_key", "open", "high", "low", "close", "lbl_atr"]),
+        "df_hash": _hash_frame_columns(df, ["symbol", "time_key", "open", "high", "low", "close", "lbl_atr", *PA_STATE_FEATURES]),
         "l1a_hash": _hash_frame_columns(l1a_outputs, ["symbol", "time_key", *L1A_REGIME_COLS, "l1a_vol_forecast"]),
         "l2_hash": _hash_frame_columns(
             l2_outputs,
@@ -323,10 +423,22 @@ def _l3_exit_class_weights(y_exit: np.ndarray) -> tuple[float, float]:
     return exit_pos_w, hold_neg_w
 
 
-def _l3_prepare_value_targets(y_value: np.ndarray, train_mask: np.ndarray) -> tuple[np.ndarray, dict[str, float | str | bool]]:
+def _l3_prepare_value_targets(
+    y_value: np.ndarray,
+    train_mask: np.ndarray,
+    pa_state: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, dict[str, float | str | bool]]:
     y = np.asarray(y_value, dtype=np.float32).copy()
     train = np.asarray(train_mask, dtype=bool).ravel()
     finite_train = train & np.isfinite(y)
+    if pa_state is not None and _l3_pa_targets_enabled():
+        trend = np.asarray(pa_state.get("pa_state_trend_strength", np.zeros(len(y))), dtype=np.float64).ravel()
+        follow = np.asarray(pa_state.get("pa_state_followthrough_quality", np.zeros(len(y))), dtype=np.float64).ravel()
+        range_risk = np.asarray(pa_state.get("pa_state_range_risk", np.zeros(len(y))), dtype=np.float64).ravel()
+        breakout = np.asarray(pa_state.get("pa_state_breakout_failure_risk", np.zeros(len(y))), dtype=np.float64).ravel()
+        pullback = np.asarray(pa_state.get("pa_state_pullback_exhaustion", np.zeros(len(y))), dtype=np.float64).ravel()
+        scale = np.clip(1.0 + 0.16 * trend + 0.08 * follow - 0.18 * range_risk - 0.16 * breakout - 0.08 * pullback, 0.75, 1.20)
+        y = (np.asarray(y, dtype=np.float64) * scale).astype(np.float32)
     clip_enabled = os.environ.get("L3_VALUE_CLIP", "1").strip().lower() in {"1", "true", "yes"}
     q_lo = _env_float_clipped("L3_VALUE_CLIP_LO_Q", 0.01, lo=0.0, hi=0.25)
     q_hi = _env_float_clipped("L3_VALUE_CLIP_HI_Q", 0.99, lo=0.75, hi=1.0)
@@ -363,6 +475,8 @@ def _l3_prepare_value_targets(y_value: np.ndarray, train_mask: np.ndarray) -> tu
         "objective": str(objective),
         "metric": str(metric),
     }
+    if pa_state is not None and _l3_pa_targets_enabled():
+        stats["pa_target_scaling"] = True
     if objective == "huber":
         stats["huber_alpha"] = _env_float_clipped("L3_VALUE_HUBER_ALPHA", 0.90, lo=0.50, hi=0.99)
     elif objective == "fair":
@@ -415,10 +529,54 @@ def _regime_ids_from_probs(regime_probs: np.ndarray) -> np.ndarray:
     return np.argmax(safe, axis=1).astype(np.int32) if safe.ndim == 2 and safe.shape[1] else np.zeros(len(safe), dtype=np.int32)
 
 
+def _l3_pa_policy_enabled() -> bool:
+    return os.environ.get("L3_PA_POLICY_STATE", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _l3_pa_targets_enabled() -> bool:
+    return os.environ.get("L3_PA_TARGETS", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _l3_pa_dict_from_frame(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    if not _l3_pa_targets_enabled():
+        return {col: np.zeros(len(df), dtype=np.float32) for col in PA_STATE_FEATURES}
+    return pa_state_arrays_from_frame(df)
+
+
+def _l3_pa_dict_from_matrix(X: np.ndarray, feature_cols: list[str]) -> dict[str, np.ndarray]:
+    if not _l3_pa_targets_enabled():
+        return {col: np.zeros(len(X), dtype=np.float32) for col in PA_STATE_FEATURES}
+    out: dict[str, np.ndarray] = {}
+    for col in PA_STATE_FEATURES:
+        if col in feature_cols:
+            out[col] = np.asarray(X[:, feature_cols.index(col)], dtype=np.float32)
+        else:
+            out[col] = np.zeros(len(X), dtype=np.float32)
+    return out
+
+
+def _append_pa_bucket_to_state_keys(base_keys: np.ndarray, pa_bucket: np.ndarray | None) -> np.ndarray:
+    if not _l3_pa_policy_enabled() or pa_bucket is None:
+        return np.asarray(base_keys, dtype=object)
+    bucket = np.asarray(pa_bucket, dtype=object).ravel()
+    if bucket.size != len(base_keys):
+        return np.asarray(base_keys, dtype=object)
+    return np.asarray([f"{key}_pa_{pb}" for key, pb in zip(base_keys, bucket)], dtype=object)
+
+
 def _state_keys_from_regime_vol(regime_probs: np.ndarray, vol_values: np.ndarray, *, vol_quantiles: list[float]) -> np.ndarray:
     reg = _regime_ids_from_probs(regime_probs)
     vb = _bucketize_by_quantiles(vol_values, vol_quantiles)
     return np.asarray([f"r{int(r)}_v{int(v)}" for r, v in zip(reg, vb)], dtype=object)
+
+
+def _exit_coarse_bucket(regime_probs: np.ndarray) -> np.ndarray:
+    """3 buckets: 0=bull (0–1), 1=range/vol (4–5), 2=bear/adverse (2–3)."""
+    rid = _regime_ids_from_probs(regime_probs)
+    sid = np.full(len(rid), 2, dtype=np.int32)
+    sid[rid <= 1] = 0
+    sid[rid >= 4] = 1
+    return sid
 
 
 def _exit_state_keys_from_regime_vol_hold(
@@ -428,9 +586,13 @@ def _exit_state_keys_from_regime_vol_hold(
     *,
     vol_quantiles: list[float],
 ) -> np.ndarray:
-    base = _state_keys_from_regime_vol(regime_probs, vol_values, vol_quantiles=vol_quantiles)
+    mode = os.environ.get("L3_EXIT_STATE_GRANULARITY", "coarse").strip().lower()
     hb = _hold_bucket_ids(hold_values)
-    return np.asarray([f"{b}_h{int(h)}" for b, h in zip(base, hb)], dtype=object)
+    if mode in {"full", "legacy", "fine"}:
+        base = _state_keys_from_regime_vol(regime_probs, vol_values, vol_quantiles=vol_quantiles)
+        return np.asarray([f"{b}_h{int(h)}" for b, h in zip(base, hb)], dtype=object)
+    sid = _exit_coarse_bucket(regime_probs)
+    return np.asarray([f"ex{int(s)}_h{int(h)}" for s, h in zip(sid, hb)], dtype=object)
 
 
 def _l3_entry_policy_defaults() -> tuple[float, float]:
@@ -500,12 +662,17 @@ def _l3_search_entry_policy(
     size: np.ndarray,
     edge_atr: np.ndarray,
     tau_edge: float,
+    pa_state: dict[str, np.ndarray] | None = None,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     cls = np.asarray(decision_class, dtype=np.int64).ravel()
     conf = np.asarray(decision_confidence, dtype=np.float64).ravel()
     sz = np.asarray(size, dtype=np.float64).ravel()
     edge = np.asarray(edge_atr, dtype=np.float64).ravel()
     keys = np.asarray(state_keys, dtype=object).ravel()
+    trend = np.asarray((pa_state or {}).get("pa_state_trend_strength", np.zeros(len(keys))), dtype=np.float64).ravel()
+    follow = np.asarray((pa_state or {}).get("pa_state_followthrough_quality", np.zeros(len(keys))), dtype=np.float64).ravel()
+    range_risk = np.asarray((pa_state or {}).get("pa_state_range_risk", np.zeros(len(keys))), dtype=np.float64).ravel()
+    breakout = np.asarray((pa_state or {}).get("pa_state_breakout_failure_risk", np.zeros(len(keys))), dtype=np.float64).ravel()
     truth_dir = np.full(len(edge), 1, dtype=np.int64)
     truth_dir[edge > tau_edge] = 0
     truth_dir[edge < -tau_edge] = 2
@@ -536,7 +703,15 @@ def _l3_search_entry_policy(
                 precision = float(np.mean(truth_active[entered]))
                 avg_abs_edge = float(np.mean(np.abs(edge[entered])))
                 trade_rate = float(np.mean(entered[mask])) if np.any(mask) else 0.0
-                score = 0.55 * precision + 0.30 * correct_side + 0.20 * avg_abs_edge - 0.20 * abs(trade_rate - active_rate_target)
+                pa_bonus = 0.0
+                if pa_state is not None and np.any(entered):
+                    pa_bonus = float(
+                        0.08 * np.mean(trend[entered])
+                        + 0.04 * np.mean(follow[entered])
+                        - 0.10 * np.mean(range_risk[entered])
+                        - 0.08 * np.mean(breakout[entered])
+                    )
+                score = 0.55 * precision + 0.30 * correct_side + 0.20 * avg_abs_edge - 0.20 * abs(trade_rate - active_rate_target) + pa_bonus
                 if score > best_score:
                     best_score = score
                     best = {
@@ -572,10 +747,19 @@ def _l3_target_horizon_by_state(
     peak_bar: np.ndarray,
     *,
     max_hold: int,
+    pa_state: dict[str, np.ndarray] | None = None,
 ) -> tuple[int, dict[str, int]]:
     base = _l3_target_horizon_bars(max_hold)
     keys = np.asarray(state_keys, dtype=object).ravel()
     peak = np.asarray(peak_bar, dtype=np.float64).ravel()
+    if pa_state is not None and _l3_pa_targets_enabled():
+        trend = np.asarray(pa_state.get("pa_state_trend_strength", np.zeros(len(peak))), dtype=np.float64).ravel()
+        follow = np.asarray(pa_state.get("pa_state_followthrough_quality", np.zeros(len(peak))), dtype=np.float64).ravel()
+        range_risk = np.asarray(pa_state.get("pa_state_range_risk", np.zeros(len(peak))), dtype=np.float64).ravel()
+        breakout = np.asarray(pa_state.get("pa_state_breakout_failure_risk", np.zeros(len(peak))), dtype=np.float64).ravel()
+        pullback = np.asarray(pa_state.get("pa_state_pullback_exhaustion", np.zeros(len(peak))), dtype=np.float64).ravel()
+        horizon_scale = np.clip(1.0 + 0.18 * trend + 0.10 * follow - 0.22 * range_risk - 0.18 * breakout - 0.10 * pullback, 0.55, 1.30)
+        peak = peak * horizon_scale
     finite = np.isfinite(peak)
     global_h = int(np.clip(np.nanmedian(peak[finite]) if finite.any() else base, 2, max_hold))
     by_state: dict[str, int] = {}
@@ -594,7 +778,14 @@ def _l3_policy_row_state_keys(X: np.ndarray, feature_cols: list[str], *, vol_qua
     vol_idx = feature_cols.index("l1a_vol_forecast")
     regime_probs = np.asarray(X[:, reg_cols], dtype=np.float32)
     vol_values = np.asarray(X[:, vol_idx], dtype=np.float32)
-    return _state_keys_from_regime_vol(regime_probs, vol_values, vol_quantiles=vol_quantiles)
+    base = _state_keys_from_regime_vol(regime_probs, vol_values, vol_quantiles=vol_quantiles)
+    pa_bucket = None
+    if _l3_pa_policy_enabled() and all(col in feature_cols for col in PA_STATE_FEATURES):
+        pa_bucket = pa_state_bucket_labels_from_arrays(
+            {col: np.asarray(X[:, feature_cols.index(col)], dtype=np.float32) for col in PA_STATE_FEATURES},
+            length=len(X),
+        )
+    return _append_pa_bucket_to_state_keys(base, pa_bucket)
 
 
 def _l3_exit_policy_row_state_keys(X: np.ndarray, feature_cols: list[str], *, vol_quantiles: list[float]) -> np.ndarray:
@@ -604,7 +795,14 @@ def _l3_exit_policy_row_state_keys(X: np.ndarray, feature_cols: list[str], *, vo
     regime_probs = np.asarray(X[:, reg_cols], dtype=np.float32)
     vol_values = np.asarray(X[:, vol_idx], dtype=np.float32)
     hold_values = np.asarray(X[:, hold_idx], dtype=np.float32)
-    return _exit_state_keys_from_regime_vol_hold(regime_probs, vol_values, hold_values, vol_quantiles=vol_quantiles)
+    base = _exit_state_keys_from_regime_vol_hold(regime_probs, vol_values, hold_values, vol_quantiles=vol_quantiles)
+    pa_bucket = None
+    if _l3_pa_policy_enabled() and all(col in feature_cols for col in PA_STATE_FEATURES):
+        pa_bucket = pa_state_bucket_labels_from_arrays(
+            {col: np.asarray(X[:, feature_cols.index(col)], dtype=np.float32) for col in PA_STATE_FEATURES},
+            length=len(X),
+        )
+    return _append_pa_bucket_to_state_keys(base, pa_bucket)
 
 
 def _l3_search_exit_policy(
@@ -713,7 +911,7 @@ def _l3_search_conditional_exit_policy(
     valid = np.isfinite(np.asarray(exit_prob, dtype=np.float64).ravel()) & np.isfinite(np.asarray(value_pred, dtype=np.float64).ravel())
     keys = keys[valid]
     by_state: dict[str, dict[str, float]] = {}
-    min_rows = max(80, int(os.environ.get("L3_EXIT_POLICY_MIN_STATE_ROWS", "140")))
+    min_rows = max(80, int(os.environ.get("L3_EXIT_POLICY_MIN_STATE_ROWS", "300")))
     for key in sorted({str(k) for k in keys.tolist()}):
         m = keys == key
         if int(np.sum(m)) < min_rows:
@@ -734,6 +932,9 @@ def _choose_l3_value_policy_mode(
     y_true: np.ndarray,
     pred: np.ndarray,
 ) -> str:
+    if (os.environ.get("L3_VALUE_MODE", "") or "").strip().lower() == "disabled":
+        print("  [L3] value-policy mode forced prob_only (L3_VALUE_MODE=disabled)", flush=True)
+        return "prob_only"
     yt = np.asarray(y_true, dtype=np.float64).ravel()
     yp = np.asarray(pred, dtype=np.float64).ravel()
     valid = np.isfinite(yt) & np.isfinite(yp)
@@ -772,6 +973,7 @@ def _l3_trade_normalized_exit_weights(
     rows_entry: np.ndarray,
     hold_bars: np.ndarray,
     y_exit: np.ndarray,
+    pa_state: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     entry = np.asarray(rows_entry, dtype=np.int64).ravel()
     hold = np.asarray(hold_bars, dtype=np.float64).ravel()
@@ -788,6 +990,13 @@ def _l3_trade_normalized_exit_weights(
     exit_pos_w, hold_neg_w = _l3_exit_class_weights(y)
     cls_w = np.where(y == 1, exit_pos_w, hold_neg_w).astype(np.float64)
     w = trade_norm * hold_w * cls_w
+    if pa_state is not None and _l3_pa_targets_enabled():
+        range_risk = np.asarray(pa_state.get("pa_state_range_risk", np.zeros(len(w))), dtype=np.float64).ravel()
+        breakout = np.asarray(pa_state.get("pa_state_breakout_failure_risk", np.zeros(len(w))), dtype=np.float64).ravel()
+        trend = np.asarray(pa_state.get("pa_state_trend_strength", np.zeros(len(w))), dtype=np.float64).ravel()
+        pullback = np.asarray(pa_state.get("pa_state_pullback_exhaustion", np.zeros(len(w))), dtype=np.float64).ravel()
+        pa_w = np.clip(1.0 + 0.24 * range_risk + 0.18 * breakout + 0.10 * pullback - 0.10 * trend, 0.70, 1.80)
+        w *= pa_w
     w = w / max(float(np.mean(w)), 1e-8)
     return w.astype(np.float32)
 
@@ -796,12 +1005,28 @@ def _l3_boost_rounds() -> int:
     return _env_int_clipped("L3_BOOST_ROUNDS", 250, lo=50, hi=5000)
 
 
+def _l3_exit_boost_rounds() -> int:
+    return _env_int_clipped("L3_EXIT_BOOST_ROUNDS", 150, lo=50, hi=5000)
+
+
 def _l3_early_stopping_rounds() -> int:
     return _env_int_clipped("L3_EARLY_STOPPING_ROUNDS", 40, lo=5, hi=1000)
 
 
 def _l3_lgb_params(prefix: str, *, seed_default: int) -> dict[str, Any]:
-    del prefix
+    if prefix in {"L3_EXIT", "L3_STATIC_EXIT"}:
+        return {
+            "learning_rate": _env_float_clipped("L3_EXIT_LEARNING_RATE", 0.03, lo=1e-4, hi=0.5),
+            "num_leaves": _env_int_clipped("L3_EXIT_NUM_LEAVES", 15, lo=2, hi=1024),
+            "max_depth": _env_int_clipped("L3_EXIT_MAX_DEPTH", 5, lo=-1, hi=64),
+            "feature_fraction": _env_float_clipped("L3_EXIT_COLSAMPLE_BYTREE", 0.7, lo=0.1, hi=1.0),
+            "bagging_fraction": _env_float_clipped("L3_EXIT_SUBSAMPLE", 0.7, lo=0.1, hi=1.0),
+            "bagging_freq": _env_int_clipped("L3_EXIT_BAGGING_FREQ", 5, lo=0, hi=64),
+            "min_child_samples": _env_int_clipped("L3_EXIT_MIN_CHILD_SAMPLES", 50, lo=1, hi=10_000),
+            "lambda_l1": _env_float_clipped("L3_EXIT_LAMBDA_L1", 0.2, lo=0.0, hi=100.0),
+            "lambda_l2": _env_float_clipped("L3_EXIT_LAMBDA_L2", 2.0, lo=0.0, hi=100.0),
+            "seed": int(seed_default),
+        }
     return {
         "learning_rate": 0.03,
         "num_leaves": 48,
@@ -849,7 +1074,13 @@ def _fit_l3_static_ablation(
     }
     value_params = _l3_value_lgb_params({**exit_params, **value_cfg}, seed=value_cfg["seed"], prep=value_prep)
     ih = feature_cols.index("l3_hold_bars")
-    w = _l3_trade_normalized_exit_weights(rows_entry[train_mask], X_static[train_mask, ih], y_exit[train_mask])
+    pa_state = _l3_pa_dict_from_matrix(X_static, feature_cols)
+    w = _l3_trade_normalized_exit_weights(
+        rows_entry[train_mask],
+        X_static[train_mask, ih],
+        y_exit[train_mask],
+        pa_state={k: v[train_mask] for k, v in pa_state.items()},
+    )
     static_es_rounds = min(es_rounds, _env_int_clipped("L3_STATIC_EARLY_STOPPING_ROUNDS_CAP", 30, lo=1, hi=1000))
     static_rounds = min(rounds, _env_int_clipped("L3_STATIC_BOOST_ROUNDS_CAP", 120, lo=10, hi=5000))
     cbs, cl = _lgb_train_callbacks_with_round_tqdm(static_es_rounds, static_rounds, "[L3] static-exit")
@@ -895,14 +1126,342 @@ def l3_entry_side_from_l2(decision_class: int, decision_confidence: float, size:
     return 0.0
 
 
-def l3_policy_state_key(regime_probs: np.ndarray, vol_value: float, meta: dict[str, Any]) -> str:
+L3_COX_FEATURE_NAMES: tuple[str, ...] = (
+    "l3_unreal_pnl_atr",
+    "l3_regime_divergence",
+    "l3_vol_surprise",
+    "l3_drawdown_from_peak_atr",
+    "l3_price_velocity_3bar_atr",
+    "l3_feature_momentum_regdiv_3bar",
+    "l3_vol_surprise_accel",
+    "l3_regime_stability_3bar",
+    "l3_side",
+    "l2_decision_confidence",
+    "l3_signal_conf_decay",
+    "l3_signal_direction_agree",
+    "l3_regime_changed",
+    "l3_l2_gate_current",
+    "l3_l2_gate_decay",
+    "l3_would_enter_now",
+    "l3_regret_ratio",
+    "l3_bars_since_peak",
+    "l3_at_new_high",
+    "l3_regret_velocity",
+    "l3_trade_quality_bayes",
+)
+
+
+def _l3_bayes_weights() -> dict[str, float]:
+    return {
+        "fav": float(os.environ.get("L3_BAYES_LLR_FAV", "0.28")),
+        "adv": float(os.environ.get("L3_BAYES_LLR_ADV", "-0.35")),
+        "regime": float(os.environ.get("L3_BAYES_LLR_REGIME", "-0.45")),
+        "gate": float(os.environ.get("L3_BAYES_LLR_GATE", "-0.18")),
+        "gate_thr": float(os.environ.get("L3_BAYES_GATE_DECAY_THR", "-0.12")),
+    }
+
+
+def _l3_episode_aux_feature_block(
+    *,
+    n_steps: int,
+    idx_arr: np.ndarray,
+    entry_i: int,
+    side: float,
+    decision_class: np.ndarray,
+    decision_conf: np.ndarray,
+    size: np.ndarray,
+    neutral: np.ndarray,
+    l1a_dir: np.ndarray,
+    entry_regime_row: np.ndarray,
+    current_regime: np.ndarray,
+    unreal_seg: np.ndarray,
+    min_conf_arr: np.ndarray,
+    min_size_arr: np.ndarray,
+    drawdown_from_peak: np.ndarray,
+) -> np.ndarray:
+    """Entry decay, counterfactual regret, and Bayesian trade-quality path (one row per hold step)."""
+    w = _l3_bayes_weights()
+    dec_e = float(decision_conf[entry_i])
+    gate_e = float(1.0 - neutral[entry_i])
+    rid_e = int(np.argmax(entry_regime_row.astype(np.float64)))
+    sgn_side = 1.0 if side > 0 else -1.0
+
+    signal_conf_decay = np.empty(n_steps, dtype=np.float32)
+    direction_agree = np.empty(n_steps, dtype=np.float32)
+    regime_changed = np.empty(n_steps, dtype=np.float32)
+    gate_curr = np.empty(n_steps, dtype=np.float32)
+    gate_decay = np.empty(n_steps, dtype=np.float32)
+    would_enter = np.empty(n_steps, dtype=np.float32)
+    regret_ratio = np.empty(n_steps, dtype=np.float32)
+    bars_since_peak = np.empty(n_steps, dtype=np.float32)
+    at_new_high = np.empty(n_steps, dtype=np.float32)
+    regret_velocity = np.empty(n_steps, dtype=np.float32)
+    quality_bayes = np.empty(n_steps, dtype=np.float32)
+
+    p0 = float(np.clip(dec_e, 0.05, 0.95))
+    log_odds = float(np.log(p0 / (1.0 - p0)))
+
+    running_peak = float(unreal_seg[0])
+    peak_idx = 0
+    peak_cum = np.maximum.accumulate(unreal_seg.astype(np.float64))
+
+    for j in range(n_steps):
+        k = int(idx_arr[j])
+        signal_conf_decay[j] = np.float32(decision_conf[k] - dec_e)
+        direction_agree[j] = np.float32(
+            1.0 if np.sign(float(l1a_dir[k])) == np.sign(float(l1a_dir[entry_i])) else 0.0
+        )
+        regime_changed[j] = np.float32(float(int(np.argmax(current_regime[k].astype(np.float64))) != rid_e))
+        gc = float(1.0 - neutral[k])
+        gate_curr[j] = np.float32(gc)
+        gate_decay[j] = np.float32(gc - gate_e)
+        would_enter[j] = np.float32(
+            1.0
+            if l3_entry_side_from_l2(
+                int(decision_class[k]),
+                float(decision_conf[k]),
+                float(size[k]),
+                min_confidence=float(min_conf_arr[k]),
+                min_size=float(min_size_arr[k]),
+            )
+            != 0.0
+            else 0.0
+        )
+
+        u = float(unreal_seg[j])
+        if u >= running_peak - 1e-9:
+            running_peak = u
+            peak_idx = j
+        bars_since_peak[j] = np.float32(j - peak_idx)
+        at_new_high[j] = np.float32(1.0 if abs(u - running_peak) < 1e-9 else 0.0)
+
+        pk = float(peak_cum[j])
+        if pk > 1e-6:
+            regret_ratio[j] = np.float32(max(0.0, (pk - u) / pk))
+        else:
+            regret_ratio[j] = np.float32(0.0)
+
+        dd = float(drawdown_from_peak[j])
+        bsp = float(bars_since_peak[j])
+        regret_velocity[j] = np.float32(dd / bsp) if bsp > 0.5 else np.float32(0.0)
+
+        du = float(unreal_seg[j] - unreal_seg[j - 1]) if j > 0 else float(unreal_seg[0])
+        favorable = sgn_side * du > 0.0
+        llr = w["fav"] if favorable else w["adv"]
+        if float(regime_changed[j]) > 0.5:
+            llr += w["regime"]
+        if float(gate_decay[j]) < w["gate_thr"]:
+            llr += w["gate"]
+        log_odds = float(log_odds + llr)
+        quality_bayes[j] = np.float32(1.0 / (1.0 + np.exp(-log_odds)))
+
+    return np.column_stack(
+        [
+            signal_conf_decay,
+            direction_agree,
+            regime_changed,
+            gate_curr,
+            gate_decay,
+            would_enter,
+            regret_ratio,
+            bars_since_peak,
+            at_new_high,
+            regret_velocity,
+            quality_bayes,
+        ]
+    ).astype(np.float32, copy=False)
+
+
+def _l3_ctv_frame_first_event(
+    entry_ids: np.ndarray,
+    holds: np.ndarray,
+    y_exit: np.ndarray,
+    X_cov: np.ndarray,
+    cov_names: list[str],
+    row_mask: np.ndarray,
+) -> pd.DataFrame:
+    rows_out: list[dict[str, float | int]] = []
+    e_m = entry_ids[row_mask]
+    h_m = holds[row_mask]
+    y_m = y_exit[row_mask]
+    X_m = np.nan_to_num(X_cov[row_mask].astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    for uid in np.unique(e_m):
+        idx = np.where(e_m == uid)[0]
+        order = np.argsort(h_m[idx], kind="mergesort")
+        ix = idx[order]
+        h_u = h_m[ix].astype(np.float64)
+        y_u = y_m[ix].astype(np.int32)
+        X_u = X_m[ix]
+        first: int | None = None
+        for t in range(len(y_u)):
+            if y_u[t] == 1:
+                first = t
+                break
+        end_u = len(h_u) - 1 if first is None else int(first)
+        for t in range(end_u + 1):
+            h_t = float(h_u[t])
+            evt = int(first is not None and t == int(first))
+            d: dict[str, float | int] = {"id": int(uid), "start": h_t - 1.0, "stop": h_t, "event": evt}
+            for ci, name in enumerate(cov_names):
+                d[name] = float(X_u[t, ci])
+            rows_out.append(d)
+    return pd.DataFrame(rows_out)
+
+
+def _l3_lookup_baseline_cumhaz(ctv: Any, stops: np.ndarray) -> np.ndarray:
+    bh = ctv.baseline_cumulative_hazard_
+    col = bh.columns[0]
+    times = bh.index.to_numpy(dtype=np.float64)
+    vals = bh[col].to_numpy(dtype=np.float64)
+    out = np.zeros(len(stops), dtype=np.float64)
+    for i, s in enumerate(stops.astype(np.float64)):
+        m = times <= s + 1e-9
+        if not np.any(m):
+            out[i] = 0.0
+        else:
+            out[i] = float(vals[np.where(m)[0][-1]])
+    return out
+
+
+def _l3_append_cox_survival_features(
+    X: np.ndarray,
+    feature_cols: list[str],
+    rows_entry: np.ndarray,
+    y_exit: np.ndarray,
+    train_mask: np.ndarray,
+) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+    """Fit discrete-interval Cox (time-varying) on train rows; append log partial hazard + log baseline H0(stop)."""
+    cox_cols = [c for c in L3_COX_FEATURE_NAMES if c in feature_cols]
+    if not cox_cols:
+        z = np.zeros((len(X), 2), dtype=np.float32)
+        return np.hstack([X, z]), feature_cols + [
+            "l3_cox_log_partial_hazard",
+            "l3_cox_baseline_cumhaz_at_stop",
+        ], {"l3_cox_fitted": False, "reason": "no_cox_columns"}
+
+    disabled = os.environ.get("L3_COX_DISABLE", "0").strip().lower() in {"1", "true", "yes"}
+    if disabled or CoxTimeVaryingFitter is None:
+        reason = "disabled" if disabled else "lifelines_missing"
+        if CoxTimeVaryingFitter is None:
+            print("  [L3] Cox survival: lifelines not installed — install lifelines or set L3_COX_DISABLE=1.", flush=True)
+        z = np.zeros((len(X), 2), dtype=np.float32)
+        return np.hstack([X, z]), feature_cols + [
+            "l3_cox_log_partial_hazard",
+            "l3_cox_baseline_cumhaz_at_stop",
+        ], {"l3_cox_fitted": False, "reason": reason}
+
+    ih = feature_cols.index("l3_hold_bars")
+    holds = X[:, ih].astype(np.float64)
+    cov_idx = [feature_cols.index(c) for c in cox_cols]
+    X_cov = X[:, cov_idx]
+    df_ctv = _l3_ctv_frame_first_event(rows_entry, holds, y_exit, X_cov, cox_cols, train_mask)
+    min_rows = int(os.environ.get("L3_COX_MIN_ROWS", "400"))
+    min_ev = int(os.environ.get("L3_COX_MIN_EVENTS", "80"))
+    if len(df_ctv) < min_rows or int(df_ctv["event"].sum()) < min_ev:
+        print(
+            f"  [L3] Cox survival: skipped (ctv_rows={len(df_ctv)} events={int(df_ctv['event'].sum())} "
+            f"need>={min_rows}/{min_ev})",
+            flush=True,
+        )
+        z = np.zeros((len(X), 2), dtype=np.float32)
+        return np.hstack([X, z]), feature_cols + [
+            "l3_cox_log_partial_hazard",
+            "l3_cox_baseline_cumhaz_at_stop",
+        ], {"l3_cox_fitted": False, "reason": "too_few_rows"}
+
+    penal = float(os.environ.get("L3_COX_PENALIZER", "1.0"))
+    ctv = CoxTimeVaryingFitter(penalizer=penal)
+    try:
+        ctv.fit(df_ctv, id_col="id", event_col="event", start_col="start", stop_col="stop", show_progress=False)
+    except Exception as ex:  # pragma: no cover
+        print(f"  [L3] Cox survival: fit failed ({ex!r}) — filling zeros.", flush=True)
+        z = np.zeros((len(X), 2), dtype=np.float32)
+        return np.hstack([X, z]), feature_cols + [
+            "l3_cox_log_partial_hazard",
+            "l3_cox_baseline_cumhaz_at_stop",
+        ], {"l3_cox_fitted": False, "reason": f"fit_error:{ex}"}
+
+    pred_df = pd.DataFrame(np.nan_to_num(X_cov, nan=0.0, posinf=0.0, neginf=0.0), columns=cox_cols)
+    ph = np.asarray(ctv.predict_partial_hazard(pred_df), dtype=np.float64).ravel()
+    log_ph = np.log(np.clip(ph, 1e-12, None))
+    h0 = _l3_lookup_baseline_cumhaz(ctv, holds)
+    extra = np.column_stack([log_ph, np.log1p(np.clip(h0, 0.0, None))]).astype(np.float32, copy=False)
+    bundle = {
+        "l3_cox_fitted": True,
+        "fitter": ctv,
+        "cov_names": list(cox_cols),
+        "reason": "ok",
+    }
+    print(
+        f"  [L3] Cox time-varying survival: fitted on {len(df_ctv):,} CTV rows ({int(df_ctv['event'].sum())} events); "
+        f"covariates={len(cox_cols)} penalizer={penal}",
+        flush=True,
+    )
+    return np.hstack([X, extra]), feature_cols + [
+        "l3_cox_log_partial_hazard",
+        "l3_cox_baseline_cumhaz_at_stop",
+    ], bundle
+
+
+def l3_infer_cox_features(
+    cox_bundle: Mapping[str, Any] | None,
+    X_base: np.ndarray,
+    feature_cols: list[str],
+) -> np.ndarray:
+    """Two Cox-derived features aligned with training; zeros if bundle missing."""
+    if not cox_bundle or not cox_bundle.get("l3_cox_fitted") or cox_bundle.get("fitter") is None:
+        return np.zeros(2, dtype=np.float32)
+    ctv = cox_bundle["fitter"]
+    cov_names: list[str] = list(cox_bundle["cov_names"])
+    try:
+        vec = np.asarray([float(X_base[feature_cols.index(n)]) for n in cov_names], dtype=np.float64).reshape(1, -1)
+    except ValueError:
+        return np.zeros(2, dtype=np.float32)
+    pred_df = pd.DataFrame(np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0), columns=cov_names)
+    ph = float(np.asarray(ctv.predict_partial_hazard(pred_df), dtype=np.float64).ravel()[0])
+    ih = feature_cols.index("l3_hold_bars")
+    stop = float(X_base[ih])
+    h0 = float(_l3_lookup_baseline_cumhaz(ctv, np.asarray([stop], dtype=np.float64))[0])
+    return np.asarray(
+        [np.float32(np.log(max(ph, 1e-12))), np.float32(np.log1p(max(h0, 0.0)))],
+        dtype=np.float32,
+    )
+
+
+def l3_load_cox_bundle(meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not meta or not meta.get("l3_cox_fitted"):
+        return None
+    fname = str(meta.get("l3_cox_artifact_file", L3_COX_FILE))
+    path = os.path.join(MODEL_DIR, fname)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def l3_policy_state_key(
+    regime_probs: np.ndarray,
+    vol_value: float,
+    meta: dict[str, Any],
+    *,
+    pa_state: Mapping[str, Any] | pd.Series | None = None,
+) -> str:
     vol_quantiles = [float(x) for x in (meta.get("policy_state_vol_quantiles") or [])]
     keys = _state_keys_from_regime_vol(np.asarray(regime_probs, dtype=np.float32).reshape(1, -1), np.asarray([vol_value], dtype=np.float32), vol_quantiles=vol_quantiles)
-    return str(keys[0]) if len(keys) else "r0_v0"
+    base = str(keys[0]) if len(keys) else "r0_v0"
+    if not _l3_pa_policy_enabled():
+        return base
+    return str(_append_pa_bucket_to_state_keys(np.asarray([base], dtype=object), np.asarray([pa_state_bucket_label_from_mapping(pa_state)], dtype=object))[0])
 
 
-def l3_entry_policy_params(regime_probs: np.ndarray, vol_value: float, meta: dict[str, Any]) -> tuple[float, float, int, str]:
-    state_key = l3_policy_state_key(regime_probs, vol_value, meta)
+def l3_entry_policy_params(
+    regime_probs: np.ndarray,
+    vol_value: float,
+    meta: dict[str, Any],
+    *,
+    pa_state: Mapping[str, Any] | pd.Series | None = None,
+) -> tuple[float, float, int, str]:
+    state_key = l3_policy_state_key(regime_probs, vol_value, meta, pa_state=pa_state)
     params = (meta.get("l3_entry_policy_by_state") or {}).get(state_key, {})
     min_conf = float(params.get("min_confidence", meta.get("l3_entry_min_confidence", _l3_entry_policy_defaults()[0])))
     min_size = float(params.get("min_size", meta.get("l3_entry_min_size", _l3_entry_policy_defaults()[1])))
@@ -911,14 +1470,31 @@ def l3_entry_policy_params(regime_probs: np.ndarray, vol_value: float, meta: dic
     return min_conf, min_size, max_hold, state_key
 
 
-def l3_exit_policy_params(regime_probs: np.ndarray, vol_value: float, hold_bars: int, meta: dict[str, Any]) -> tuple[float, float, int, str, str, float]:
-    state_key = str(
+def l3_exit_policy_params(
+    regime_probs: np.ndarray,
+    vol_value: float,
+    hold_bars: int,
+    meta: dict[str, Any],
+    *,
+    pa_state: Mapping[str, Any] | pd.Series | None = None,
+) -> tuple[float, float, int, str, str, float]:
+    base_key = str(
         _exit_state_keys_from_regime_vol_hold(
             np.asarray(regime_probs, dtype=np.float32).reshape(1, -1),
             np.asarray([vol_value], dtype=np.float32),
             np.asarray([hold_bars], dtype=np.float32),
             vol_quantiles=[float(x) for x in (meta.get("policy_state_vol_quantiles") or [])],
         )[0]
+    )
+    state_key = (
+        base_key
+        if not _l3_pa_policy_enabled()
+        else str(
+            _append_pa_bucket_to_state_keys(
+                np.asarray([base_key], dtype=object),
+                np.asarray([pa_state_bucket_label_from_mapping(pa_state)], dtype=object),
+            )[0]
+        )
     )
     params = (meta.get("l3_exit_policy_by_state") or {}).get(state_key, {})
     prob_thr = float(params.get("exit_prob_threshold", meta.get("l3_exit_prob_threshold", 0.55)))
@@ -966,6 +1542,8 @@ def _build_l3_policy_dataset(
         .merge(l1a_outputs, on=["symbol", "time_key"], how="left")
         .merge(l2_outputs, on=["symbol", "time_key"], how="left")
     )
+    merged = ensure_pa_state_features(merged)
+    pa_state = _l3_pa_dict_from_frame(merged)
     safe_atr = np.where(pd.to_numeric(merged["lbl_atr"], errors="coerce").fillna(0.0).to_numpy() > 1e-3, merged["lbl_atr"].to_numpy(dtype=np.float64), 1e-3)
     open_px = merged["open"].to_numpy(dtype=np.float64)
     high_px = merged["high"].to_numpy(dtype=np.float64)
@@ -992,7 +1570,10 @@ def _build_l3_policy_dataset(
     _t_ref = max(_t_max, int(max_hold))
     oot_mask = (times >= np.datetime64(CAL_END)) & (times < np.datetime64(TEST_END))
     policy_vol_quantiles = _policy_vol_quantiles(current_vol, fit_mask=oot_mask)
-    state_keys_all = _state_keys_from_regime_vol(current_regime, current_vol, vol_quantiles=policy_vol_quantiles)
+    state_keys_all = _append_pa_bucket_to_state_keys(
+        _state_keys_from_regime_vol(current_regime, current_vol, vol_quantiles=policy_vol_quantiles),
+        pa_state_bucket_labels_from_frame(merged) if _l3_pa_policy_enabled() else None,
+    )
     if "decision_peak_bar" in merged.columns:
         peak_bar = pd.to_numeric(merged["decision_peak_bar"], errors="coerce").fillna(_l3_target_horizon_bars(max_hold)).to_numpy(dtype=np.float32)
     else:
@@ -1001,6 +1582,7 @@ def _build_l3_policy_dataset(
         state_keys_all[oot_mask] if oot_mask.any() else state_keys_all,
         peak_bar[oot_mask] if oot_mask.any() else peak_bar,
         max_hold=max_hold,
+        pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
     )
     entry_policy_global, entry_policy_by_state = _l3_search_entry_policy(
         state_keys_all[oot_mask] if oot_mask.any() else state_keys_all,
@@ -1009,6 +1591,7 @@ def _build_l3_policy_dataset(
         size[oot_mask] if oot_mask.any() else size,
         edge_atr[oot_mask] if oot_mask.any() else edge_atr,
         tau_edge,
+        pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
     )
     entry_policy_arrays = _l3_lookup_policy_map(
         state_keys_all,
@@ -1017,6 +1600,13 @@ def _build_l3_policy_dataset(
             "min_confidence": float(entry_policy_global["min_confidence"]),
             "min_size": float(entry_policy_global["min_size"]),
         },
+    )
+    if "l2_decision_neutral" in merged.columns:
+        neutral = pd.to_numeric(merged["l2_decision_neutral"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float64)
+    else:
+        neutral = np.where(decision_class == 1, 1.0, 0.25).astype(np.float64)
+    l1a_dir = (
+        pd.to_numeric(merged.get("l1a_dir_normalized", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
     )
     horizon_arr = np.full(len(merged), int(target_horizon_global), dtype=np.int32)
     for key, horizon in target_horizon_by_state.items():
@@ -1061,6 +1651,23 @@ def _build_l3_policy_dataset(
         "l3_log_hold_bars",
         "l3_hold_bars_sq",
         "l3_hold_bucket",
+        "l3_drawdown_from_peak_atr",
+        "l3_price_velocity_3bar_atr",
+        "l3_feature_momentum_regdiv_3bar",
+        "l3_vol_surprise_accel",
+        "l3_regime_stability_3bar",
+        *PA_STATE_FEATURES,
+        "l3_signal_conf_decay",
+        "l3_signal_direction_agree",
+        "l3_regime_changed",
+        "l3_l2_gate_current",
+        "l3_l2_gate_decay",
+        "l3_would_enter_now",
+        "l3_regret_ratio",
+        "l3_bars_since_peak",
+        "l3_at_new_high",
+        "l3_regret_velocity",
+        "l3_trade_quality_bayes",
     ]
     row_it = range(len(merged))
     if _lgb_round_tqdm_enabled():
@@ -1133,6 +1740,48 @@ def _build_l3_policy_dataset(
         log_h_seg = np.log1p(holds).astype(np.float32, copy=False)
         h_sq_seg = ((holds * holds) / 100.0).astype(np.float32, copy=False)
         h_bkt_seg = np.searchsorted(_hold_bin_edges, holds.astype(np.int64), side="right").astype(np.float32, copy=False)
+        # Causal: peak at step j is max(unreal[0:j]); no look-ahead within the episode.
+        peak_unreal_cum = np.maximum.accumulate(unreal_seg.astype(np.float64))
+        drawdown_from_peak = (peak_unreal_cum - unreal_seg.astype(np.float64)).astype(np.float32, copy=False)
+        close_seg = close_px[idx_arr].astype(np.float64, copy=False)
+        atr_d = max(float(atr), 1e-6)
+        vel3 = np.zeros(n_steps, dtype=np.float32)
+        for j in range(n_steps):
+            j0 = max(0, j - 3)
+            vel3[j] = float((close_seg[j] - close_seg[j0]) / atr_d)
+        reg_div_d = regime_div_seg.astype(np.float64, copy=False)
+        mom_rd = np.zeros(n_steps, dtype=np.float32)
+        for j in range(n_steps):
+            j0 = max(0, j - 3)
+            mom_rd[j] = float(reg_div_d[j] - reg_div_d[j0])
+        vs = vol_surprise_seg.astype(np.float64, copy=False)
+        vs_acc = np.zeros(n_steps, dtype=np.float32)
+        for j in range(n_steps):
+            if j >= 2:
+                vs_acc[j] = float(vs[j] - 2.0 * vs[j - 1] + vs[j - 2])
+        cr = current_regime[idx_arr].astype(np.float64, copy=False)
+        rid = np.argmax(cr, axis=1).astype(np.int32, copy=False)
+        stab = np.zeros(n_steps, dtype=np.float32)
+        for j in range(n_steps):
+            lo = max(0, j - 2)
+            stab[j] = float(np.mean(rid[lo : j + 1] == rid[j]))
+        aux_block = _l3_episode_aux_feature_block(
+            n_steps=n_steps,
+            idx_arr=idx_arr,
+            entry_i=i,
+            side=float(side),
+            decision_class=decision_class,
+            decision_conf=decision_conf,
+            size=size,
+            neutral=neutral,
+            l1a_dir=l1a_dir,
+            entry_regime_row=entry_regime[i],
+            current_regime=current_regime,
+            unreal_seg=unreal_seg,
+            min_conf_arr=entry_policy_arrays["min_confidence"],
+            min_size_arr=entry_policy_arrays["min_size"],
+            drawdown_from_peak=drawdown_from_peak,
+        )
         feat_block = np.column_stack(
             [
                 np.full(n_steps, decision_conf[i], dtype=np.float32),
@@ -1154,19 +1803,62 @@ def _build_l3_policy_dataset(
                 log_h_seg,
                 h_sq_seg,
                 h_bkt_seg,
+                drawdown_from_peak,
+                vel3,
+                mom_rd,
+                vs_acc,
+                stab,
+                merged.loc[idx_arr, PA_STATE_FEATURES].to_numpy(dtype=np.float32, copy=False),
+                aux_block,
             ]
         ).astype(np.float32, copy=False)
         terminal_unreal = float(unreal_seg[-1])
         future_gain_left = (terminal_unreal - unreal_seg).astype(np.float32, copy=False)
         continuation_score = _l3_continuation_score(future_gain_left, live_edge_seg)
+        step_trend = np.asarray(pa_state["pa_state_trend_strength"][idx_arr], dtype=np.float32)
+        step_follow = np.asarray(pa_state["pa_state_followthrough_quality"][idx_arr], dtype=np.float32)
+        step_range = np.asarray(pa_state["pa_state_range_risk"][idx_arr], dtype=np.float32)
+        step_breakout = np.asarray(pa_state["pa_state_breakout_failure_risk"][idx_arr], dtype=np.float32)
+        step_pullback = np.asarray(pa_state["pa_state_pullback_exhaustion"][idx_arr], dtype=np.float32)
         last_step = np.arange(n_steps) == (n_steps - 1)
         late_hold_start = max(
             _env_int_clipped("L3_LATE_HOLD_MIN_BARS", 2, lo=1, hi=max_hold),
             int(np.ceil(target_horizon * _env_float_clipped("L3_LATE_HOLD_FRAC", 0.75, lo=0.1, hi=1.0))),
         )
-        weak_continuation = continuation_score <= exit_epsilon_atr
-        clearly_spent = future_gain_left <= -_l3_exit_loss_buffer_atr()
-        live_edge_faded = live_edge_seg <= _l3_exit_live_edge_floor()
+        if _l3_pa_targets_enabled():
+            eps_arr = exit_epsilon_atr * np.clip(
+                1.0 + 0.25 * step_range + 0.20 * step_breakout + 0.10 * step_pullback - 0.12 * step_trend - 0.08 * step_follow,
+                0.70,
+                1.60,
+            )
+            loss_buffer_arr = _l3_exit_loss_buffer_atr() * np.clip(
+                1.0 - 0.18 * step_range - 0.14 * step_breakout - 0.08 * step_pullback + 0.10 * step_trend,
+                0.55,
+                1.20,
+            )
+            live_edge_floor_arr = _l3_exit_live_edge_floor() * np.clip(
+                1.0 + 0.20 * step_range + 0.18 * step_breakout - 0.12 * step_trend,
+                0.60,
+                1.50,
+            )
+            late_start_scale = np.clip(
+                1.0
+                + 0.20 * float(pa_state["pa_state_trend_strength"][i])
+                + 0.10 * float(pa_state["pa_state_followthrough_quality"][i])
+                - 0.24 * float(pa_state["pa_state_range_risk"][i])
+                - 0.20 * float(pa_state["pa_state_breakout_failure_risk"][i])
+                - 0.10 * float(pa_state["pa_state_pullback_exhaustion"][i]),
+                0.55,
+                1.25,
+            )
+            late_hold_start = max(1, int(np.ceil(late_hold_start * late_start_scale)))
+        else:
+            eps_arr = np.full(n_steps, exit_epsilon_atr, dtype=np.float32)
+            loss_buffer_arr = np.full(n_steps, _l3_exit_loss_buffer_atr(), dtype=np.float32)
+            live_edge_floor_arr = np.full(n_steps, _l3_exit_live_edge_floor(), dtype=np.float32)
+        weak_continuation = continuation_score <= eps_arr
+        clearly_spent = future_gain_left <= -loss_buffer_arr
+        live_edge_faded = live_edge_seg <= live_edge_floor_arr
         late_flat = (holds >= late_hold_start) & (future_gain_left <= 0.0)
         exit_block = (last_step | clearly_spent | (weak_continuation & live_edge_faded) | late_flat).astype(np.int32, copy=False)
         rows_x_blocks.append(feat_block)
@@ -1230,6 +1922,7 @@ def _build_l3_policy_dataset(
                 "l3_entry_policy_by_state": entry_policy_by_state,
                 "l3_target_horizon_bars": target_horizon_global,
                 "l3_target_horizon_bars_by_state": target_horizon_by_state,
+                "pa_target_semantics": "PA-aware continuation thresholds, horizon scaling, and entry-quality scoring are applied inside dataset/target construction",
             },
         )
     print(
@@ -1292,7 +1985,7 @@ def _log_l3_val_extended(
     val_mask: np.ndarray,
     test_mask: np.ndarray,
     exit_model: lgb.Booster,
-    value_model: lgb.Booster,
+    value_model: lgb.Booster | None,
     *,
     exit_calibrator: IsotonicRegression | None = None,
 ) -> None:
@@ -1384,39 +2077,46 @@ def _log_l3_val_extended(
     i_conf = feature_cols.index("l2_decision_confidence")
     i_size = feature_cols.index("l2_size")
     c_ec = pearson_corr(X[vm, i_conf].astype(np.float64), p_exit)
-    vv_pred = value_model.predict(X[vm]).astype(np.float64)
-    c_sz_val = pearson_corr(X[vm, i_size].astype(np.float64), vv_pred)
-    print(f"    corr(L2 conf, L3 exit p)={c_ec:.4f}  corr(L2 size, L3 value pred)={c_sz_val:.4f}", flush=True)
+    if value_model is None:
+        print(f"    corr(L2 conf, L3 exit p)={c_ec:.4f}  (L3 value model disabled)", flush=True)
+    else:
+        vv_pred = value_model.predict(X[vm]).astype(np.float64)
+        c_sz_val = pearson_corr(X[vm, i_size].astype(np.float64), vv_pred)
+        print(f"    corr(L2 conf, L3 exit p)={c_ec:.4f}  corr(L2 size, L3 value pred)={c_sz_val:.4f}", flush=True)
 
     t_vm = np.asarray(pd.to_datetime(t_state))[vm]
     order = np.argsort(t_vm)
     fr = flip_rate_sorted(p_exit, order)
     print(f"    exit prob flip_rate (time-sorted val)={fr:.6f}", flush=True)
 
-    vv_true = y_value[vm].astype(np.float64)
-    mae_v = float(mean_absolute_error(vv_true, vv_pred))
-    rmse_v = float(np.sqrt(mean_squared_error(vv_true, vv_pred)))
-    r2_v = float(r2_score(vv_true, vv_pred)) if len(np.unique(vv_true)) > 1 else float("nan")
-    c_v = pearson_corr(vv_true, vv_pred)
-    std_v, degen_v = regression_degen_flag(vv_pred)
-    dir_acc = directional_accuracy_regression(vv_true, vv_pred)
-    print("\n  [L3] val — value (extended)", flush=True)
-    print(
-        f"    MAE={mae_v:.4f}  RMSE={rmse_v:.4f}  R2={r2_v:.4f}  corr={c_v:.4f}  "
-        f"dir_acc={dir_acc:.4f}  pred_std={std_v:.6f}  degen={degen_v}",
-        flush=True,
-    )
-    if reg_cols:
-        for k in range(len(reg_cols)):
-            m = reg_id == k
-            n_k = int(m.sum())
-            if n_k < 15:
-                continue
-            yt = vv_true[m]
-            yp = vv_pred[m]
-            mae_k = float(mean_absolute_error(yt, yp))
-            r2_k = float(r2_score(yt, yp)) if len(np.unique(yt)) > 1 else float("nan")
-            print(f"    entry-regime {k}  MAE={mae_k:.4f}  R2={r2_k:.4f}  n={n_k:,}", flush=True)
+    if value_model is None:
+        print("\n  [L3] val — value (extended): skipped (L3_VALUE_MODE=disabled)", flush=True)
+    else:
+        vv_pred = value_model.predict(X[vm]).astype(np.float64)
+        vv_true = y_value[vm].astype(np.float64)
+        mae_v = float(mean_absolute_error(vv_true, vv_pred))
+        rmse_v = float(np.sqrt(mean_squared_error(vv_true, vv_pred)))
+        r2_v = float(r2_score(vv_true, vv_pred)) if len(np.unique(vv_true)) > 1 else float("nan")
+        c_v = pearson_corr(vv_true, vv_pred)
+        std_v, degen_v = regression_degen_flag(vv_pred)
+        dir_acc = directional_accuracy_regression(vv_true, vv_pred)
+        print("\n  [L3] val — value (extended)", flush=True)
+        print(
+            f"    MAE={mae_v:.4f}  RMSE={rmse_v:.4f}  R2={r2_v:.4f}  corr={c_v:.4f}  "
+            f"dir_acc={dir_acc:.4f}  pred_std={std_v:.6f}  degen={degen_v}",
+            flush=True,
+        )
+        if reg_cols:
+            for k in range(len(reg_cols)):
+                m = reg_id == k
+                n_k = int(m.sum())
+                if n_k < 15:
+                    continue
+                yt = vv_true[m]
+                yp = vv_pred[m]
+                mae_k = float(mean_absolute_error(yt, yp))
+                r2_k = float(r2_score(yt, yp)) if len(np.unique(yt)) > 1 else float("nan")
+                print(f"    entry-regime {k}  MAE={mae_k:.4f}  R2={r2_k:.4f}  n={n_k:,}", flush=True)
 
     tm = np.asarray(test_mask, dtype=bool)
     if int(tm.sum()) >= 5:
@@ -1431,7 +2131,11 @@ def _log_l3_val_extended(
 
 def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_outputs: pd.DataFrame) -> L3TrainingBundle:
     traj_cfg = L3TrajectoryConfig()
+    value_disabled = (os.environ.get("L3_VALUE_MODE", "") or "").strip().lower() == "disabled"
     want_traj = os.environ.get("L3_TRAJ_GRU", "0").strip().lower() in {"1", "true", "yes"}
+    if value_disabled:
+        want_traj = False
+        print("  [L3] L3_VALUE_MODE=disabled — skipping value head & GRU hybrid.", flush=True)
     X, y_exit, y_value, t_state, feature_cols, rows_entry, traj_seq, traj_len, rows_from_model, dataset_policy = _load_or_build_l3_policy_dataset(
         df,
         l1a_outputs,
@@ -1462,7 +2166,14 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     )
     test_mask = np.asarray(holdout_mask, dtype=bool)
 
+    X, feature_cols, cox_bundle = _l3_append_cox_survival_features(X, feature_cols, rows_entry, y_exit, train_mask)
+
     log_layer_banner("[L3] Exit / policy (LGBM)")
+    print(
+        f"  [L3] exit policy states: granularity={os.environ.get('L3_EXIT_STATE_GRANULARITY', 'coarse')!r} "
+        f"(set L3_EXIT_STATE_GRANULARITY=full for legacy keys)",
+        flush=True,
+    )
     log_time_key_arrays(
         "L3",
         pd.Series(t_state[train_mask]),
@@ -1515,17 +2226,36 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "exit fires on spent continuation, late-flat paths, or terminal bar.",
         flush=True,
     )
-    print(f"  [L3] will write: {artifact_path(L3_EXIT_FILE)} | {artifact_path(L3_VALUE_FILE)} | {artifact_path(L3_META_FILE)}", flush=True)
-    log_label_baseline("l3_exit", y_exit[train_mask], task="cls")
-    log_label_baseline("l3_value", y_value[train_mask], task="reg")
-    y_value_fit, value_prep = _l3_prepare_value_targets(y_value, train_mask)
     print(
-        f"  [L3] value target prep: objective={value_prep['objective']} metric={value_prep['metric']}  "
-        f"clip={bool(value_prep['clip_enabled'])} q=[{float(value_prep['clip_lo_q']):.2f}, {float(value_prep['clip_hi_q']):.2f}]  "
-        f"train_clip=[{float(value_prep['clip_lo']):.4f}, {float(value_prep['clip_hi']):.4f}]  "
-        f"train_clipped_frac={float(value_prep['train_clipped_frac']):.3f}",
+        f"  [L3] will write: {artifact_path(L3_EXIT_FILE)}"
+        f"{' | ' + artifact_path(L3_VALUE_FILE) if not value_disabled else ''} | {artifact_path(L3_META_FILE)}",
         flush=True,
     )
+    log_label_baseline("l3_exit", y_exit[train_mask], task="cls")
+    log_label_baseline("l3_value", y_value[train_mask], task="reg")
+    pa_state_all = _l3_pa_dict_from_matrix(X, feature_cols)
+    if value_disabled:
+        y_value_fit = y_value.astype(np.float64)
+        value_prep = {
+            "objective": "disabled",
+            "metric": "none",
+            "clip_enabled": False,
+            "clip_lo_q": 0.0,
+            "clip_hi_q": 1.0,
+            "clip_lo": 0.0,
+            "clip_hi": 0.0,
+            "train_clipped_frac": 0.0,
+        }
+        print("  [L3] value target prep: disabled (exit-only policy)", flush=True)
+    else:
+        y_value_fit, value_prep = _l3_prepare_value_targets(y_value, train_mask, pa_state=pa_state_all)
+        print(
+            f"  [L3] value target prep: objective={value_prep['objective']} metric={value_prep['metric']}  "
+            f"clip={bool(value_prep['clip_enabled'])} q=[{float(value_prep['clip_lo_q']):.2f}, {float(value_prep['clip_hi_q']):.2f}]  "
+            f"train_clip=[{float(value_prep['clip_lo']):.4f}, {float(value_prep['clip_hi']):.4f}]  "
+            f"train_clipped_frac={float(value_prep['train_clipped_frac']):.3f}",
+            flush=True,
+        )
     exit_pos_w, hold_neg_w = _l3_exit_class_weights(y_exit[train_mask])
     print(
         f"  [L3] exit class weights: hold={hold_neg_w:.3f}  exit={exit_pos_w:.3f}",
@@ -1579,7 +2309,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         X_lgb = X
         feature_cols = static_cols
 
-    rounds = _l3_boost_rounds()
+    rounds_exit = _l3_exit_boost_rounds()
+    rounds_value = _l3_boost_rounds()
     es_rounds = _l3_early_stopping_rounds()
     exit_cfg = _l3_lgb_params("L3_EXIT", seed_default=71)
     value_cfg = _l3_lgb_params("L3_VALUE", seed_default=72)
@@ -1599,18 +2330,22 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "seed": exit_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
     }
-    value_params = _l3_value_lgb_params(
-        {
-            **exit_params,
-            **value_cfg,
-        },
-        seed=value_cfg["seed"],
-        prep=value_prep,
+    value_params = (
+        None
+        if value_disabled
+        else _l3_value_lgb_params(
+            {
+                **exit_params,
+                **value_cfg,
+            },
+            seed=value_cfg["seed"],
+            prep=value_prep,
+        )
     )
     static_exit_model = None
     static_value_model = None
     l3_outer = tqdm(
-        total=2,
+        total=1 if value_disabled else 2,
         desc="[L3] models",
         unit="model",
         leave=True,
@@ -1620,8 +2355,13 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     try:
         ih_tr = feature_cols.index("l3_hold_bars")
         hold_tr = X_lgb[train_mask, ih_tr].astype(np.float64)
-        w_exit = _l3_trade_normalized_exit_weights(rows_entry[train_mask], hold_tr, y_exit[train_mask])
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds, "[L3] exit")
+        w_exit = _l3_trade_normalized_exit_weights(
+            rows_entry[train_mask],
+            hold_tr,
+            y_exit[train_mask],
+            pa_state={k: v[train_mask] for k, v in pa_state_all.items()},
+        )
+        cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_exit, "[L3] exit")
         try:
             exit_model = lgb.train(
                 exit_params,
@@ -1632,7 +2372,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
                     feature_name=feature_cols,
                     free_raw_data=False,
                 ),
-                num_boost_round=rounds,
+                num_boost_round=rounds_exit,
                 valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_exit[val_mask], feature_name=feature_cols, free_raw_data=False)],
                 callbacks=cbs,
             )
@@ -1642,20 +2382,23 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         l3_outer.set_postfix_str("exit", refresh=False)
         l3_outer.update(1)
 
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds, "[L3] value")
-        try:
-            value_model = lgb.train(
-                value_params,
-                lgb.Dataset(X_lgb[train_mask], label=y_value_fit[train_mask], feature_name=feature_cols, free_raw_data=False),
-                num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_value_fit[val_mask], feature_name=feature_cols, free_raw_data=False)],
-                callbacks=cbs,
-            )
-        finally:
-            for fn in cl:
-                fn()
-        l3_outer.set_postfix_str("value", refresh=False)
-        l3_outer.update(1)
+        if value_disabled:
+            value_model = None
+        else:
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_value, "[L3] value")
+            try:
+                value_model = lgb.train(
+                    value_params,
+                    lgb.Dataset(X_lgb[train_mask], label=y_value_fit[train_mask], feature_name=feature_cols, free_raw_data=False),
+                    num_boost_round=rounds_value,
+                    valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_value_fit[val_mask], feature_name=feature_cols, free_raw_data=False)],
+                    callbacks=cbs,
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l3_outer.set_postfix_str("value", refresh=False)
+            l3_outer.update(1)
     finally:
         l3_outer.close()
     exit_calibrator = _fit_l3_exit_calibrator(
@@ -1663,9 +2406,14 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64),
     )
     exit_prob_tune = _apply_l3_exit_calibrator(exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64), exit_calibrator)
-    value_pred_tune = value_model.predict(X_lgb[val_tune_mask]).astype(np.float64)
-    value_policy_mode = _choose_l3_value_policy_mode(y_value[val_tune_mask], value_pred_tune)
-    value_tie_margin = _derive_l3_value_tie_margin(y_value[val_tune_mask], value_pred_tune)
+    if value_disabled:
+        value_pred_tune = np.zeros(int(np.sum(val_tune_mask)), dtype=np.float64)
+        value_policy_mode = "prob_only"
+        value_tie_margin = 0.03
+    else:
+        value_pred_tune = value_model.predict(X_lgb[val_tune_mask]).astype(np.float64)
+        value_policy_mode = _choose_l3_value_policy_mode(y_value[val_tune_mask], value_pred_tune)
+        value_tie_margin = _derive_l3_value_tie_margin(y_value[val_tune_mask], value_pred_tune)
     exit_state_keys = _l3_exit_policy_row_state_keys(
         X[val_tune_mask],
         static_cols,
@@ -1680,7 +2428,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
     )
-    if use_hybrid and os.environ.get("L3_GRU_ABLATION", "1").strip().lower() in {"1", "true", "yes"}:
+    if use_hybrid and not value_disabled and os.environ.get("L3_GRU_ABLATION", "1").strip().lower() in {"1", "true", "yes"}:
         print("  [L3] GRU ablation: fitting static-only comparators...", flush=True)
         static_exit_model, static_value_model = _fit_l3_static_ablation(
             X,
@@ -1690,7 +2438,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             val_mask,
             rows_entry,
             static_cols,
-            rounds=rounds,
+            rounds=rounds_exit,
             es_rounds=es_rounds,
             value_prep=value_prep,
         )
@@ -1713,12 +2461,13 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         )
     if use_hybrid:
         st_sh, em_sh = l3_trajectory_embed_importance_ratio(exit_model, n_static, traj_cfg.embed_dim)
-        st_v, em_v = l3_trajectory_embed_importance_ratio(value_model, n_static, traj_cfg.embed_dim)
         print(
-            f"  [L3] gain importance share — exit: static={st_sh:.1%}  traj_emb={em_sh:.1%}  |  "
-            f"value: static={st_v:.1%}  traj_emb={em_v:.1%}",
+            f"  [L3] gain importance share — exit: static={st_sh:.1%}  traj_emb={em_sh:.1%}",
             flush=True,
         )
+        if value_model is not None:
+            st_v, em_v = l3_trajectory_embed_importance_ratio(value_model, n_static, traj_cfg.embed_dim)
+            print(f"  [L3] gain importance share — value: static={st_v:.1%}  traj_emb={em_v:.1%}", flush=True)
     _log_l3_val_extended(
         X_lgb,
         y_exit,
@@ -1733,13 +2482,32 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     )
     os.makedirs(MODEL_DIR, exist_ok=True)
     exit_model.save_model(os.path.join(MODEL_DIR, L3_EXIT_FILE))
-    value_model.save_model(os.path.join(MODEL_DIR, L3_VALUE_FILE))
-    model_files: dict[str, str] = {"exit": L3_EXIT_FILE, "value": L3_VALUE_FILE}
+    model_files: dict[str, str] = {"exit": L3_EXIT_FILE}
+    if not value_disabled and value_model is not None:
+        value_model.save_model(os.path.join(MODEL_DIR, L3_VALUE_FILE))
+        model_files["value"] = L3_VALUE_FILE
     if exit_calibrator is not None:
         exit_calib_file = "l3_exit_calibrator.pkl"
         with open(os.path.join(MODEL_DIR, exit_calib_file), "wb") as f:
             pickle.dump(exit_calibrator, f)
         model_files["exit_calibrator"] = exit_calib_file
+    cox_path = os.path.join(MODEL_DIR, L3_COX_FILE)
+    if cox_bundle.get("l3_cox_fitted") and cox_bundle.get("fitter") is not None:
+        with open(cox_path, "wb") as f:
+            pickle.dump(
+                {
+                    "fitter": cox_bundle["fitter"],
+                    "cov_names": cox_bundle["cov_names"],
+                    "l3_cox_fitted": True,
+                },
+                f,
+            )
+        print(f"  [L3] Cox artifact saved -> {cox_path}", flush=True)
+    elif os.path.exists(cox_path):
+        try:
+            os.remove(cox_path)
+        except OSError:
+            pass
     entry_min_confidence = float(dataset_policy.get("l3_entry_policy", {}).get("min_confidence", _l3_entry_policy_defaults()[0]))
     entry_min_size = float(dataset_policy.get("l3_entry_policy", {}).get("min_size", _l3_entry_policy_defaults()[1]))
     meta = {
@@ -1752,7 +2520,38 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             "l3_log_hold_bars",
             "l3_hold_bars_sq",
             "l3_hold_bucket",
+            "l3_drawdown_from_peak_atr",
+            "l3_price_velocity_3bar_atr",
+            "l3_feature_momentum_regdiv_3bar",
+            "l3_vol_surprise_accel",
+            "l3_regime_stability_3bar",
+            *PA_STATE_FEATURES,
+            "l3_signal_conf_decay",
+            "l3_signal_direction_agree",
+            "l3_regime_changed",
+            "l3_l2_gate_current",
+            "l3_l2_gate_decay",
+            "l3_would_enter_now",
+            "l3_regret_ratio",
+            "l3_bars_since_peak",
+            "l3_at_new_high",
+            "l3_regret_velocity",
+            "l3_trade_quality_bayes",
+            "l3_cox_log_partial_hazard",
+            "l3_cox_baseline_cumhaz_at_stop",
         ],
+        "l3_cox_fitted": bool(cox_bundle.get("l3_cox_fitted")),
+        "l3_cox_artifact_file": L3_COX_FILE,
+        "l3_cox_fit_reason": str(cox_bundle.get("reason", "")),
+        "l3_value_disabled": bool(value_disabled),
+        "l3_value_mode": "disabled" if value_disabled else "full",
+        "l3_exit_state_granularity": os.environ.get("L3_EXIT_STATE_GRANULARITY", "coarse"),
+        "l3_exit_boost_rounds": int(rounds_exit),
+        "l3_exit_infer_smooth": os.environ.get("L3_EXIT_INFER_SMOOTH", "1").strip().lower() in {"1", "true", "yes"},
+        "l3_exit_ema_alpha": float(os.environ.get("L3_EXIT_EMA_ALPHA", "0.3")),
+        "l3_exit_hyst_enter": float(os.environ.get("L3_EXIT_HYST_ENTER", "0.55")),
+        "l3_exit_hyst_leave": float(os.environ.get("L3_EXIT_HYST_LEAVE", "0.35")),
+        "l3_min_hold_bars": int(max(0, round(float(os.environ.get("L3_MIN_HOLD_BARS", "3"))))),
         "l3_hybrid": bool(use_hybrid),
         "l3_val_tune_frac": val_tune_frac,
         "l3_allow_truth_fallback": os.environ.get("L3_ALLOW_TRUTH_FALLBACK", "0").strip().lower() in {"1", "true", "yes"},
@@ -1771,6 +2570,9 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_value_tie_margin": float(exit_policy.get("value_tie_margin", value_tie_margin)),
         "l3_exit_policy_search": exit_policy,
         "l3_exit_policy_by_state": exit_policy_by_state,
+        "pa_state_features": list(PA_STATE_FEATURES),
+        "pa_policy_semantics": "PA buckets expand L3 entry/exit/horizon state policies and tighten holds in fragile price-action contexts",
+        "pa_target_semantics": str(dataset_policy.get("pa_target_semantics", "PA-aware continuation thresholds and target horizon scaling are applied inside L3 supervision")),
         "l3_target_semantics": "fixed_deadline_continuation_with_meaningful_hold_class",
         "l3_gru_default_enabled": False,
         "l3_exit_class_weights": {
@@ -1778,7 +2580,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             "exit": float(exit_pos_w),
         },
         "l3_value_training": value_prep,
-        "l3_boost_rounds": int(rounds),
+        "l3_boost_rounds": int(rounds_value),
         "l3_early_stopping_rounds": int(es_rounds),
         "l3_exit_lgb_config": exit_cfg,
         "l3_value_lgb_config": value_cfg,
@@ -1822,11 +2624,14 @@ def load_l3_exit_manager() -> tuple[dict[str, Any], dict[str, Any]]:
             f"Retrain L3 so artifacts match schema {L3_SCHEMA_VERSION}."
         )
     model_files = meta.get("model_files", {})
-    models: dict[str, Any] = {
-        name: lgb.Booster(model_file=os.path.join(MODEL_DIR, fname))
-        for name, fname in model_files.items()
-        if name != "exit_calibrator"
-    }
+    models: dict[str, Any] = {}
+    for name, fname in model_files.items():
+        if name == "exit_calibrator" or not fname:
+            continue
+        path = os.path.join(MODEL_DIR, str(fname))
+        if name == "value" and not os.path.exists(path):
+            continue
+        models[name] = lgb.Booster(model_file=path)
     exit_calib_file = model_files.get("exit_calibrator")
     if exit_calib_file:
         with open(os.path.join(MODEL_DIR, exit_calib_file), "rb") as f:

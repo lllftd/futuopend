@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from core.mamba_pa_state import PAStateMamba
 from core.tcn_pa_state import PAStateTCN, FocalLoss
 from core.trainers.pa_feature_cache import load_or_build_pa_features
+from core.trainers.pa_state_controls import ensure_pa_state_features
 
 from core.trainers.constants import *
 from core.trainers.lgbm_utils import *
@@ -222,7 +223,7 @@ def _clip01(x: np.ndarray) -> np.ndarray:
 def ensure_structure_context_features(df: pd.DataFrame) -> pd.DataFrame:
     missing_cols = [c for c in PA_CTX_FEATURES if c not in df.columns]
     if not missing_cols:
-        return df
+        return ensure_pa_state_features(df)
 
     ensure_breakout_features(df)
 
@@ -432,7 +433,7 @@ def ensure_structure_context_features(df: pd.DataFrame) -> pd.DataFrame:
     }
     for col in missing_cols:
         df[col] = ctx_values[col]
-    return df
+    return ensure_pa_state_features(df)
 
 
 def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -> pd.DataFrame:
