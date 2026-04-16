@@ -24,6 +24,124 @@ def l2_val_start_time() -> np.datetime64:
     return np.datetime64(raw)
 
 
+def l2_oof_folds_from_env() -> int:
+    """Layer-2 blocked time OOF fold count.
+
+    Default ``5``: full calibration window is split into K contiguous time blocks;
+    each block is validated once with models trained on the other blocks; final
+    LGBM rounds = median best_iteration across folds; calibrators fit on stacked OOF preds.
+
+    Set ``L2_OOF_FOLDS=1`` to restore the legacy ``L2_VAL_START`` time holdout inside cal.
+    """
+    raw = os.environ.get("L2_OOF_FOLDS", "5").strip() or "5"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 5
+    return max(1, min(n, 128))
+
+
+def l3_oof_folds_from_env() -> int:
+    """Layer-3 blocked time OOF on the OOT policy window (see ``L3_OOT_START`` / ``L3_HOLDOUT_START``).
+
+    Default ``5``: split OOT rows into K contiguous time blocks; ES per fold; final rounds = median
+    ``best_iteration``; exit calibrator fits on stacked OOF raw probabilities on the full OOT fit pool.
+
+    Set ``L3_OOF_FOLDS=1`` for the legacy trade-id70/30 train/val split inside OOT.
+    """
+    raw = os.environ.get("L3_OOF_FOLDS", "5").strip() or "5"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 5
+    return max(1, min(n, 128))
+
+
+def l1_oof_folds_from_env() -> int:
+    """Layer-1 (L1a market encoder, L1b, L1c) blocked time OOF inside the in-sample stack window.
+
+    Default ``5``: rows with ``time_key < CAL_END`` (train ∪ cal) are split into K contiguous time
+    blocks; each block is validated once; ES / epoch selection uses the median across folds; final
+    fit uses the full pool.
+
+    Set ``L1_OOF_FOLDS=1`` for legacy splits (e.g. L1b/L1c train vs ``l2_val`` only).
+    """
+    raw = os.environ.get("L1_OOF_FOLDS", "5").strip() or "5"
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 5
+    return max(1, min(n, 128))
+
+
+def split_mask_for_tuning_and_report(
+    time_key: pd.Series | np.ndarray,
+    base_mask: np.ndarray,
+    *,
+    tune_frac: float,
+    min_rows_each: int = 50,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Time-ordered split of ``base_mask`` into an early (tune) and late (report) slice."""
+    base = np.asarray(base_mask, dtype=bool)
+    idx = np.flatnonzero(base)
+    tune_mask = np.zeros_like(base, dtype=bool)
+    report_mask = np.zeros_like(base, dtype=bool)
+    if idx.size == 0:
+        return tune_mask, report_mask
+    ts = np.asarray(pd.to_datetime(time_key))
+    idx = idx[np.argsort(ts[idx], kind="mergesort")]
+    if idx.size < 2 * min_rows_each:
+        tune_mask[idx] = True
+        report_mask[idx] = True
+        return tune_mask, report_mask
+    split = int(round(idx.size * float(np.clip(tune_frac, 0.2, 0.8))))
+    split = max(min_rows_each, min(idx.size - min_rows_each, split))
+    tune_mask[idx[:split]] = True
+    report_mask[idx[split:]] = True
+    return tune_mask, report_mask
+
+
+def balanced_time_fold_chunk_sizes(n: int, k: int) -> list[int]:
+    if k <= 0:
+        return [n]
+    q, r = divmod(n, k)
+    return [q + 1] * r + [q] * (k - r)
+
+
+def time_blocked_fold_masks(
+    time_key: pd.Series | np.ndarray,
+    base_mask: np.ndarray,
+    n_folds: int,
+    *,
+    context: str = "OOF",
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """K disjoint contiguous time blocks inside ``base_mask``; each tuple is (train_bool, val_bool) for one fold."""
+    base = np.asarray(base_mask, dtype=bool).ravel()
+    n = base.size
+    idx = np.flatnonzero(base)
+    if idx.size < n_folds * 10:
+        raise RuntimeError(
+            f"{context}: need at least {n_folds * 10} rows in fit mask, got {idx.size} "
+            f"(reduce fold count or widen the fit window)."
+        )
+    ts = np.asarray(pd.to_datetime(time_key))
+    idx = idx[np.argsort(ts[idx], kind="mergesort")]
+    sizes = balanced_time_fold_chunk_sizes(int(idx.size), n_folds)
+    folds: list[tuple[np.ndarray, np.ndarray]] = []
+    start = 0
+    for sz in sizes:
+        end = start + int(sz)
+        va_idx = idx[start:end]
+        tr_idx = np.setdiff1d(idx, va_idx, assume_unique=False)
+        tr_m = np.zeros(n, dtype=bool)
+        va_m = np.zeros(n, dtype=bool)
+        tr_m[tr_idx] = True
+        va_m[va_idx] = True
+        folds.append((tr_m, va_m))
+        start = end
+    return folds
+
+
 def build_stack_time_splits(time_key: pd.Series | np.ndarray) -> StackTimeSplits:
     ts = pd.to_datetime(np.asarray(time_key))
     train_mask = ts < np.datetime64(TRAIN_END)

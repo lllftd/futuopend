@@ -67,7 +67,15 @@ from core.trainers.pa_state_controls import (
     pa_state_bucket_labels_from_frame,
 )
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_split
-from core.trainers.stack_v2_common import build_stack_time_splits, l2_val_start_time, log_label_baseline, save_output_cache
+from core.trainers.stack_v2_common import (
+    build_stack_time_splits,
+    l2_oof_folds_from_env,
+    l2_val_start_time,
+    log_label_baseline,
+    save_output_cache,
+    split_mask_for_tuning_and_report,
+    time_blocked_fold_masks,
+)
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.val_metrics_extra import (
     brier_binary,
@@ -540,32 +548,6 @@ def _l2_expected_edge_from_gate_dir(
             )
 
     return out
-
-
-def _split_mask_for_tuning_and_report(
-    time_key: pd.Series | np.ndarray,
-    base_mask: np.ndarray,
-    *,
-    tune_frac: float,
-    min_rows_each: int = 50,
-) -> tuple[np.ndarray, np.ndarray]:
-    base = np.asarray(base_mask, dtype=bool)
-    idx = np.flatnonzero(base)
-    tune_mask = np.zeros_like(base, dtype=bool)
-    report_mask = np.zeros_like(base, dtype=bool)
-    if idx.size == 0:
-        return tune_mask, report_mask
-    ts = np.asarray(pd.to_datetime(time_key))
-    idx = idx[np.argsort(ts[idx])]
-    if idx.size < 2 * min_rows_each:
-        tune_mask[idx] = True
-        report_mask[idx] = True
-        return tune_mask, report_mask
-    split = int(round(idx.size * float(np.clip(tune_frac, 0.2, 0.8))))
-    split = max(min_rows_each, min(idx.size - min_rows_each, split))
-    tune_mask[idx[:split]] = True
-    report_mask[idx[split:]] = True
-    return tune_mask, report_mask
 
 
 def _l2_hard_decision_from_gate_dir(
@@ -2335,14 +2317,24 @@ def train_l2_trade_decision(
     X = frame[feature_cols].to_numpy(dtype=np.float32, copy=False)
     splits = build_stack_time_splits(df["time_key"])
     l2_val_start = l2_val_start_time()
+    n_oof = l2_oof_folds_from_env()
 
-    train_mask = splits.l2_train_mask
-    val_mask = splits.l2_val_mask
+    if n_oof >= 2:
+        train_mask = np.asarray(splits.cal_mask, dtype=bool)
+        val_mask = np.asarray(splits.cal_mask, dtype=bool)
+        print(
+            f"  [L2] blocked time OOF: L2_OOF_FOLDS={n_oof} on full cal window [{TRAIN_END}, {CAL_END}) "
+            f"(set L2_OOF_FOLDS=1 for legacy split at L2_VAL_START={l2_val_start})",
+            flush=True,
+        )
+    else:
+        train_mask = splits.l2_train_mask
+        val_mask = splits.l2_val_mask
     test_mask = splits.test_mask
     if not train_mask.any() or not val_mask.any():
         raise RuntimeError("L2: calibration split is empty for train/val.")
     tune_frac = float(os.environ.get("L2_TUNE_FRAC_WITHIN_VAL", "0.5"))
-    val_tune_mask, val_report_mask = _split_mask_for_tuning_and_report(
+    val_tune_mask, val_report_mask = split_mask_for_tuning_and_report(
         df["time_key"], val_mask, tune_frac=tune_frac, min_rows_each=50
     )
     if not val_tune_mask.any() or not val_report_mask.any():
@@ -2461,18 +2453,29 @@ def train_l2_trade_decision(
     }
 
     log_layer_banner("[L2] Trade decision (LGBM)")
-    log_time_key_split(
-        "L2",
-        df["time_key"],
-        train_mask,
-        val_mask,
-        train_label=f"l2_train [{TRAIN_END}, {str(l2_val_start)})",
-        val_label=f"l2_val [{str(l2_val_start)}, {CAL_END})",
-        extra_note=(
-            f"Strict time split inside cal window: train in [{TRAIN_END}, {str(l2_val_start)}), "
-            f"val in [{str(l2_val_start)}, {CAL_END})."
-        ),
-    )
+    if n_oof >= 2:
+        log_time_key_split(
+            "L2",
+            df["time_key"],
+            train_mask,
+            val_mask,
+            train_label=f"l2_cal(full) [{TRAIN_END}, {CAL_END})",
+            val_label=f"l2_cal(full) [{TRAIN_END}, {CAL_END})",
+            extra_note=f"OOF: {n_oof} contiguous time folds; val masks match cal for tune/report slicing only.",
+        )
+    else:
+        log_time_key_split(
+            "L2",
+            df["time_key"],
+            train_mask,
+            val_mask,
+            train_label=f"l2_train [{TRAIN_END}, {str(l2_val_start)})",
+            val_label=f"l2_val [{str(l2_val_start)}, {CAL_END})",
+            extra_note=(
+                f"Strict time split inside cal window: train in [{TRAIN_END}, {str(l2_val_start)}), "
+                f"val in [{str(l2_val_start)}, {CAL_END})."
+            ),
+        )
     log_time_key_split(
         "L2(threshold/calibration)",
         df["time_key"],
@@ -2624,115 +2627,341 @@ def train_l2_trade_decision(
             f"  [L2] trade_gate blocks {len(gate_blocked_cols)} sign-bearing L1c/derived cols: {gate_blocked_cols}",
             flush=True,
         )
-    dtrain_gate = lgb.Dataset(
-        X_gate_train_fit[fit_train_mask],
-        label=y_trade[fit_train_mask],
-        weight=gate_w_train,
-        feature_name=feature_cols,
-        free_raw_data=False,
-    )
-    dval_gate = lgb.Dataset(
-        X_gate_all[val_mask],
-        label=y_trade[val_mask],
-        weight=gate_w_val,
-        feature_name=feature_cols,
-        free_raw_data=False,
-    )
-    l2_outer = tqdm(
-        total=4,
-        desc="[L2] models",
-        unit="model",
-        leave=True,
-        file=TQDM_FILE,
-        disable=not _lgb_round_tqdm_enabled(),
-    )
     direction_model: lgb.Booster
-    try:
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(gate_es_rounds, rounds, "[L2] gate", first_metric_only=True)
-        try:
-            gate_model = lgb.train(trade_gate_params, dtrain_gate, num_boost_round=rounds, valid_sets=[dval_gate], callbacks=cbs)
-        finally:
-            for fn in cl:
-                fn()
-        l2_outer.set_postfix_str("gate", refresh=False)
-        l2_outer.update(1)
+    gate_model: lgb.Booster
+    mfe_model: lgb.Booster
+    mae_model: lgb.Booster
+    n_samples = len(df)
+    gate_oof = np.full(n_samples, np.nan, dtype=np.float64)
+    dir_oof = np.full(n_samples, np.nan, dtype=np.float64)
+    mfe_oof = np.full(n_samples, np.nan, dtype=np.float64)
+    mae_oof = np.full(n_samples, np.nan, dtype=np.float64)
 
-        if int(active_train.sum()) < 100 or int(active_val.sum()) < 25:
-            raise RuntimeError(
-                "L2: too few active rows for direction/MFE/MAE heads after strict time split. "
-                f"active_train={int(active_train.sum())}, active_val={int(active_val.sum())}"
-            )
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(side_es_rounds, rounds, "[L2] direction")
+    if n_oof >= 2:
+        fold_masks = time_blocked_fold_masks(df["time_key"], fit_train_mask, n_oof, context="L2 OOF")
+        best_gate: list[int] = []
+        best_dir: list[int] = []
+        best_mfe: list[int] = []
+        best_mae: list[int] = []
+        l2_outer = tqdm(
+            total=n_oof * 4,
+            desc="[L2] OOF models",
+            unit="fit",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
         try:
-            direction_model = lgb.train(
-                direction_params,
-                lgb.Dataset(
-                    X_train_fit[active_train],
-                    label=y_dir_stage[active_train],
-                    weight=dir_weights[active_train],
+            for fk, (tr_m, va_m) in enumerate(fold_masks):
+                fit_tr = fit_train_mask & tr_m
+                fit_va = fit_train_mask & va_m
+                active_tr = fit_tr & (y_dir_stage >= 0)
+                active_va = fit_va & (y_dir_stage >= 0)
+                if (
+                    int(fit_tr.sum()) < 200
+                    or int(fit_va.sum()) < 30
+                    or int(active_tr.sum()) < 100
+                    or int(active_va.sum()) < 25
+                ):
+                    raise RuntimeError(
+                        "L2 OOF: fold too small for direction/MFE/MAE. "
+                        f"fold={fk} fit_tr={int(fit_tr.sum())} fit_va={int(fit_va.sum())} "
+                        f"active_tr={int(active_tr.sum())} active_va={int(active_va.sum())}"
+                    )
+                w_tr = np.ones(int(fit_tr.sum()), dtype=np.float64)
+                tr_ix = np.flatnonzero(fit_tr)
+                w_tr[y_trade[tr_ix] == 0] = gate_nt_w
+                w_va = np.ones(int(fit_va.sum()), dtype=np.float64)
+                va_ix = np.flatnonzero(fit_va)
+                w_va[y_trade[va_ix] == 0] = gate_nt_w
+                dtr_g = lgb.Dataset(
+                    X_gate_train_fit[fit_tr],
+                    label=y_trade[fit_tr],
+                    weight=w_tr,
                     feature_name=feature_cols,
                     free_raw_data=False,
-                ),
-                num_boost_round=rounds,
-                valid_sets=[
+                )
+                dva_g = lgb.Dataset(
+                    X_gate_all[fit_va],
+                    label=y_trade[fit_va],
+                    weight=w_va,
+                    feature_name=feature_cols,
+                    free_raw_data=False,
+                )
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+                    gate_es_rounds, rounds, f"[L2] gate oof {fk + 1}/{n_oof}", first_metric_only=True
+                )
+                try:
+                    gm_fold = lgb.train(
+                        trade_gate_params, dtr_g, num_boost_round=rounds, valid_sets=[dva_g], callbacks=cbs
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                bi_g = int(gm_fold.best_iteration) if gm_fold.best_iteration is not None else rounds
+                best_gate.append(max(1, bi_g))
+                gate_oof[fit_va] = gm_fold.predict(X_gate_all[fit_va]).astype(np.float64)
+                l2_outer.update(1)
+
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+                    side_es_rounds, rounds, f"[L2] direction oof {fk + 1}/{n_oof}"
+                )
+                try:
+                    dm_fold = lgb.train(
+                        direction_params,
+                        lgb.Dataset(
+                            X_train_fit[active_tr],
+                            label=y_dir_stage[active_tr],
+                            weight=dir_weights[active_tr],
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=rounds,
+                        valid_sets=[
+                            lgb.Dataset(
+                                X[active_va],
+                                label=y_dir_stage[active_va],
+                                weight=dir_weights[active_va],
+                                feature_name=feature_cols,
+                                free_raw_data=False,
+                            )
+                        ],
+                        callbacks=cbs,
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                bi_d = int(dm_fold.best_iteration) if dm_fold.best_iteration is not None else rounds
+                best_dir.append(max(1, bi_d))
+                dir_oof[fit_va] = dm_fold.predict(X[fit_va]).astype(np.float64)
+                l2_outer.update(1)
+
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(mfe_es_rounds, rounds, f"[L2] mfe oof {fk + 1}/{n_oof}")
+                try:
+                    mf_fold = lgb.train(
+                        mfe_params,
+                        lgb.Dataset(
+                            X_train_fit[active_tr],
+                            label=y_mfe_fit[active_tr],
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=rounds,
+                        valid_sets=[
+                            lgb.Dataset(
+                                X[active_va], label=y_mfe_fit[active_va], feature_name=feature_cols, free_raw_data=False
+                            )
+                        ],
+                        callbacks=cbs,
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                best_mfe.append(max(1, int(mf_fold.best_iteration) if mf_fold.best_iteration is not None else rounds))
+                mfe_oof[fit_va] = mf_fold.predict(X[fit_va]).astype(np.float64)
+                l2_outer.update(1)
+
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(mae_es_rounds, rounds, f"[L2] mae oof {fk + 1}/{n_oof}")
+                try:
+                    ma_fold = lgb.train(
+                        mae_params,
+                        lgb.Dataset(
+                            X_train_fit[active_tr],
+                            label=y_mae_fit[active_tr],
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=rounds,
+                        valid_sets=[
+                            lgb.Dataset(
+                                X[active_va], label=y_mae_fit[active_va], feature_name=feature_cols, free_raw_data=False
+                            )
+                        ],
+                        callbacks=cbs,
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                best_mae.append(max(1, int(ma_fold.best_iteration) if ma_fold.best_iteration is not None else rounds))
+                mae_oof[fit_va] = ma_fold.predict(X[fit_va]).astype(np.float64)
+                l2_outer.update(1)
+        finally:
+            l2_outer.close()
+
+        nr_gate = int(np.clip(np.median(best_gate), 10, rounds))
+        nr_dir = int(np.clip(np.median(best_dir), 10, rounds))
+        nr_mfe = int(np.clip(np.median(best_mfe), 10, rounds))
+        nr_mae = int(np.clip(np.median(best_mae), 10, rounds))
+        print(
+            f"  [L2] OOF median best_iteration → gate={nr_gate} direction={nr_dir} mfe={nr_mfe} mae={nr_mae} "
+            f"(cap={rounds})",
+            flush=True,
+        )
+        gate_model = lgb.train(
+            trade_gate_params,
+            lgb.Dataset(
+                X_gate_train_fit[fit_train_mask],
+                label=y_trade[fit_train_mask],
+                weight=gate_w_train,
+                feature_name=feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nr_gate,
+        )
+        direction_model = lgb.train(
+            direction_params,
+            lgb.Dataset(
+                X_train_fit[active_train],
+                label=y_dir_stage[active_train],
+                weight=dir_weights[active_train],
+                feature_name=feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nr_dir,
+        )
+        mfe_model = lgb.train(
+            mfe_params,
+            lgb.Dataset(
+                X_train_fit[active_train],
+                label=y_mfe_fit[active_train],
+                feature_name=feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nr_mfe,
+        )
+        mae_model = lgb.train(
+            mae_params,
+            lgb.Dataset(
+                X_train_fit[active_train],
+                label=y_mae_fit[active_train],
+                feature_name=feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nr_mae,
+        )
+    else:
+        dtrain_gate = lgb.Dataset(
+            X_gate_train_fit[fit_train_mask],
+            label=y_trade[fit_train_mask],
+            weight=gate_w_train,
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        dval_gate = lgb.Dataset(
+            X_gate_all[val_mask],
+            label=y_trade[val_mask],
+            weight=gate_w_val,
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        l2_outer = tqdm(
+            total=4,
+            desc="[L2] models",
+            unit="model",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
+        try:
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(gate_es_rounds, rounds, "[L2] gate", first_metric_only=True)
+            try:
+                gate_model = lgb.train(
+                    trade_gate_params, dtrain_gate, num_boost_round=rounds, valid_sets=[dval_gate], callbacks=cbs
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l2_outer.set_postfix_str("gate", refresh=False)
+            l2_outer.update(1)
+
+            if int(active_train.sum()) < 100 or int(active_val.sum()) < 25:
+                raise RuntimeError(
+                    "L2: too few active rows for direction/MFE/MAE heads after strict time split. "
+                    f"active_train={int(active_train.sum())}, active_val={int(active_val.sum())}"
+                )
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(side_es_rounds, rounds, "[L2] direction")
+            try:
+                direction_model = lgb.train(
+                    direction_params,
                     lgb.Dataset(
-                        X[active_val],
-                        label=y_dir_stage[active_val],
-                        weight=dir_weights[active_val],
+                        X_train_fit[active_train],
+                        label=y_dir_stage[active_train],
+                        weight=dir_weights[active_train],
                         feature_name=feature_cols,
                         free_raw_data=False,
-                    )
-                ],
-                callbacks=cbs,
-            )
-        finally:
-            for fn in cl:
-                fn()
-        l2_outer.set_postfix_str("direction", refresh=False)
-        l2_outer.update(1)
+                    ),
+                    num_boost_round=rounds,
+                    valid_sets=[
+                        lgb.Dataset(
+                            X[active_val],
+                            label=y_dir_stage[active_val],
+                            weight=dir_weights[active_val],
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        )
+                    ],
+                    callbacks=cbs,
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l2_outer.set_postfix_str("direction", refresh=False)
+            l2_outer.update(1)
 
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(mfe_es_rounds, rounds, "[L2] mfe")
-        try:
-            mfe_model = lgb.train(
-                mfe_params,
-                lgb.Dataset(
-                    X_train_fit[active_train], label=y_mfe_fit[active_train], feature_name=feature_cols, free_raw_data=False
-                ),
-                num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X[active_val], label=y_mfe_fit[active_val], feature_name=feature_cols, free_raw_data=False)],
-                callbacks=cbs,
-            )
-        finally:
-            for fn in cl:
-                fn()
-        l2_outer.set_postfix_str("mfe", refresh=False)
-        l2_outer.update(1)
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(mfe_es_rounds, rounds, "[L2] mfe")
+            try:
+                mfe_model = lgb.train(
+                    mfe_params,
+                    lgb.Dataset(
+                        X_train_fit[active_train], label=y_mfe_fit[active_train], feature_name=feature_cols, free_raw_data=False
+                    ),
+                    num_boost_round=rounds,
+                    valid_sets=[
+                        lgb.Dataset(X[active_val], label=y_mfe_fit[active_val], feature_name=feature_cols, free_raw_data=False)
+                    ],
+                    callbacks=cbs,
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l2_outer.set_postfix_str("mfe", refresh=False)
+            l2_outer.update(1)
 
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(mae_es_rounds, rounds, "[L2] mae")
-        try:
-            mae_model = lgb.train(
-                mae_params,
-                lgb.Dataset(
-                    X_train_fit[active_train], label=y_mae_fit[active_train], feature_name=feature_cols, free_raw_data=False
-                ),
-                num_boost_round=rounds,
-                valid_sets=[lgb.Dataset(X[active_val], label=y_mae_fit[active_val], feature_name=feature_cols, free_raw_data=False)],
-                callbacks=cbs,
-            )
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(mae_es_rounds, rounds, "[L2] mae")
+            try:
+                mae_model = lgb.train(
+                    mae_params,
+                    lgb.Dataset(
+                        X_train_fit[active_train], label=y_mae_fit[active_train], feature_name=feature_cols, free_raw_data=False
+                    ),
+                    num_boost_round=rounds,
+                    valid_sets=[
+                        lgb.Dataset(X[active_val], label=y_mae_fit[active_val], feature_name=feature_cols, free_raw_data=False)
+                    ],
+                    callbacks=cbs,
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l2_outer.set_postfix_str("mae", refresh=False)
+            l2_outer.update(1)
         finally:
-            for fn in cl:
-                fn()
-        l2_outer.set_postfix_str("mae", refresh=False)
-        l2_outer.update(1)
-    finally:
-        l2_outer.close()
+            l2_outer.close()
 
     gate_raw_all = gate_model.predict(X_gate_all).astype(np.float64)
     direction_raw_all = direction_model.predict(X).astype(np.float64)
-    gate_calibrator = _fit_binary_calibrator(y_trade[val_tune_mask], gate_raw_all[val_tune_mask])
-    trade_p_all = _apply_binary_calibrator(gate_raw_all, gate_calibrator).astype(np.float32)
     direction_tune_mask = val_tune_mask & (y_dir_stage >= 0)
-    direction_calibrator = _fit_binary_calibrator(y_dir_stage[direction_tune_mask], direction_raw_all[direction_tune_mask])
+    if n_oof >= 2:
+        if not bool(np.all(np.isfinite(gate_oof[fit_train_mask]))):
+            raise RuntimeError("L2 OOF: incomplete gate OOF predictions on fit_train_mask.")
+        gate_calibrator = _fit_binary_calibrator(y_trade[fit_train_mask], gate_oof[fit_train_mask])
+        direction_calibrator = _fit_binary_calibrator(y_dir_stage[direction_tune_mask], dir_oof[direction_tune_mask])
+    else:
+        gate_calibrator = _fit_binary_calibrator(y_trade[val_tune_mask], gate_raw_all[val_tune_mask])
+        direction_calibrator = _fit_binary_calibrator(
+            y_dir_stage[direction_tune_mask], direction_raw_all[direction_tune_mask]
+        )
+    trade_p_all = _apply_binary_calibrator(gate_raw_all, gate_calibrator).astype(np.float32)
     direction_p_cal = _apply_binary_calibrator(direction_raw_all, direction_calibrator).astype(np.float32)
     train_long_prior = float(np.mean(y_dir_stage[active_train] == 1)) if np.any(active_train) else 0.5
     target_long_prior = float(np.clip(float(os.environ.get("L2_DIRECTION_TARGET_LONG_PRIOR", "0.5")), 1e-4, 1.0 - 1e-4))
@@ -2934,6 +3163,7 @@ def train_l2_trade_decision(
         model_files["direction_calibrator"] = direction_calib_file
     meta = {
         "schema_version": L2_SCHEMA_VERSION,
+        "l2_oof_folds": int(n_oof) if n_oof >= 2 else 0,
         "l2_policy_state_granularity": os.environ.get("L2_POLICY_STATE_GRANULARITY", "coarse"),
         "l2_gate_no_trade_weight": float(gate_nt_w),
         "l2_l1b_train_feature_dropout": float(l1b_train_dropout_p),

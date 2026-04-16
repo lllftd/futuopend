@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import trange
 
 from core.trainers.constants import (
+    CAL_END,
     FAST_TRAIN_MODE,
     L1C_META_FILE,
     L1C_MODEL_FILE,
@@ -31,7 +32,15 @@ from core.trainers.l1c.losses import L1cBinaryDirectionLoss
 from core.trainers.l1c.model import L1cDirectionModel
 from core.trainers.lgbm_utils import TQDM_FILE, _lgb_round_tqdm_enabled
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner
-from core.trainers.stack_v2_common import build_stack_time_splits, log_label_baseline, save_output_cache
+from core.trainers.stack_v2_common import (
+    build_stack_time_splits,
+    l1_oof_folds_from_env,
+    l2_val_start_time,
+    log_label_baseline,
+    save_output_cache,
+    split_mask_for_tuning_and_report,
+    time_blocked_fold_masks,
+)
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.tcn_constants import DEVICE
 
@@ -468,6 +477,61 @@ def _eval_loss(
     return total / max(n, 1)
 
 
+def _l1c_early_stop_best_epoch(
+    train_dl: DataLoader,
+    val_dl: DataLoader,
+    config: L1cConfig,
+    *,
+    seq_len: int,
+    max_epochs: int,
+    patience: int,
+    min_delta: float,
+    desc: str,
+) -> int:
+    """Return 1-based epoch index of best validation loss (early stopping). Fresh model each call."""
+    criterion = L1cBinaryDirectionLoss(config)
+    model = L1cDirectionModel(config).to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config.lr),
+        weight_decay=float(config.weight_decay),
+    )
+    scheduler: CosineAnnealingWarmRestarts | None = None
+    if int(config.cosine_t0) > 0:
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, int(config.cosine_t0)),
+            T_mult=max(1, int(config.cosine_t_mult)),
+        )
+    best_val = float("inf")
+    stale = 0
+    best_ep = 1
+    epoch_bar = trange(
+        max_epochs,
+        desc=desc,
+        unit="ep",
+        leave=False,
+        file=TQDM_FILE,
+        disable=not _lgb_round_tqdm_enabled(),
+    )
+    for ep in epoch_bar:
+        _train_one_epoch(model, train_dl, optimizer, criterion, DEVICE, seq_len=seq_len)
+        va_loss = _eval_loss(model, val_dl, criterion, DEVICE)
+        if scheduler is not None:
+            scheduler.step()
+        if hasattr(epoch_bar, "set_postfix"):
+            epoch_bar.set_postfix(val=f"{va_loss:.4f}", refresh=False)
+        if va_loss < (best_val - min_delta):
+            best_val = va_loss
+            best_ep = ep + 1
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                break
+    return max(1, int(best_ep))
+
+
 def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
     train_started_at = datetime.now().astimezone()
     train_started_perf = time.perf_counter()
@@ -521,7 +585,10 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
     work = df.copy(deep=False)
     feature_cols = _select_l1c_feature_cols(work, feat_cols, config)
     splits = build_stack_time_splits(work["time_key"])
-    Xn, mean, std = _normalize_l1c_matrix(work, feature_cols, splits.train_mask)
+    l1_fit_mask = np.asarray(splits.train_mask | splits.cal_mask, dtype=bool)
+    n_l1_oof = l1_oof_folds_from_env()
+    norm_mask = l1_fit_mask if n_l1_oof >= 2 else splits.train_mask
+    Xn, mean, std = _normalize_l1c_matrix(work, feature_cols, norm_mask)
     seq_len = int(config.seq_len)
     horizon = int(config.predict_horizon)
     windows, y_bin, sw, y_ret, end_idx = _build_l1c_windows_labels(
@@ -533,12 +600,34 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
     )
     if len(end_idx) == 0:
         raise RuntimeError("L1c: no windows with valid future horizon.")
+    n_w = len(end_idx)
     window_train = splits.train_mask[end_idx]
     window_val = splits.l2_val_mask[end_idx]
-    if not window_train.any():
-        raise RuntimeError("L1c: no training windows (end bar in train split).")
-    if not window_val.any():
-        raise RuntimeError("L1c: no validation windows (end bar in l2_val).")
+    window_pool = l1_fit_mask[end_idx]
+    l2_vs = l2_val_start_time()
+    if n_l1_oof >= 2:
+        print(
+            f"  [L1c] blocked time OOF: L1_OOF_FOLDS={n_l1_oof} on train+cal window ends (t < {CAL_END}) "
+            f"(set L1_OOF_FOLDS=1 for legacy train vs l2_val [{l2_vs}, {CAL_END}))",
+            flush=True,
+        )
+        if not window_pool.any():
+            raise RuntimeError("L1c OOF: no windows with end bar in train+cal.")
+        tune_frac = float(os.environ.get("L1_TUNE_FRAC_WITHIN_FIT", "0.5"))
+        val_tune_mask, val_report_mask = split_mask_for_tuning_and_report(
+            work["time_key"], l1_fit_mask, tune_frac=tune_frac, min_rows_each=50
+        )
+        if not val_tune_mask.any() or not val_report_mask.any():
+            raise RuntimeError("L1c OOF: failed to build tune/report masks inside train+cal.")
+        window_val_report = val_report_mask[end_idx]
+        if not window_val_report.any():
+            raise RuntimeError("L1c OOF: no validation windows in fit_report slice.")
+    else:
+        if not window_train.any():
+            raise RuntimeError("L1c: no training windows (end bar in train split).")
+        if not window_val.any():
+            raise RuntimeError("L1c: no validation windows (end bar in l2_val).")
+        window_val_report = window_val
 
     log_layer_banner("[L1c] Direction (causal Transformer, binary BCE)")
     print(
@@ -547,13 +636,16 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         f"{artifact_path(L1C_OUTPUT_CACHE_FILE)}",
         flush=True,
     )
+    win_tr_n = int(window_pool.sum()) if n_l1_oof >= 2 else int(window_train.sum())
+    win_va_n = int(window_val_report.sum())
     print(
         f"  [L1c] seq_len={seq_len} horizon={horizon} feats={len(feature_cols)} "
-        f"train_windows={int(window_train.sum())} val_windows={int(window_val.sum())}",
+        f"fit_windows={win_tr_n} report_windows={win_va_n}",
         flush=True,
     )
-    log_label_baseline("l1c_up_binary", y_bin[window_train], task="cls")
-    _print_l1c_binary_label_stats(y_bin[window_train], y_ret[window_train], prefix="train windows")
+    log_mask = window_pool if n_l1_oof >= 2 else window_train
+    log_label_baseline("l1c_up_binary", y_bin[log_mask], task="cls")
+    _print_l1c_binary_label_stats(y_bin[log_mask], y_ret[log_mask], prefix="fit windows")
     print(
         "  [L1c] target: 1[future_ret>0]; loss: weighted BCE (logits); "
         "sample_weight=rank(|ret|)/N (set L1C_SAMPLE_WEIGHT_MODE=uniform to disable).",
@@ -567,69 +659,137 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
         torch.from_numpy(sw),
         torch.from_numpy(y_ret),
     )
-    train_ds = TensorDataset(*[t[window_train] for t in ds.tensors])
-    val_ds = TensorDataset(*[t[window_val] for t in ds.tensors])
     pin = DEVICE.type == "cuda"
-    train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, pin_memory=pin)
-    val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, pin_memory=pin)
-
-    criterion = L1cBinaryDirectionLoss(config)
-    config.input_dim = len(feature_cols)
-    model = L1cDirectionModel(config).to(DEVICE)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config.lr),
-        weight_decay=float(config.weight_decay),
-    )
-    scheduler: CosineAnnealingWarmRestarts | None = None
-    if int(config.cosine_t0) > 0:
-        scheduler = CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=max(1, int(config.cosine_t0)),
-            T_mult=max(1, int(config.cosine_t_mult)),
-        )
-
-    best_state: dict[str, torch.Tensor] | None = None
-    best_val = float("inf")
-    stale = 0
     max_epochs = int(config.max_epochs)
     patience = int(config.patience)
     min_delta = float(config.early_stop_min_delta)
-    print(
-        f"  [L1c] train_config: batch_size={config.batch_size}  lr={float(config.lr):g}  "
-        f"weight_decay={float(config.weight_decay):g}  max_epochs={max_epochs}  patience={patience}  "
-        f"min_delta={min_delta:g}  label_smoothing={float(config.label_smoothing):.4f}",
-        flush=True,
-    )
-    epoch_bar = trange(
-        max_epochs,
-        desc="[L1c] epochs",
-        unit="ep",
-        leave=True,
-        file=TQDM_FILE,
-        disable=not _lgb_round_tqdm_enabled(),
-    )
-    for _ep in epoch_bar:
-        tr_loss = _train_one_epoch(model, train_dl, optimizer, criterion, DEVICE, seq_len=seq_len)
-        if _ep == 0:
-            _first_epoch_diagnostic(model, train_dl, DEVICE)
-        va_loss = _eval_loss(model, val_dl, criterion, DEVICE)
-        if scheduler is not None:
-            scheduler.step()
-        if hasattr(epoch_bar, "set_postfix"):
-            epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
-        print(f"  [L1c] epoch={_ep + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
-        if va_loss < (best_val - min_delta):
-            best_val = va_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            stale = 0
-        else:
-            stale += 1
-            if stale >= patience:
-                break
-    if best_state is None:
-        raise RuntimeError("L1c: training failed to produce a checkpoint.")
-    model.load_state_dict(best_state)
+    config.input_dim = len(feature_cols)
+
+    if n_l1_oof >= 2:
+        w_pool_idx = np.flatnonzero(window_pool)
+        tk_sub = work["time_key"].to_numpy()[end_idx[w_pool_idx]]
+        fold_masks = time_blocked_fold_masks(tk_sub, np.ones(len(w_pool_idx), bool), n_l1_oof, context="L1c OOF")
+        best_eps: list[int] = []
+        for fk, (tr_sub, va_sub) in enumerate(fold_masks):
+            w_tr = np.zeros(n_w, dtype=bool)
+            w_va = np.zeros(n_w, dtype=bool)
+            w_tr[w_pool_idx[tr_sub]] = True
+            w_va[w_pool_idx[va_sub]] = True
+            train_ds_f = TensorDataset(*[t[w_tr] for t in ds.tensors])
+            val_ds_f = TensorDataset(*[t[w_va] for t in ds.tensors])
+            train_dl_f = DataLoader(train_ds_f, batch_size=config.batch_size, shuffle=True, pin_memory=pin)
+            val_dl_f = DataLoader(val_ds_f, batch_size=config.batch_size, shuffle=False, pin_memory=pin)
+            be = _l1c_early_stop_best_epoch(
+                train_dl_f,
+                val_dl_f,
+                config,
+                seq_len=seq_len,
+                max_epochs=max_epochs,
+                patience=patience,
+                min_delta=min_delta,
+                desc=f"[L1c] oof {fk + 1}/{n_l1_oof}",
+            )
+            best_eps.append(be)
+            print(f"  [L1c] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
+        nr = int(np.clip(np.median(best_eps), 1, max_epochs))
+        print(f"  [L1c] OOF median best_epoch -> final_epochs={nr}", flush=True)
+        train_ds = TensorDataset(*[t[window_pool] for t in ds.tensors])
+        train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, pin_memory=pin)
+        val_ds = TensorDataset(*[t[window_val_report] for t in ds.tensors])
+        val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, pin_memory=pin)
+        model = L1cDirectionModel(config).to(DEVICE)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(config.lr),
+            weight_decay=float(config.weight_decay),
+        )
+        scheduler: CosineAnnealingWarmRestarts | None = None
+        if int(config.cosine_t0) > 0:
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=max(1, int(config.cosine_t0)),
+                T_mult=max(1, int(config.cosine_t_mult)),
+            )
+        print(
+            f"  [L1c] train_config: batch_size={config.batch_size}  lr={float(config.lr):g}  "
+            f"weight_decay={float(config.weight_decay):g}  final_epochs={nr} (OOF median)  "
+            f"label_smoothing={float(config.label_smoothing):.4f}",
+            flush=True,
+        )
+        epoch_bar = trange(
+            nr,
+            desc="[L1c] final fit",
+            unit="ep",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
+        criterion_final = L1cBinaryDirectionLoss(config)
+        for _ep in epoch_bar:
+            tr_loss = _train_one_epoch(model, train_dl, optimizer, criterion_final, DEVICE, seq_len=seq_len)
+            if _ep == 0:
+                _first_epoch_diagnostic(model, train_dl, DEVICE)
+            if scheduler is not None:
+                scheduler.step()
+            if hasattr(epoch_bar, "set_postfix"):
+                epoch_bar.set_postfix(train=f"{tr_loss:.4f}", refresh=False)
+            print(f"  [L1c] epoch={_ep + 1:02d} train_loss={tr_loss:.4f}", flush=True)
+    else:
+        train_ds = TensorDataset(*[t[window_train] for t in ds.tensors])
+        val_ds = TensorDataset(*[t[window_val] for t in ds.tensors])
+        train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, pin_memory=pin)
+        val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, pin_memory=pin)
+        model = L1cDirectionModel(config).to(DEVICE)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(config.lr),
+            weight_decay=float(config.weight_decay),
+        )
+        scheduler = None
+        if int(config.cosine_t0) > 0:
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=max(1, int(config.cosine_t0)),
+                T_mult=max(1, int(config.cosine_t_mult)),
+            )
+        best_state: dict[str, torch.Tensor] | None = None
+        best_val = float("inf")
+        stale = 0
+        print(
+            f"  [L1c] train_config: batch_size={config.batch_size}  lr={float(config.lr):g}  "
+            f"weight_decay={float(config.weight_decay):g}  max_epochs={max_epochs}  patience={patience}  "
+            f"min_delta={min_delta:g}  label_smoothing={float(config.label_smoothing):.4f}",
+            flush=True,
+        )
+        epoch_bar = trange(
+            max_epochs,
+            desc="[L1c] epochs",
+            unit="ep",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
+        for _ep in epoch_bar:
+            tr_loss = _train_one_epoch(model, train_dl, optimizer, criterion, DEVICE, seq_len=seq_len)
+            if _ep == 0:
+                _first_epoch_diagnostic(model, train_dl, DEVICE)
+            va_loss = _eval_loss(model, val_dl, criterion, DEVICE)
+            if scheduler is not None:
+                scheduler.step()
+            if hasattr(epoch_bar, "set_postfix"):
+                epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
+            print(f"  [L1c] epoch={_ep + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
+            if va_loss < (best_val - min_delta):
+                best_val = va_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale = 0
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
+        if best_state is None:
+            raise RuntimeError("L1c: training failed to produce a checkpoint.")
+        model.load_state_dict(best_state)
 
     val_metrics = evaluate_l1c(model, val_dl, DEVICE)
     print_l1c_eval_report(val_metrics)
@@ -671,6 +831,9 @@ def train_l1c_direction(df: pd.DataFrame, feat_cols: list[str]) -> None:
             "patience": int(patience),
             "min_delta": float(min_delta),
         },
+        "l1_oof_folds": int(n_l1_oof),
+        "l1_oof_enabled": bool(n_l1_oof >= 2),
+        "l1_final_epochs_after_oof": int(nr) if n_l1_oof >= 2 else None,
         "val_metrics": val_metrics,
     }
     meta = attach_threshold_registry(

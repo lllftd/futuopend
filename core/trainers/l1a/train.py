@@ -32,6 +32,7 @@ from tqdm.auto import trange, tqdm
 
 from core.tcn_pa_state import FocalLoss, L1AGatedTemporalBlock, TemporalAttentionReadout
 from core.trainers.constants import (
+    CAL_END,
     FAST_TRAIN_MODE,
     L1A_META_FILE,
     L1A_MODEL_FILE,
@@ -50,8 +51,12 @@ from core.trainers.val_metrics_extra import brier_binary, brier_multiclass, ece_
 from core.trainers.stack_v2_common import (
     build_stack_time_splits,
     compute_transition_event_labels,
+    l1_oof_folds_from_env,
+    l2_val_start_time,
     log_label_baseline,
     save_output_cache,
+    split_mask_for_tuning_and_report,
+    time_blocked_fold_masks,
 )
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.tcn_constants import DEVICE, SEQ_LEN
@@ -782,6 +787,84 @@ def _eval_epoch(
     return total_loss / max(total_rows, 1)
 
 
+def _l1a_early_stop_best_epoch(
+    train_dl: DataLoader,
+    val_dl: DataLoader,
+    *,
+    n_feat: int,
+    embed_dim: int,
+    channels: list[int],
+    tcn_dropout: float,
+    readout_dropout: float,
+    head_dropout: float,
+    regime_loss: nn.Module,
+    transition_loss: nn.Module,
+    loss_weights: dict[str, float],
+    lr: float,
+    wd: float,
+    T0: int,
+    Tm: int,
+    max_epochs: int,
+    patience: int,
+    min_delta: float,
+    desc: str,
+) -> int:
+    model = L1AMarketTCN(
+        n_feat,
+        channels=channels,
+        seq_len=SEQ_LEN,
+        readout_type=_l1a_readout_type(),
+        min_attention_seq_len=_l1a_min_attention_seq_len(),
+        tcn_dropout=tcn_dropout,
+        readout_dropout=readout_dropout,
+        head_dropout=head_dropout,
+        embed_dim=embed_dim,
+    ).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
+    best_val = float("inf")
+    stale = 0
+    best_ep = 1
+    epoch_bar = trange(
+        max_epochs,
+        desc=desc,
+        unit="ep",
+        leave=False,
+        file=TQDM_FILE,
+        disable=not _lgb_round_tqdm_enabled(),
+    )
+    for epoch in epoch_bar:
+        tr_loss = _train_epoch(
+            model,
+            train_dl,
+            optimizer,
+            DEVICE,
+            regime_loss=regime_loss,
+            transition_loss=transition_loss,
+            loss_weights=loss_weights,
+        )
+        va_loss = _eval_epoch(
+            model,
+            val_dl,
+            DEVICE,
+            regime_loss=regime_loss,
+            transition_loss=transition_loss,
+            loss_weights=loss_weights,
+        )
+        scheduler.step()
+        if hasattr(epoch_bar, "set_postfix"):
+            epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
+        if va_loss < (best_val - min_delta):
+            best_val = va_loss
+            best_ep = epoch + 1
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                break
+    return max(1, int(best_ep))
+
+
 def _l1a_transition_val_block(
     label: str,
     y_true: np.ndarray,
@@ -1085,20 +1168,45 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     work = df.copy(deep=False)
     feature_cols = _select_l1a_feature_cols(work, feat_cols)
     splits = build_stack_time_splits(work["time_key"])
-    Xn, mean, std = _normalize_l1a_matrix(work, feature_cols, splits.train_mask)
+    l1_fit_mask = np.asarray(splits.train_mask | splits.cal_mask, dtype=bool)
+    n_l1_oof = l1_oof_folds_from_env()
+    norm_mask = l1_fit_mask if n_l1_oof >= 2 else splits.train_mask
+    l2_vs = l2_val_start_time()
+    Xn, mean, std = _normalize_l1a_matrix(work, feature_cols, norm_mask)
     norm_df = pd.concat([work[["symbol", "time_key"]], pd.DataFrame(Xn, columns=feature_cols)], axis=1)
     windows, end_idx = _build_symbol_windows(norm_df, feature_cols, SEQ_LEN)
     if len(end_idx) == 0:
         raise RuntimeError("L1a: no valid sequence windows were created.")
 
-    targets, clip_meta = _build_l1a_targets(work, fit_mask=splits.train_mask)
+    targets, clip_meta = _build_l1a_targets(work, fit_mask=norm_mask)
     window_train = splits.train_mask[end_idx]
     window_cal = splits.cal_mask[end_idx]
     window_val = splits.l2_val_mask[end_idx]
-    if not window_val.any():
-        raise RuntimeError("L1a: L2 validation window is empty for validation.")
-    if not window_cal.any():
-        raise RuntimeError("L1a: calibration window is empty for diagnostics.")
+    window_pool = l1_fit_mask[end_idx]
+    n_w = len(end_idx)
+    if n_l1_oof >= 2:
+        print(
+            f"  [L1a] blocked time OOF: L1_OOF_FOLDS={n_l1_oof} on train+cal window ends (t < {CAL_END}) "
+            f"(set L1_OOF_FOLDS=1 for legacy train vs l2_val [{l2_vs}, {CAL_END}))",
+            flush=True,
+        )
+        if not window_pool.any():
+            raise RuntimeError("L1a OOF: no windows with end bar in train+cal.")
+        tune_frac = float(os.environ.get("L1_TUNE_FRAC_WITHIN_FIT", "0.5"))
+        val_tune_mask, val_report_mask = split_mask_for_tuning_and_report(
+            work["time_key"], l1_fit_mask, tune_frac=tune_frac, min_rows_each=50
+        )
+        if not val_tune_mask.any() or not val_report_mask.any():
+            raise RuntimeError("L1a OOF: failed to build tune/report masks inside train+cal.")
+        window_val_report = val_report_mask[end_idx]
+        if not window_val_report.any():
+            raise RuntimeError("L1a OOF: no windows in fit_report slice.")
+    else:
+        if not window_val.any():
+            raise RuntimeError("L1a: L2 validation window is empty for validation.")
+        if not window_cal.any():
+            raise RuntimeError("L1a: calibration window is empty for diagnostics.")
+        window_val_report = window_val
 
     X_t = torch.from_numpy(windows.astype(np.float32, copy=False))
     time_ir_fit = _transform_time_in_regime_target(targets["time_in_regime"])
@@ -1110,8 +1218,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         torch.from_numpy(targets["vol_trend"][end_idx].astype(np.float32)),
         torch.from_numpy(time_ir_fit[end_idx].astype(np.float32)),
     )
-    train_ds = TensorDataset(*[tensor[window_train] for tensor in ds.tensors])
-    val_ds = TensorDataset(*[tensor[window_val] for tensor in ds.tensors])
+    val_ds = TensorDataset(*[tensor[window_val_report] for tensor in ds.tensors])
     cal_ds = TensorDataset(*[tensor[window_cal] for tensor in ds.tensors])
     batch_size = 512 if FAST_TRAIN_MODE else 1024
     loader_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
@@ -1123,23 +1230,37 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     }
     if loader_workers > 0:
         loader_kwargs["persistent_workers"] = True
-    train_dl = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_dl = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     cal_dl = DataLoader(cal_ds, shuffle=False, **loader_kwargs)
 
     embed_dim = _l1a_embed_dim()
+    log_w_tr = window_pool if n_l1_oof >= 2 else window_train
 
     log_layer_banner("[L1a] Sequence Market Encoder (TCN)")
-    log_time_key_arrays(
+    if n_l1_oof >= 2:
+        log_time_key_arrays(
+            "L1a",
+            work.iloc[end_idx[log_w_tr]]["time_key"],
+            work.iloc[end_idx[window_val_report]]["time_key"],
+            train_label="window fit (end in train+cal)",
+            val_label="window report (late slice in train+cal)",
+            extra_note=f"OOF: {n_l1_oof} folds; late-time report slice for metrics.",
+        )
+    else:
+        log_time_key_arrays(
+            "L1a",
+            work.iloc[end_idx[window_train]]["time_key"],
+            work.iloc[end_idx[window_val]]["time_key"],
+            train_label="window train (end_idx in train split)",
+            val_label="window val (end_idx in l2_val split)",
+            extra_note="Primary L1a early stopping/reporting uses l2_val end-bars; full cal remains secondary diagnostic.",
+        )
+    w_tr = windows[log_w_tr]
+    log_numpy_x_stats(
         "L1a",
-        work.iloc[end_idx[window_train]]["time_key"],
-        work.iloc[end_idx[window_val]]["time_key"],
-        train_label="window train (end_idx in train split)",
-        val_label="window val (end_idx in l2_val split)",
-        extra_note="Primary L1a early stopping/reporting uses l2_val end-bars; full cal remains secondary diagnostic.",
+        w_tr.reshape(w_tr.shape[0], -1),
+        label="windows[fit] (flattened seq×feat)" if n_l1_oof >= 2 else "windows[train] (flattened seq×feat)",
     )
-    w_tr = windows[window_train]
-    log_numpy_x_stats("L1a", w_tr.reshape(w_tr.shape[0], -1), label="windows[train] (flattened seq×feat)")
     n_row = len(work)
     n_warm = int(len(end_idx))
     print(
@@ -1163,95 +1284,189 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "  [L1a] note: forward uses this run's weights/data (not loading L1a from disk for features).",
         flush=True,
     )
-    log_label_baseline("l1a_regime", targets["regime"][end_idx][window_train], task="cls")
-    log_label_baseline("l1a_transition_risk", targets["transition_risk"][end_idx][window_train], task="cls")
-    log_label_baseline("l1a_vol_forecast", targets["vol_forecast"][end_idx][window_train], task="reg")
-    log_label_baseline("l1a_vol_trend", targets["vol_trend"][end_idx][window_train], task="reg")
-    log_label_baseline("l1a_time_in_regime", targets["time_in_regime"][end_idx][window_train], task="reg")
+    log_label_baseline("l1a_regime", targets["regime"][end_idx][log_w_tr], task="cls")
+    log_label_baseline("l1a_transition_risk", targets["transition_risk"][end_idx][log_w_tr], task="cls")
+    log_label_baseline("l1a_vol_forecast", targets["vol_forecast"][end_idx][log_w_tr], task="reg")
+    log_label_baseline("l1a_vol_trend", targets["vol_trend"][end_idx][log_w_tr], task="reg")
+    log_label_baseline("l1a_time_in_regime", targets["time_in_regime"][end_idx][log_w_tr], task="reg")
 
     loss_weights = _l1a_loss_weights()
-    regime_loss = _l1a_regime_loss(targets["regime"][end_idx][window_train], device=DEVICE)
-    transition_loss = _l1a_transition_loss(targets["transition_risk"][end_idx][window_train], device=DEVICE)
     ch = _l1a_tcn_channels()
     td = _l1a_tcn_dropout()
     rd = _l1a_readout_dropout()
     hd_drop = _l1a_head_dropout()
-    model = L1AMarketTCN(
-        len(feature_cols),
-        channels=ch,
-        seq_len=SEQ_LEN,
-        readout_type=_l1a_readout_type(),
-        min_attention_seq_len=_l1a_min_attention_seq_len(),
-        tcn_dropout=td,
-        readout_dropout=rd,
-        head_dropout=hd_drop,
-        embed_dim=embed_dim,
-    ).to(DEVICE)
     lr = float(os.environ.get("L1A_LR", "5e-4"))
     wd = float(os.environ.get("L1A_WEIGHT_DECAY", "1e-3"))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     T0 = max(1, int(os.environ.get("L1A_COS_T0", "5")))
     Tm = max(1, int(os.environ.get("L1A_COS_T_MULT", "2")))
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
     max_epochs = max(4, int(os.environ.get("L1A_MAX_EPOCHS", "8" if FAST_TRAIN_MODE else "18")))
     patience = max(2, int(os.environ.get("L1A_PATIENCE", "4" if FAST_TRAIN_MODE else "6")))
     min_delta = float(os.environ.get("L1A_EARLY_STOP_MIN_DELTA", "5e-4"))
-    best_state: dict[str, torch.Tensor] | None = None
-    best_val = float("inf")
-    stale = 0
-    epoch_bar = trange(
-        max_epochs,
-        desc="[L1a] epochs",
-        unit="ep",
-        leave=True,
-        file=TQDM_FILE,
-        disable=not _lgb_round_tqdm_enabled(),
-    )
-    print(
-        f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
-        f"tcn_channels={ch}  tcn_dropout={td}  "
-        f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
-        f"max_epochs={max_epochs}  patience={patience}  min_delta={min_delta:g}  loss_weights={loss_weights}",
-        flush=True,
-    )
-    for epoch in epoch_bar:
-        tr_loss = _train_epoch(
-            model,
-            train_dl,
-            optimizer,
-            DEVICE,
-            regime_loss=regime_loss,
-            transition_loss=transition_loss,
-            loss_weights=loss_weights,
+    l1_final_epochs_after_oof: int | None = None
+
+    if n_l1_oof >= 2:
+        w_pool_idx = np.flatnonzero(window_pool)
+        tk_sub = work["time_key"].to_numpy()[end_idx[w_pool_idx]]
+        fold_masks = time_blocked_fold_masks(tk_sub, np.ones(len(w_pool_idx), bool), n_l1_oof, context="L1a OOF")
+        best_eps: list[int] = []
+        for fk, (tr_sub, va_sub) in enumerate(fold_masks):
+            w_tr_f = np.zeros(n_w, dtype=bool)
+            w_va_f = np.zeros(n_w, dtype=bool)
+            w_tr_f[w_pool_idx[tr_sub]] = True
+            w_va_f[w_pool_idx[va_sub]] = True
+            regime_loss_f = _l1a_regime_loss(targets["regime"][end_idx][w_tr_f], device=DEVICE)
+            transition_loss_f = _l1a_transition_loss(targets["transition_risk"][end_idx][w_tr_f], device=DEVICE)
+            train_ds_f = TensorDataset(*[tensor[w_tr_f] for tensor in ds.tensors])
+            val_ds_f = TensorDataset(*[tensor[w_va_f] for tensor in ds.tensors])
+            train_dl_f = DataLoader(train_ds_f, shuffle=True, **loader_kwargs)
+            val_dl_f = DataLoader(val_ds_f, shuffle=False, **loader_kwargs)
+            be = _l1a_early_stop_best_epoch(
+                train_dl_f,
+                val_dl_f,
+                n_feat=len(feature_cols),
+                embed_dim=embed_dim,
+                channels=ch,
+                tcn_dropout=td,
+                readout_dropout=rd,
+                head_dropout=hd_drop,
+                regime_loss=regime_loss_f,
+                transition_loss=transition_loss_f,
+                loss_weights=loss_weights,
+                lr=lr,
+                wd=wd,
+                T0=T0,
+                Tm=Tm,
+                max_epochs=max_epochs,
+                patience=patience,
+                min_delta=min_delta,
+                desc=f"[L1a] oof {fk + 1}/{n_l1_oof}",
+            )
+            best_eps.append(be)
+            print(f"  [L1a] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
+        nr = int(np.clip(np.median(best_eps), 1, max_epochs))
+        l1_final_epochs_after_oof = int(nr)
+        print(f"  [L1a] OOF median best_epoch -> final_epochs={nr}", flush=True)
+        regime_loss = _l1a_regime_loss(targets["regime"][end_idx][window_pool], device=DEVICE)
+        transition_loss = _l1a_transition_loss(targets["transition_risk"][end_idx][window_pool], device=DEVICE)
+        train_ds = TensorDataset(*[tensor[window_pool] for tensor in ds.tensors])
+        train_dl = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+        model = L1AMarketTCN(
+            len(feature_cols),
+            channels=ch,
+            seq_len=SEQ_LEN,
+            readout_type=_l1a_readout_type(),
+            min_attention_seq_len=_l1a_min_attention_seq_len(),
+            tcn_dropout=td,
+            readout_dropout=rd,
+            head_dropout=hd_drop,
+            embed_dim=embed_dim,
+        ).to(DEVICE)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
+        print(
+            f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
+            f"tcn_channels={ch}  tcn_dropout={td}  "
+            f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
+            f"final_epochs={nr} (OOF median)  loss_weights={loss_weights}",
+            flush=True,
         )
-        va_loss = _eval_epoch(
-            model,
-            val_dl,
-            DEVICE,
-            regime_loss=regime_loss,
-            transition_loss=transition_loss,
-            loss_weights=loss_weights,
+        epoch_bar = trange(
+            nr,
+            desc="[L1a] final fit",
+            unit="ep",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
         )
-        scheduler.step()
-        if hasattr(epoch_bar, "set_postfix"):
-            epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
-        print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
-        if va_loss < (best_val - min_delta):
-            best_val = va_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            stale = 0
-        else:
-            stale += 1
-            if stale >= patience:
-                break
-    if best_state is None:
-        raise RuntimeError("L1a: training failed to produce a checkpoint.")
-    model.load_state_dict(best_state)
-    _log_l1a_val_metrics(model, val_dl, DEVICE, label="l2_val")
-    if window_cal.sum() != window_val.sum():
+        for epoch in epoch_bar:
+            tr_loss = _train_epoch(
+                model,
+                train_dl,
+                optimizer,
+                DEVICE,
+                regime_loss=regime_loss,
+                transition_loss=transition_loss,
+                loss_weights=loss_weights,
+            )
+            scheduler.step()
+            if hasattr(epoch_bar, "set_postfix"):
+                epoch_bar.set_postfix(train=f"{tr_loss:.4f}", refresh=False)
+            print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f}", flush=True)
+    else:
+        regime_loss = _l1a_regime_loss(targets["regime"][end_idx][window_train], device=DEVICE)
+        transition_loss = _l1a_transition_loss(targets["transition_risk"][end_idx][window_train], device=DEVICE)
+        train_ds = TensorDataset(*[tensor[window_train] for tensor in ds.tensors])
+        train_dl = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+        model = L1AMarketTCN(
+            len(feature_cols),
+            channels=ch,
+            seq_len=SEQ_LEN,
+            readout_type=_l1a_readout_type(),
+            min_attention_seq_len=_l1a_min_attention_seq_len(),
+            tcn_dropout=td,
+            readout_dropout=rd,
+            head_dropout=hd_drop,
+            embed_dim=embed_dim,
+        ).to(DEVICE)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
+        best_state: dict[str, torch.Tensor] | None = None
+        best_val = float("inf")
+        stale = 0
+        epoch_bar = trange(
+            max_epochs,
+            desc="[L1a] epochs",
+            unit="ep",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
+        print(
+            f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
+            f"tcn_channels={ch}  tcn_dropout={td}  "
+            f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
+            f"max_epochs={max_epochs}  patience={patience}  min_delta={min_delta:g}  loss_weights={loss_weights}",
+            flush=True,
+        )
+        for epoch in epoch_bar:
+            tr_loss = _train_epoch(
+                model,
+                train_dl,
+                optimizer,
+                DEVICE,
+                regime_loss=regime_loss,
+                transition_loss=transition_loss,
+                loss_weights=loss_weights,
+            )
+            va_loss = _eval_epoch(
+                model,
+                val_dl,
+                DEVICE,
+                regime_loss=regime_loss,
+                transition_loss=transition_loss,
+                loss_weights=loss_weights,
+            )
+            scheduler.step()
+            if hasattr(epoch_bar, "set_postfix"):
+                epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
+            print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
+            if va_loss < (best_val - min_delta):
+                best_val = va_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                stale = 0
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
+        if best_state is None:
+            raise RuntimeError("L1a: training failed to produce a checkpoint.")
+        model.load_state_dict(best_state)
+
+    _log_l1a_val_metrics(model, val_dl, DEVICE, label="fit_report" if n_l1_oof >= 2 else "l2_val")
+    if window_cal.sum() != window_val_report.sum():
         _log_l1a_val_metrics(model, cal_dl, DEVICE, label="cal_full")
 
-    _tr_m = np.asarray(splits.train_mask, dtype=bool)
+    _tr_m = np.asarray(l1_fit_mask if n_l1_oof >= 2 else splits.train_mask, dtype=bool)
     _atr_tr = pd.to_numeric(work["lbl_atr"], errors="coerce").to_numpy(dtype=np.float64)
     _fin_tr = _tr_m & np.isfinite(_atr_tr)
     lbl_atr_median_train = float(np.median(_atr_tr[_fin_tr])) if np.any(_fin_tr) else 1.0
@@ -1311,9 +1526,12 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             "vol_trend": dict(clip_meta.get("vol_trend") or {}),
         },
         "lbl_atr_median_train": float(lbl_atr_median_train),
+        "l1_oof_folds": int(n_l1_oof),
+        "l1_oof_enabled": bool(n_l1_oof >= 2),
+        "l1_final_epochs_after_oof": l1_final_epochs_after_oof,
     }
     adaptive_min_samples = int(os.environ.get("ADAPTIVE_THRESHOLD_MIN_SAMPLES", "500"))
-    fit_n = int(np.sum(np.asarray(splits.train_mask, dtype=bool)))
+    fit_n = int(np.sum(np.asarray(norm_mask, dtype=bool)))
     meta = attach_threshold_registry(
         meta,
         "l1a",

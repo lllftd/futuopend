@@ -55,8 +55,12 @@ from core.trainers.val_metrics_extra import brier_binary
 from core.trainers.stack_v2_common import (
     build_stack_time_splits,
     compute_cross_asset_context,
+    l1_oof_folds_from_env,
+    l2_val_start_time,
     log_label_baseline,
     save_output_cache,
+    split_mask_for_tuning_and_report,
+    time_blocked_fold_masks,
 )
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 
@@ -1063,6 +1067,116 @@ def _l1b_edge_dq_train_config() -> tuple[int, int]:
     return max(50, rounds), max(20, es)
 
 
+def _l1b_oof_median_rounds_binary(
+    label: str,
+    y: np.ndarray,
+    X: np.ndarray,
+    feature_cols: list[str],
+    fold_masks: list[tuple[np.ndarray, np.ndarray]],
+    fit_pool: np.ndarray,
+    label_row_ok: np.ndarray,
+    sample_weight: np.ndarray,
+) -> int:
+    pool = np.asarray(fit_pool, dtype=bool).ravel()
+    y = np.asarray(y, dtype=np.int32).ravel()
+    label_row_ok = np.asarray(label_row_ok, dtype=bool).ravel()
+    sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
+    rounds, es_rounds = _l1b_edge_dq_train_config()
+    params = _l1b_edge_candidate_lgb_params()
+    best_iters: list[int] = []
+    for fk, (tr_m, va_m) in enumerate(fold_masks):
+        tr_m = np.asarray(tr_m, dtype=bool).ravel()
+        va_m = np.asarray(va_m, dtype=bool).ravel()
+        row_ok = np.all(np.isfinite(X), axis=1) & label_row_ok & np.isfinite(y.astype(np.float64))
+        fit_tr = tr_m & pool & row_ok
+        fit_va = va_m & pool & row_ok
+        if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_va)) < 20:
+            raise RuntimeError(
+                f"L1b {label} OOF fold {fk + 1}: insufficient rows "
+                f"(train={int(np.sum(fit_tr))}, val={int(np.sum(fit_va))})."
+            )
+        dtrain = lgb.Dataset(
+            X[fit_tr],
+            label=y[fit_tr],
+            weight=sample_weight[fit_tr],
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        dval = lgb.Dataset(
+            X[fit_va],
+            label=y[fit_va],
+            weight=sample_weight[fit_va],
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+            es_rounds, rounds, f"[L1b] {label} oof {fk + 1}/{len(fold_masks)}", first_metric_only=True
+        )
+        try:
+            booster = lgb.train(params, dtrain, num_boost_round=rounds, valid_sets=[dval], callbacks=cbs)
+        finally:
+            for fn in cl:
+                fn()
+        bi = booster.best_iteration
+        best_iters.append(max(1, int(bi) if bi is not None else rounds))
+    return int(np.clip(np.median(best_iters), 1, rounds))
+
+
+def _l1b_oof_median_rounds_regressor(
+    label: str,
+    y: np.ndarray,
+    X: np.ndarray,
+    feature_cols: list[str],
+    fold_masks: list[tuple[np.ndarray, np.ndarray]],
+    fit_pool: np.ndarray,
+    label_row_ok: np.ndarray,
+    sample_weight: np.ndarray,
+) -> int:
+    pool = np.asarray(fit_pool, dtype=bool).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+    label_row_ok = np.asarray(label_row_ok, dtype=bool).ravel()
+    sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
+    rounds, es_rounds = _l1b_edge_dq_train_config()
+    params = _l1b_edge_dq_lgb_params()
+    best_iters: list[int] = []
+    for fk, (tr_m, va_m) in enumerate(fold_masks):
+        tr_m = np.asarray(tr_m, dtype=bool).ravel()
+        va_m = np.asarray(va_m, dtype=bool).ravel()
+        row_ok = np.all(np.isfinite(X), axis=1) & label_row_ok & np.isfinite(y)
+        fit_tr = tr_m & pool & row_ok
+        fit_va = va_m & pool & row_ok
+        if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_va)) < 20:
+            raise RuntimeError(
+                f"L1b {label} OOF fold {fk + 1}: insufficient rows "
+                f"(train={int(np.sum(fit_tr))}, val={int(np.sum(fit_va))})."
+            )
+        dtrain = lgb.Dataset(
+            X[fit_tr],
+            label=y[fit_tr],
+            weight=sample_weight[fit_tr],
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        dval = lgb.Dataset(
+            X[fit_va],
+            label=y[fit_va],
+            weight=sample_weight[fit_va],
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+            es_rounds, rounds, f"[L1b] {label} oof {fk + 1}/{len(fold_masks)}", first_metric_only=True
+        )
+        try:
+            booster = lgb.train(params, dtrain, num_boost_round=rounds, valid_sets=[dval], callbacks=cbs)
+        finally:
+            for fn in cl:
+                fn()
+        bi = booster.best_iteration
+        best_iters.append(max(1, int(bi) if bi is not None else rounds))
+    return int(np.clip(np.median(best_iters), 1, rounds))
+
+
 def _l1b_edge_label_valid(work: pd.DataFrame) -> np.ndarray:
     """Rows with a realizable edge label (raw label finite). Excludes tail/invalid rows where label_v2 left NaN (``fillna(0)`` in helpers would otherwise fake a target)."""
     if "decision_net_edge_atr" in work.columns:
@@ -1094,6 +1208,7 @@ def _l1b_fit_lgb_regressor(
     out_path: str,
     label_row_ok: np.ndarray | None = None,
     sample_weight: np.ndarray | None = None,
+    num_boost_round_fixed: int | None = None,
 ) -> lgb.Booster:
     train = np.asarray(train_mask, dtype=bool).ravel()
     val = np.asarray(val_mask, dtype=bool).ravel()
@@ -1113,6 +1228,40 @@ def _l1b_fit_lgb_regressor(
     fit_val = val & row_ok
     rounds, es_rounds = _l1b_edge_dq_train_config()
     params = _l1b_edge_dq_lgb_params()
+    if num_boost_round_fixed is not None:
+        nr = max(1, int(num_boost_round_fixed))
+        if int(np.sum(fit_tr)) < 80:
+            raise RuntimeError(
+                f"L1b {label}: insufficient rows for fixed-round fit (train={int(np.sum(fit_tr))})."
+            )
+        dtrain = lgb.Dataset(
+            X[fit_tr],
+            label=y[fit_tr],
+            weight=sample_weight[fit_tr],
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        booster = lgb.train(params, dtrain, num_boost_round=nr)
+        booster.save_model(out_path)
+        pred_tr = booster.predict(X[fit_tr]).astype(np.float64)
+        y_tr = y[fit_tr]
+        mae_tr = float(mean_absolute_error(y_tr, pred_tr))
+        std_tr = float(np.std(y_tr)) if y_tr.size > 1 else 0.0
+        mae_v = cor_v = float("nan")
+        std_v = 0.0
+        if int(np.sum(fit_val)) >= 20:
+            pred_v = booster.predict(X[fit_val]).astype(np.float64)
+            y_v = y[fit_val]
+            mae_v = float(mean_absolute_error(y_v, pred_v))
+            std_v = float(np.std(y_v)) if y_v.size > 1 else 0.0
+            cor_v = _corr1d(y_v, pred_v)
+        print(
+            f"  [L1b] {label} booster (OOF final rounds={nr}): train_MAE={mae_tr:.4f}  "
+            f"report_MAE={mae_v:.4f}  report_corr={cor_v:.4f}  "
+            f"report_n={int(np.sum(fit_val)):,}  train_n={int(np.sum(fit_tr)):,}  -> {out_path}",
+            flush=True,
+        )
+        return booster
     if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_val)) < 20:
         raise RuntimeError(
             f"L1b {label}: insufficient rows for edge/dq regressor "
@@ -1183,6 +1332,7 @@ def _l1b_fit_lgb_binary_classifier(
     out_path: str,
     label_row_ok: np.ndarray | None = None,
     sample_weight: np.ndarray | None = None,
+    num_boost_round_fixed: int | None = None,
 ) -> lgb.Booster:
     train = np.asarray(train_mask, dtype=bool).ravel()
     val = np.asarray(val_mask, dtype=bool).ravel()
@@ -1202,6 +1352,39 @@ def _l1b_fit_lgb_binary_classifier(
     fit_val = val & row_ok
     rounds, es_rounds = _l1b_edge_dq_train_config()
     params = _l1b_edge_candidate_lgb_params()
+    if num_boost_round_fixed is not None:
+        nr = max(1, int(num_boost_round_fixed))
+        if int(np.sum(fit_tr)) < 80:
+            raise RuntimeError(
+                f"L1b {label}: insufficient rows for fixed-round fit (train={int(np.sum(fit_tr))})."
+            )
+        dtrain = lgb.Dataset(
+            X[fit_tr],
+            label=y[fit_tr],
+            weight=sample_weight[fit_tr],
+            feature_name=feature_cols,
+            free_raw_data=False,
+        )
+        booster = lgb.train(params, dtrain, num_boost_round=nr)
+        booster.save_model(out_path)
+        if int(np.sum(fit_val)) >= 20:
+            pred_v = np.clip(booster.predict(X[fit_val]).astype(np.float64), 1e-7, 1.0 - 1e-7)
+            y_v = y[fit_val].astype(np.int32)
+            try:
+                auc = float(roc_auc_score(y_v, pred_v))
+            except ValueError:
+                auc = float("nan")
+            print(
+                f"  [L1b] {label} booster (OOF final rounds={nr}): report_AUC={auc:.4f}  "
+                f"report_n={int(np.sum(fit_val)):,}  train_n={int(np.sum(fit_tr)):,}  -> {out_path}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [L1b] {label} booster (OOF final rounds={nr}): train_n={int(np.sum(fit_tr)):,}  -> {out_path}",
+                flush=True,
+            )
+        return booster
     if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_val)) < 20:
         raise RuntimeError(
             f"L1b {label}: insufficient rows for binary classifier "
@@ -1264,6 +1447,8 @@ def _fit_l1b_edge_dq_boosters(
     *,
     train_mask: np.ndarray,
     val_mask: np.ndarray,
+    n_oof_folds: int = 1,
+    l1_fit_mask: np.ndarray | None = None,
 ) -> tuple[dict[str, lgb.Booster], dict[str, str], dict[str, np.ndarray], dict[str, Any]]:
     edge_signed = np.clip(_decision_edge_atr_array(work), -5.0, 5.0).astype(np.float64)
     edge_tgt = np.abs(edge_signed).astype(np.float64)
@@ -1322,6 +1507,11 @@ def _fit_l1b_edge_dq_boosters(
     edge_label_ok = _l1b_edge_label_valid(work)
     dq_label_ok = _l1b_dq_label_valid(work)
     tm = np.asarray(train_mask, dtype=bool).ravel()
+    n_oof = max(1, int(n_oof_folds))
+    use_oof = n_oof >= 2 and l1_fit_mask is not None
+    fit_pool = np.asarray(l1_fit_mask, dtype=bool).ravel() if use_oof else tm
+    if use_oof and not np.array_equal(fit_pool, tm):
+        raise RuntimeError("L1b OOF: train_mask must match l1_fit_mask.")
     ok_both = tm & edge_label_ok & dq_label_ok & np.isfinite(edge_tgt) & np.isfinite(dq_tgt)
     if int(np.sum(ok_both)) > 50:
         c_ed = _corr1d(edge_tgt[ok_both], dq_tgt[ok_both])
@@ -1346,36 +1536,107 @@ def _fit_l1b_edge_dq_boosters(
     edge_candidate_path = os.path.join(MODEL_DIR, "l1b_edge_candidate.txt")
     edge_quality_path = os.path.join(MODEL_DIR, L1B_EDGE_PRED_FILE)
     dq_path = os.path.join(MODEL_DIR, L1B_DQ_PRED_FILE)
-    models["l1b_edge_candidate_model"] = _l1b_fit_lgb_binary_classifier(
-        "l1b_edge_candidate",
-        edge_candidate_tgt,
-        X,
-        feature_cols,
-        train_mask=train_mask,
-        val_mask=val_mask,
-        out_path=edge_candidate_path,
-        label_row_ok=edge_candidate_row_ok,
-    )
-    models["l1b_edge_quality_model"] = _l1b_fit_lgb_regressor(
-        "l1b_edge_quality",
-        edge_tgt,
-        X,
-        feature_cols,
-        train_mask=train_mask,
-        val_mask=val_mask,
-        out_path=edge_quality_path,
-        label_row_ok=edge_quality_row_ok,
-    )
-    models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
-        "l1b_dq_pred",
-        dq_tgt,
-        X,
-        feature_cols,
-        train_mask=train_mask,
-        val_mask=val_mask,
-        out_path=dq_path,
-        label_row_ok=dq_label_ok,
-    )
+    sw_uni = np.ones(len(work), dtype=np.float32)
+    if use_oof:
+        fold_masks = time_blocked_fold_masks(work["time_key"], fit_pool, n_oof, context="L1b OOF")
+        nr_cand = _l1b_oof_median_rounds_binary(
+            "l1b_edge_candidate",
+            edge_candidate_tgt,
+            X,
+            feature_cols,
+            fold_masks,
+            fit_pool,
+            edge_candidate_row_ok,
+            sw_uni,
+        )
+        nr_qual = _l1b_oof_median_rounds_regressor(
+            "l1b_edge_quality",
+            edge_tgt,
+            X,
+            feature_cols,
+            fold_masks,
+            fit_pool,
+            edge_quality_row_ok,
+            sw_uni,
+        )
+        nr_dq = _l1b_oof_median_rounds_regressor(
+            "l1b_dq_pred",
+            dq_tgt,
+            X,
+            feature_cols,
+            fold_masks,
+            fit_pool,
+            dq_label_ok,
+            sw_uni,
+        )
+        print(
+            f"  [L1b] OOF median best_iteration → edge_candidate={nr_cand}  edge_quality={nr_qual}  dq={nr_dq}",
+            flush=True,
+        )
+        models["l1b_edge_candidate_model"] = _l1b_fit_lgb_binary_classifier(
+            "l1b_edge_candidate",
+            edge_candidate_tgt,
+            X,
+            feature_cols,
+            train_mask=fit_pool,
+            val_mask=val_mask,
+            out_path=edge_candidate_path,
+            label_row_ok=edge_candidate_row_ok,
+            num_boost_round_fixed=nr_cand,
+        )
+        models["l1b_edge_quality_model"] = _l1b_fit_lgb_regressor(
+            "l1b_edge_quality",
+            edge_tgt,
+            X,
+            feature_cols,
+            train_mask=fit_pool,
+            val_mask=val_mask,
+            out_path=edge_quality_path,
+            label_row_ok=edge_quality_row_ok,
+            num_boost_round_fixed=nr_qual,
+        )
+        models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
+            "l1b_dq_pred",
+            dq_tgt,
+            X,
+            feature_cols,
+            train_mask=fit_pool,
+            val_mask=val_mask,
+            out_path=dq_path,
+            label_row_ok=dq_label_ok,
+            num_boost_round_fixed=nr_dq,
+        )
+    else:
+        models["l1b_edge_candidate_model"] = _l1b_fit_lgb_binary_classifier(
+            "l1b_edge_candidate",
+            edge_candidate_tgt,
+            X,
+            feature_cols,
+            train_mask=train_mask,
+            val_mask=val_mask,
+            out_path=edge_candidate_path,
+            label_row_ok=edge_candidate_row_ok,
+        )
+        models["l1b_edge_quality_model"] = _l1b_fit_lgb_regressor(
+            "l1b_edge_quality",
+            edge_tgt,
+            X,
+            feature_cols,
+            train_mask=train_mask,
+            val_mask=val_mask,
+            out_path=edge_quality_path,
+            label_row_ok=edge_quality_row_ok,
+        )
+        models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
+            "l1b_dq_pred",
+            dq_tgt,
+            X,
+            feature_cols,
+            train_mask=train_mask,
+            val_mask=val_mask,
+            out_path=dq_path,
+            label_row_ok=dq_label_ok,
+        )
     model_files["l1b_edge_candidate_model"] = "l1b_edge_candidate.txt"
     model_files["l1b_edge_quality_model"] = L1B_EDGE_PRED_FILE
     model_files["l1b_dq_pred"] = L1B_DQ_PRED_FILE
@@ -1441,6 +1702,8 @@ def _fit_l1b_edge_dq_boosters(
         "early_stopping_env": "L1B_EDGE_DQ_ES_ROUNDS",
         "experts_enabled": False,
         "routing_semantics": "disabled; base edge/dq regressors only",
+        "l1_oof_folds": int(n_oof),
+        "l1_oof_enabled": bool(use_oof),
     }
     return models, model_files, preds, block_meta
 
@@ -1453,8 +1716,28 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     feature_cols = _select_l1b_feature_cols(work, feat_cols)
     X = work[feature_cols].to_numpy(dtype=np.float32, copy=False)
     splits = build_stack_time_splits(work["time_key"])
-    train_mask = splits.train_mask
-    val_mask = splits.l2_val_mask
+    l1_fit_mask = np.asarray(splits.train_mask | splits.cal_mask, dtype=bool)
+    n_l1_oof = l1_oof_folds_from_env()
+    l2_vs = l2_val_start_time()
+    if n_l1_oof >= 2:
+        train_mask = l1_fit_mask
+        val_mask = l1_fit_mask
+        print(
+            f"  [L1b] blocked time OOF: L1_OOF_FOLDS={n_l1_oof} on train+cal (t < {CAL_END}) "
+            f"(set L1_OOF_FOLDS=1 for legacy train vs l2_val [{l2_vs}, {CAL_END}))",
+            flush=True,
+        )
+        tune_frac = float(os.environ.get("L1_TUNE_FRAC_WITHIN_FIT", "0.5"))
+        val_tune_mask, val_report_mask = split_mask_for_tuning_and_report(
+            work["time_key"], l1_fit_mask, tune_frac=tune_frac, min_rows_each=50
+        )
+        if not val_tune_mask.any() or not val_report_mask.any():
+            raise RuntimeError("L1b OOF: failed to build non-empty tune/report masks inside train+cal.")
+    else:
+        train_mask = splits.train_mask
+        val_mask = splits.l2_val_mask
+        val_tune_mask = val_report_mask = val_mask
+    unsup_mask = l1_fit_mask if n_l1_oof >= 2 else splits.train_mask
     direct_outputs = _build_l1b_direct_semantic_outputs(work)
     cross_context_reliable = _l1b_cross_context_reliable(work)
     if cross_context_reliable:
@@ -1473,19 +1756,39 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             cross[_ctx] = np.float32(0.0)
 
     log_layer_banner("[L1b] Tabular market descriptor")
-    log_time_key_split(
-        "L1b",
-        work["time_key"],
-        train_mask,
-        val_mask,
-        train_label="train (t < TRAIN_END)",
-        val_label="val (l2_val)",
-        extra_note=(
-            f"Primary L1b early stopping/reporting uses l2_val end-bars inside [{TRAIN_END}, {CAL_END}); "
-            f"full cal remains a secondary diagnostic."
-        ),
-    )
-    log_numpy_x_stats("L1b", X[train_mask], label="X[train]")
+    if n_l1_oof >= 2:
+        log_time_key_split(
+            "L1b",
+            work["time_key"],
+            train_mask,
+            val_mask,
+            train_label=f"train+cal (t < {CAL_END})",
+            val_label=f"train+cal (t < {CAL_END})",
+            extra_note=f"OOF: {n_l1_oof} contiguous time folds; tune/report masks slice the fit pool for diagnostics.",
+        )
+        log_time_key_split(
+            "L1b(tune/report)",
+            work["time_key"],
+            val_tune_mask,
+            val_report_mask,
+            train_label="fit_tune (early slice)",
+            val_label="fit_report (late slice)",
+            extra_note="Unsupervised/LGBM diagnostics vs held-out late time within train+cal.",
+        )
+    else:
+        log_time_key_split(
+            "L1b",
+            work["time_key"],
+            train_mask,
+            val_mask,
+            train_label="train (t < TRAIN_END)",
+            val_label="val (l2_val)",
+            extra_note=(
+                f"Primary L1b early stopping/reporting uses l2_val end-bars inside [{TRAIN_END}, {CAL_END}); "
+                f"full cal remains a secondary diagnostic."
+            ),
+        )
+    log_numpy_x_stats("L1b", X[unsup_mask], label="X[fit_pool]" if n_l1_oof >= 2 else "X[train]")
     print(f"  [L1b] target/output schema L1B_OUTPUT_COLS count={len(L1B_OUTPUT_COLS)}: {L1B_OUTPUT_COLS}", flush=True)
     atomic_supervised = _l1b_attach_atomic_supervised_columns(work, feature_cols)
     supervised_feature_cols = list(feature_cols) + atomic_supervised
@@ -1497,10 +1800,6 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     )
     print(f"  [L1b] artifact dir: {MODEL_DIR}", flush=True)
     print(f"  [L1b] will write meta/cache: {artifact_path(L1B_META_FILE)} | {artifact_path(L1B_OUTPUT_CACHE_FILE)}", flush=True)
-    print(
-        "  [L1b] note: L1b heads use in-memory X from this run (not OOF row-by-row unless you change data prep).",
-        flush=True,
-    )
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
     outputs = pd.concat(
         [
@@ -1521,8 +1820,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (clusters + novelty/regime_change + staged edge/dq + retained tradeability heads).",
         flush=True,
     )
-    _log_l1b_semantic_head_diagnostics(work, rule_diag, train_mask=train_mask, val_mask=val_mask)
-    unsup_outputs, unsup_meta = _fit_l1b_unsupervised_block(work, feature_cols, train_mask=train_mask)
+    _log_l1b_semantic_head_diagnostics(work, rule_diag, train_mask=unsup_mask, val_mask=val_report_mask)
+    unsup_outputs, unsup_meta = _fit_l1b_unsupervised_block(work, feature_cols, train_mask=unsup_mask)
     outputs = pd.concat([outputs, unsup_outputs.reset_index(drop=True)], axis=1)
     print(f"  [L1b] cluster heads: {L1B_CLUSTER_COLS}", flush=True)
     print(f"  [L1b] latent heads (internal diagnostics): {L1B_LATENT_HEADS}", flush=True)
@@ -1543,8 +1842,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         )
     _log_l1b_unsupervised_diagnostics(
         outputs,
-        train_mask=train_mask,
-        val_mask=val_mask,
+        train_mask=unsup_mask,
+        val_mask=val_report_mask,
         cluster_cols=list(L1B_CLUSTER_COLS),
         latent_cols=list(L1B_LATENT_EMBED_COLS),
     )
@@ -1552,8 +1851,10 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     l1b_supervised_models, edge_dq_model_files, edge_dq_preds, edge_dq_block_meta = _fit_l1b_edge_dq_boosters(
         work,
         supervised_feature_cols,
-        train_mask=train_mask,
-        val_mask=val_mask,
+        train_mask=unsup_mask,
+        val_mask=val_report_mask,
+        n_oof_folds=n_l1_oof,
+        l1_fit_mask=l1_fit_mask if n_l1_oof >= 2 else None,
     )
     for k, arr in edge_dq_preds.items():
         outputs[k] = arr
@@ -1565,6 +1866,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
 
     meta = {
         "schema_version": L1B_SCHEMA_VERSION,
+        "l1_oof_folds": int(n_l1_oof),
+        "l1_oof_enabled": bool(n_l1_oof >= 2),
         "feature_cols": feature_cols,
         "supervised_feature_cols": supervised_feature_cols,
         "supervised_atomic_cols": atomic_supervised,

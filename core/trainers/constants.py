@@ -78,8 +78,8 @@ REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 # New dual-view stack schema versions
 L1A_SCHEMA_VERSION = "1.19.0"
 L1B_SCHEMA_VERSION = "1.17.0"
-L2_SCHEMA_VERSION = "1.34.0"
-L3_SCHEMA_VERSION = "1.17.0"
+L2_SCHEMA_VERSION = "1.36.0"
+L3_SCHEMA_VERSION = "1.18.1"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"

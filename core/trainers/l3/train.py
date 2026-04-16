@@ -59,7 +59,7 @@ from core.trainers.lgbm_utils import (
 )
 from core.trainers.l3_policy_params import derive_policy_params
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_arrays
-from core.trainers.stack_v2_common import log_label_baseline
+from core.trainers.stack_v2_common import l3_oof_folds_from_env, log_label_baseline, time_blocked_fold_masks
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.val_metrics_extra import (
     brier_binary,
@@ -3032,6 +3032,14 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     traj_cfg = L3TrajectoryConfig()
     value_disabled = (os.environ.get("L3_VALUE_MODE", "") or "").strip().lower() == "disabled"
     want_traj = os.environ.get("L3_TRAJ_GRU", "0").strip().lower() in {"1", "true", "yes"}
+    n_l3_oof = l3_oof_folds_from_env()
+    if n_l3_oof >= 2 and want_traj:
+        print(
+            "  [L3] L3_OOF_FOLDS>=2: trajectory GRU disabled (no fold-wise GRU in this build); "
+            "use L3_OOF_FOLDS=1 with L3_TRAJ_GRU=1 to train the encoder.",
+            flush=True,
+        )
+        want_traj = False
     if value_disabled:
         want_traj = False
         print("  [L3] L3_VALUE_MODE=disabled — skipping value head & GRU hybrid.", flush=True)
@@ -3057,16 +3065,31 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     oot_idx = np.flatnonzero(oot_mask)
     if len(oot_idx) < 20:
         raise RuntimeError("L3: not enough post-CAL_END state rows for strict OOT training.")
-    train_mask, val_mask = _l3_oot_train_val_masks_by_trade(
-        t_state, rows_entry, oot_mask, train_frac=0.7
-    )
+    if n_l3_oof >= 2:
+        train_mask = np.asarray(oot_mask, dtype=bool)
+        val_mask = np.asarray(oot_mask, dtype=bool)
+        gain_probe_train_frac = float(os.environ.get("L3_OOF_GAIN_PROBE_TRAIN_FRAC", "0.75"))
+        gain_train_mask, gain_val_mask = _split_l3_val_for_calibration(
+            t_state, oot_mask, tune_frac=gain_probe_train_frac, min_rows_each=40
+        )
+        print(
+            f"  [L3] blocked time OOF: L3_OOF_FOLDS={n_l3_oof} on OOT [{oot_start}, {holdout_start}) "
+            f"(L3_OOF_FOLDS=1 restores trade-id 70/30 split; gain-probe uses first {gain_probe_train_frac:.0%} vs tail by time)",
+            flush=True,
+        )
+    else:
+        train_mask, val_mask = _l3_oot_train_val_masks_by_trade(
+            t_state, rows_entry, oot_mask, train_frac=0.7
+        )
+        gain_train_mask, gain_val_mask = train_mask, val_mask
     val_tune_frac = float(os.environ.get("L3_VAL_TUNE_FRAC", "0.5"))
     val_tune_mask, val_report_mask = _split_l3_val_for_calibration(
         t_state, val_mask, tune_frac=val_tune_frac, min_rows_each=40
     )
     n_oot_tr = len(np.unique(rows_entry[oot_idx]))
     print(
-        f"  [L3] OOT train/val split by trade_id (rows_entry): {n_oot_tr:,} distinct entries in OOT window",
+        f"  [L3] OOT window: {n_oot_tr:,} distinct trade entries (rows_entry) "
+        f"({'OOF full fit' if n_l3_oof >= 2 else 'trade-level train/val'})",
         flush=True,
     )
     test_mask = np.asarray(holdout_mask, dtype=bool)
@@ -3079,14 +3102,24 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         f"(set L3_EXIT_STATE_GRANULARITY=full for legacy keys)",
         flush=True,
     )
-    log_time_key_arrays(
-        "L3",
-        pd.Series(t_state[train_mask]),
-        pd.Series(t_state[val_mask]),
-        train_label="policy train (OOT trades, ~70% of distinct entries)",
-        val_label="policy val (OOT trades, ~30% of distinct entries)",
-        extra_note=f"Split by rows_entry (signal bar), not by policy row index. Times in [{oot_start}, {holdout_start}); holdout t>={holdout_start}.",
-    )
+    if n_l3_oof >= 2:
+        log_time_key_arrays(
+            "L3",
+            pd.Series(t_state[train_mask]),
+            pd.Series(t_state[val_mask]),
+            train_label=f"policy fit pool (full OOT) [{oot_start}, {holdout_start})",
+            val_label=f"policy fit pool (full OOT) [{oot_start}, {holdout_start})",
+            extra_note="LGBM uses time-blocked OOF for early stopping; final models train on full OOT. val_tune/report slice this pool by time.",
+        )
+    else:
+        log_time_key_arrays(
+            "L3",
+            pd.Series(t_state[train_mask]),
+            pd.Series(t_state[val_mask]),
+            train_label="policy train (OOT trades, ~70% of distinct entries)",
+            val_label="policy val (OOT trades, ~30% of distinct entries)",
+            extra_note=f"Split by rows_entry (signal bar), not by policy row index. Times in [{oot_start}, {holdout_start}); holdout t>={holdout_start}.",
+        )
     log_time_key_arrays(
         "L3(calibration/report)",
         pd.Series(t_state[val_tune_mask]),
@@ -3304,8 +3337,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         static_cols=list(static_cols),
         use_hybrid=use_hybrid,
         emb_matrix=emb_all,
-        train_mask=train_mask,
-        val_mask=val_mask,
+        train_mask=gain_train_mask,
+        val_mask=gain_val_mask,
         y_exit=y_exit,
         rows_entry=rows_entry,
         pa_state_all=pa_state_all,
@@ -3323,85 +3356,122 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
     static_exit_model = None
     static_value_model = None
     l3_model_total = 1 if value_disabled else (3 if value_hurdle_enabled else 2)
-    l3_outer = tqdm(
-        total=l3_model_total,
-        desc="[L3] models",
-        unit="model",
-        leave=True,
-        file=TQDM_FILE,
-        disable=not _lgb_round_tqdm_enabled(),
+    ih_tr = feature_cols.index("l3_hold_bars")
+    hold_tr = X_lgb[train_mask, ih_tr].astype(np.float64)
+    y_exit_tr = y_exit[train_mask]
+    w_exit = _l3_trade_normalized_exit_weights(
+        rows_entry[train_mask],
+        hold_tr,
+        y_exit_tr,
+        pa_state={k: v[train_mask] for k, v in pa_state_all.items()},
     )
-    try:
-        ih_tr = feature_cols.index("l3_hold_bars")
-        hold_tr = X_lgb[train_mask, ih_tr].astype(np.float64)
-        y_exit_tr = y_exit[train_mask]
-        w_exit = _l3_trade_normalized_exit_weights(
-            rows_entry[train_mask],
-            hold_tr,
-            y_exit_tr,
-            pa_state={k: v[train_mask] for k, v in pa_state_all.items()},
+    exit_pos_w, hold_neg_w = _l3_exit_class_weights(y_exit_tr)
+    hb_tr = _hold_bucket_ids(hold_tr)
+    hb_stats = []
+    for hb in range(4):
+        m = hb_tr == hb
+        if not np.any(m):
+            hb_stats.append(f"b{hb}:n=0")
+            continue
+        hb_stats.append(
+            f"b{hb}:n={int(np.sum(m))} w={float(np.mean(w_exit[m])):.3f}"
         )
-        exit_pos_w, hold_neg_w = _l3_exit_class_weights(y_exit_tr)
-        hb_tr = _hold_bucket_ids(hold_tr)
-        hb_stats = []
-        for hb in range(4):
-            m = hb_tr == hb
-            if not np.any(m):
-                hb_stats.append(f"b{hb}:n=0")
-                continue
-            hb_stats.append(
-                f"b{hb}:n={int(np.sum(m))} w={float(np.mean(w_exit[m])):.3f}"
-            )
-        print(
-            f"  [L3] exit weight profile: hold_rate={float(np.mean(y_exit_tr == 0)):.4f}  "
-            f"exit_rate={float(np.mean(y_exit_tr == 1)):.4f}  "
-            f"class_w(exit={exit_pos_w:.3f}, hold={hold_neg_w:.3f})  "
-            f"bucket_w({' | '.join(hb_stats)})",
-            flush=True,
-        )
-        cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_exit, "[L3] exit")
-        try:
-            exit_model = lgb.train(
-                exit_params,
-                lgb.Dataset(
-                    X_lgb[train_mask],
-                    label=y_exit[train_mask],
-                    weight=w_exit.astype(np.float32),
-                    feature_name=feature_cols,
-                    free_raw_data=False,
-                ),
-                num_boost_round=rounds_exit,
-                valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_exit[val_mask], feature_name=feature_cols, free_raw_data=False)],
-                callbacks=cbs,
-            )
-        finally:
-            for fn in cl:
-                fn()
-        l3_outer.set_postfix_str("exit", refresh=False)
-        l3_outer.update(1)
+    print(
+        f"  [L3] exit weight profile: hold_rate={float(np.mean(y_exit_tr == 0)):.4f}  "
+        f"exit_rate={float(np.mean(y_exit_tr == 1)):.4f}  "
+        f"class_w(exit={exit_pos_w:.3f}, hold={hold_neg_w:.3f})  "
+        f"bucket_w({' | '.join(hb_stats)})",
+        flush=True,
+    )
+    has_vnz = bool(value_hurdle_enabled and value_nonzero_params is not None)
+    exit_oof: np.ndarray | None = None
 
-        if value_disabled:
-            value_model = None
-            value_nonzero_model = None
-        else:
-            if value_hurdle_enabled and value_nonzero_params is not None:
-                nz_train_w = _l3_hurdle_nonzero_weights(value_nonzero_target[train_mask])
-                cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_value, "[L3] value-nonzero")
+    if n_l3_oof < 2:
+        l3_outer = tqdm(
+            total=l3_model_total,
+            desc="[L3] models",
+            unit="model",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
+        try:
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_exit, "[L3] exit")
+            try:
+                exit_model = lgb.train(
+                    exit_params,
+                    lgb.Dataset(
+                        X_lgb[train_mask],
+                        label=y_exit[train_mask],
+                        weight=w_exit.astype(np.float32),
+                        feature_name=feature_cols,
+                        free_raw_data=False,
+                    ),
+                    num_boost_round=rounds_exit,
+                    valid_sets=[lgb.Dataset(X_lgb[val_mask], label=y_exit[val_mask], feature_name=feature_cols, free_raw_data=False)],
+                    callbacks=cbs,
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l3_outer.set_postfix_str("exit", refresh=False)
+            l3_outer.update(1)
+
+            if value_disabled:
+                value_model = None
+                value_nonzero_model = None
+            else:
+                if has_vnz:
+                    nz_train_w = _l3_hurdle_nonzero_weights(value_nonzero_target[train_mask])
+                    cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_value, "[L3] value-nonzero")
+                    try:
+                        value_nonzero_model = lgb.train(
+                            value_nonzero_params,
+                            lgb.Dataset(
+                                X_lgb[train_mask],
+                                label=value_nonzero_target[train_mask],
+                                weight=nz_train_w,
+                                feature_name=feature_cols,
+                                free_raw_data=False,
+                            ),
+                            num_boost_round=rounds_value,
+                            valid_sets=[
+                                lgb.Dataset(
+                                    X_lgb[val_mask],
+                                    label=value_nonzero_target[val_mask],
+                                    feature_name=feature_cols,
+                                    free_raw_data=False,
+                                )
+                            ],
+                            callbacks=cbs,
+                        )
+                    finally:
+                        for fn in cl:
+                            fn()
+                    l3_outer.set_postfix_str("value-nz", refresh=False)
+                    l3_outer.update(1)
+                else:
+                    value_nonzero_model = None
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_value, "[L3] value")
                 try:
-                    value_nonzero_model = lgb.train(
-                        value_nonzero_params,
+                    value_train_mask = train_mask if value_nonzero_model is None else value_nonzero_train
+                    value_val_mask = val_mask if value_nonzero_model is None else value_nonzero_val
+                    if int(value_train_mask.sum()) < 20 or int(value_val_mask.sum()) < 10:
+                        value_train_mask = train_mask
+                        value_val_mask = val_mask
+                    value_model = lgb.train(
+                        value_params,
                         lgb.Dataset(
-                            X_lgb[train_mask],
-                            label=value_nonzero_target[train_mask],
-                            weight=nz_train_w,
+                            X_lgb[value_train_mask],
+                            label=y_value_fit[value_train_mask],
                             feature_name=feature_cols,
                             free_raw_data=False,
                         ),
                         num_boost_round=rounds_value,
                         valid_sets=[
                             lgb.Dataset(
-                                X_lgb[val_mask],
-                                label=value_nonzero_target[val_mask],
+                                X_lgb[value_val_mask],
+                                label=y_value_fit[value_val_mask],
                                 feature_name=feature_cols,
                                 free_raw_data=False,
                             )
@@ -3411,12 +3481,186 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
                 finally:
                     for fn in cl:
                         fn()
-                l3_outer.set_postfix_str("value-nz", refresh=False)
+                l3_outer.set_postfix_str("value", refresh=False)
                 l3_outer.update(1)
-            else:
+        finally:
+            l3_outer.close()
+    else:
+        fold_masks = time_blocked_fold_masks(np.asarray(t_state), oot_mask, n_l3_oof, context="L3 OOF")
+        best_exit: list[int] = []
+        best_vnz: list[int] = []
+        best_val: list[int] = []
+        n_pol = len(X)
+        exit_oof = np.full(n_pol, np.nan, dtype=np.float64)
+        l3_outer = tqdm(
+            total=n_l3_oof * l3_model_total + l3_model_total,
+            desc="[L3] OOF models",
+            unit="fit",
+            leave=True,
+            file=TQDM_FILE,
+            disable=not _lgb_round_tqdm_enabled(),
+        )
+        try:
+            for fk, (tr_m, va_m) in enumerate(fold_masks):
+                fit_tr = np.asarray(oot_mask & tr_m, dtype=bool)
+                fit_va = np.asarray(oot_mask & va_m, dtype=bool)
+                if int(fit_tr.sum()) < 200 or int(fit_va.sum()) < 40:
+                    raise RuntimeError(
+                        "L3 OOF: fold too small. "
+                        f"fold={fk} fit_tr={int(fit_tr.sum())} fit_va={int(fit_va.sum())} "
+                        f"(lower L3_OOF_FOLDS or widen OOT window)."
+                    )
+                hold_tr_f = X_lgb[fit_tr, ih_tr].astype(np.float64)
+                w_ef = _l3_trade_normalized_exit_weights(
+                    rows_entry[fit_tr],
+                    hold_tr_f,
+                    y_exit[fit_tr],
+                    pa_state={k: v[fit_tr] for k, v in pa_state_all.items()},
+                )
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+                    es_rounds, rounds_exit, f"[L3] exit oof {fk + 1}/{n_l3_oof}"
+                )
+                try:
+                    em_f = lgb.train(
+                        exit_params,
+                        lgb.Dataset(
+                            X_lgb[fit_tr],
+                            label=y_exit[fit_tr],
+                            weight=w_ef.astype(np.float32),
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=rounds_exit,
+                        valid_sets=[
+                            lgb.Dataset(
+                                X_lgb[fit_va],
+                                label=y_exit[fit_va],
+                                feature_name=feature_cols,
+                                free_raw_data=False,
+                            )
+                        ],
+                        callbacks=cbs,
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                bi_e = em_f.best_iteration
+                best_exit.append(max(1, int(bi_e) if bi_e is not None else rounds_exit))
+                exit_oof[fit_va] = em_f.predict(X_lgb[fit_va]).astype(np.float64)
+                l3_outer.update(1)
+
+                if value_disabled:
+                    continue
+                if has_vnz:
+                    nz_train_w_f = _l3_hurdle_nonzero_weights(value_nonzero_target[fit_tr])
+                    cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+                        es_rounds, rounds_value, f"[L3] value-nz oof {fk + 1}/{n_l3_oof}"
+                    )
+                    try:
+                        vnz_f = lgb.train(
+                            value_nonzero_params,
+                            lgb.Dataset(
+                                X_lgb[fit_tr],
+                                label=value_nonzero_target[fit_tr],
+                                weight=nz_train_w_f,
+                                feature_name=feature_cols,
+                                free_raw_data=False,
+                            ),
+                            num_boost_round=rounds_value,
+                            valid_sets=[
+                                lgb.Dataset(
+                                    X_lgb[fit_va],
+                                    label=value_nonzero_target[fit_va],
+                                    feature_name=feature_cols,
+                                    free_raw_data=False,
+                                )
+                            ],
+                            callbacks=cbs,
+                        )
+                    finally:
+                        for fn in cl:
+                            fn()
+                    bi_z = vnz_f.best_iteration
+                    best_vnz.append(max(1, int(bi_z) if bi_z is not None else rounds_value))
+                    l3_outer.update(1)
+                val_tr = fit_tr if not has_vnz else (fit_tr & (value_nonzero_target == 1))
+                val_va = fit_va if not has_vnz else (fit_va & (value_nonzero_target == 1))
+                if int(val_tr.sum()) < 20 or int(val_va.sum()) < 10:
+                    val_tr, val_va = fit_tr, fit_va
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(
+                    es_rounds, rounds_value, f"[L3] value oof {fk + 1}/{n_l3_oof}"
+                )
+                try:
+                    vm_f = lgb.train(
+                        value_params,
+                        lgb.Dataset(
+                            X_lgb[val_tr],
+                            label=y_value_fit[val_tr],
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=rounds_value,
+                        valid_sets=[
+                            lgb.Dataset(
+                                X_lgb[val_va],
+                                label=y_value_fit[val_va],
+                                feature_name=feature_cols,
+                                free_raw_data=False,
+                            )
+                        ],
+                        callbacks=cbs,
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                bi_v = vm_f.best_iteration
+                best_val.append(max(1, int(bi_v) if bi_v is not None else rounds_value))
+                l3_outer.update(1)
+
+            nr_exit = int(np.clip(np.median(best_exit), 10, rounds_exit))
+            nz_med = int(np.median(best_vnz)) if best_vnz else None
+            val_med = int(np.median(best_val)) if best_val else None
+            nz_txt = f"value_nz={nz_med}  " if nz_med is not None else ""
+            val_txt = f"value={val_med}" if val_med is not None else "value=n/a"
+            print(
+                f"  [L3] OOF median best_iteration → exit={nr_exit}  {nz_txt}{val_txt}  "
+                f"(caps exit={rounds_exit} value={rounds_value})",
+                flush=True,
+            )
+            exit_model = lgb.train(
+                exit_params,
+                lgb.Dataset(
+                    X_lgb[train_mask],
+                    label=y_exit[train_mask],
+                    weight=w_exit.astype(np.float32),
+                    feature_name=feature_cols,
+                    free_raw_data=False,
+                ),
+                num_boost_round=nr_exit,
+            )
+            l3_outer.update(1)
+            if value_disabled:
+                value_model = None
                 value_nonzero_model = None
-            cbs, cl = _lgb_train_callbacks_with_round_tqdm(es_rounds, rounds_value, "[L3] value")
-            try:
+            else:
+                if has_vnz:
+                    nr_vnz = int(np.clip(np.median(best_vnz), 10, rounds_value))
+                    nz_train_w = _l3_hurdle_nonzero_weights(value_nonzero_target[train_mask])
+                    value_nonzero_model = lgb.train(
+                        value_nonzero_params,
+                        lgb.Dataset(
+                            X_lgb[train_mask],
+                            label=value_nonzero_target[train_mask],
+                            weight=nz_train_w,
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=nr_vnz,
+                    )
+                    l3_outer.update(1)
+                else:
+                    value_nonzero_model = None
+                nr_val = int(np.clip(np.median(best_val), 10, rounds_value))
                 value_train_mask = train_mask if value_nonzero_model is None else value_nonzero_train
                 value_val_mask = val_mask if value_nonzero_model is None else value_nonzero_val
                 if int(value_train_mask.sum()) < 20 or int(value_val_mask.sum()) < 10:
@@ -3430,29 +3674,25 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
                         feature_name=feature_cols,
                         free_raw_data=False,
                     ),
-                    num_boost_round=rounds_value,
-                    valid_sets=[
-                        lgb.Dataset(
-                            X_lgb[value_val_mask],
-                            label=y_value_fit[value_val_mask],
-                            feature_name=feature_cols,
-                            free_raw_data=False,
-                        )
-                    ],
-                    callbacks=cbs,
+                    num_boost_round=nr_val,
                 )
-            finally:
-                for fn in cl:
-                    fn()
-            l3_outer.set_postfix_str("value", refresh=False)
-            l3_outer.update(1)
-    finally:
-        l3_outer.close()
-    exit_calibrator = _fit_l3_exit_calibrator(
-        y_exit[val_tune_mask],
-        exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64),
-    )
-    exit_prob_tune = _apply_l3_exit_calibrator(exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64), exit_calibrator)
+                l3_outer.update(1)
+        finally:
+            l3_outer.close()
+        fit_chk = np.asarray(train_mask, dtype=bool)
+        if not bool(np.all(np.isfinite(exit_oof[fit_chk]))):
+            raise RuntimeError("L3 OOF: incomplete exit OOF coverage on policy fit pool.")
+
+    exit_raw_tune = exit_model.predict(X_lgb[val_tune_mask]).astype(np.float64)
+    if n_l3_oof >= 2:
+        assert exit_oof is not None
+        exit_calibrator = _fit_l3_exit_calibrator(
+            y_exit[val_tune_mask],
+            exit_oof[val_tune_mask].astype(np.float64),
+        )
+    else:
+        exit_calibrator = _fit_l3_exit_calibrator(y_exit[val_tune_mask], exit_raw_tune)
+    exit_prob_tune = _apply_l3_exit_calibrator(exit_raw_tune, exit_calibrator)
     if value_disabled:
         value_pred_tune = np.zeros(int(np.sum(val_tune_mask)), dtype=np.float64)
         value_policy_mode = "prob_only"
