@@ -51,7 +51,11 @@ from core.trainers.l3 import (
     l3_single_trajectory_embedding,
 )
 from core.trainers.lgbm_utils import _live_trade_state_from_bar, _net_edge_atr_from_state
-from core.trainers.l3.train import _apply_l3_exit_calibrator
+from core.trainers.l3.train import (
+    _apply_l3_exit_calibrator,
+    _l3_exit_infer_params,
+    _l3_soft_exit_hysteresis_thresholds,
+)
 from core.trainers.tcn_constants import DEVICE as TORCH_DEVICE
 
 DATA_DIR = _REPO_ROOT / "data"
@@ -365,12 +369,12 @@ def run_single_symbol(
     l3_traj_enc=None,
     l3_traj_cfg=None,
     torch_device=None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (trades, oos_price_df) for charting; oos_price_df has time_key/close over OOS window."""
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Returns (trades, oos_price_df, runtime_diag) for charting + diagnostics."""
     print(f"\n[{symbol}] preparing features...", flush=True)
     df = _prepare_symbol_df(symbol)
     if df.empty:
-        return pd.DataFrame(), df
+        return pd.DataFrame(), df, {}
     show_pb = _oos_progress_enabled()
     infer_bar = (
         _oos_tqdm_pbar(total=3, desc=f"[{symbol}] infer", unit="stage", leave=True, mininterval=0.25)
@@ -421,6 +425,19 @@ def run_single_symbol(
     peak_unreal_atr = float("-inf")
     cox_bundle = l3_load_cox_bundle(l3_meta)
     l3_aux_state: dict[str, float | int] = {}
+    infer_cfg = _l3_exit_infer_params(l3_meta)
+    runtime_diag: dict[str, Any] = {
+        "symbol": symbol,
+        "entries": 0,
+        "policy_exit_count": 0,
+        "flip_exit_count": 0,
+        "soft_enter_hits_early": 0,
+        "soft_enter_hits_late": 0,
+        "steps_early": 0,
+        "steps_late": 0,
+        "soft_enter_thr_early_sum": 0.0,
+        "soft_enter_thr_late_sum": 0.0,
+    }
 
     in_pos = 0
     entry_idx = -1
@@ -456,6 +473,7 @@ def run_single_symbol(
                 min_size=entry_min_size,
             )
             if side != 0.0:
+                runtime_diag["entries"] = int(runtime_diag["entries"]) + 1
                 in_pos = int(side)
                 entry_idx = i
                 entry_open = float(df["open"].iloc[i + 1])
@@ -543,13 +561,30 @@ def run_single_symbol(
             exit_state_probs = l1a_out.loc[i, L1A_REGIME_COLS].to_numpy(dtype=np.float32)
             exit_state_vol = float(l1a_out.loc[i, "l1a_vol_forecast"])
             pa_state = df.loc[i, PA_STATE_FEATURES] if all(col in df.columns for col in PA_STATE_FEATURES) else None
-            exit_prob_threshold, value_left_threshold, state_max_hold, _, value_policy_mode, value_tie_margin = l3_exit_policy_params(
+            exit_prob_threshold, value_left_threshold, state_hold_ref, _, value_policy_mode, value_tie_margin = l3_exit_policy_params(
                 exit_state_probs,
                 exit_state_vol,
                 hold,
                 l3_meta,
                 pa_state=pa_state,
             )
+            ent_soft, lev_soft = _l3_soft_exit_hysteresis_thresholds(
+                hold,
+                enter_thr=float(exit_prob_threshold),
+                leave_thr=max(float(value_tie_margin), float(exit_prob_threshold) - 0.20),
+                hold_ref_bars=int(state_hold_ref),
+                infer_cfg=infer_cfg,
+            )
+            if hold < int(state_hold_ref):
+                runtime_diag["steps_early"] = int(runtime_diag["steps_early"]) + 1
+                runtime_diag["soft_enter_thr_early_sum"] = float(runtime_diag["soft_enter_thr_early_sum"]) + float(ent_soft)
+                if exit_prob >= ent_soft:
+                    runtime_diag["soft_enter_hits_early"] = int(runtime_diag["soft_enter_hits_early"]) + 1
+            else:
+                runtime_diag["steps_late"] = int(runtime_diag["steps_late"]) + 1
+                runtime_diag["soft_enter_thr_late_sum"] = float(runtime_diag["soft_enter_thr_late_sum"]) + float(ent_soft)
+                if exit_prob >= ent_soft:
+                    runtime_diag["soft_enter_hits_late"] = int(runtime_diag["soft_enter_hits_late"]) + 1
             policy_exit, exit_infer_state = l3_exit_decision_live(
                 exit_prob,
                 value_left,
@@ -559,9 +594,14 @@ def run_single_symbol(
                 value_left_threshold=value_left_threshold,
                 value_policy_mode=value_policy_mode,
                 value_tie_margin=value_tie_margin,
+                hold_ref_bars=int(state_hold_ref),
                 meta=l3_meta,
             )
-            if policy_exit or flip_against or hold >= state_max_hold:
+            if policy_exit or flip_against:
+                if policy_exit:
+                    runtime_diag["policy_exit_count"] = int(runtime_diag["policy_exit_count"]) + 1
+                elif flip_against:
+                    runtime_diag["flip_exit_count"] = int(runtime_diag["flip_exit_count"]) + 1
                 exit_open = float(df["open"].iloc[i + 1])
                 exit_price = _oos_adjust_fill(exit_open, is_buy=(in_pos == -1), slip_f=slip_f, comm_f=comm_f)
                 ret = (exit_price / entry_price - 1.0) * in_pos
@@ -575,7 +615,15 @@ def run_single_symbol(
                         "exit_price": exit_price,
                         "return": ret,
                         "holding_bars": hold,
-                        "exit_reason": "Policy_Exit" if policy_exit else ("Signal_Flip" if flip_against else "Max_Hold"),
+                        "entry_regime_id": int(
+                            np.argmax(l1a_out.loc[entry_idx, L1A_REGIME_COLS].to_numpy(dtype=np.float32))
+                        ) if entry_idx >= 0 else -1,
+                        "exit_soft_enter_thr": float(ent_soft),
+                        "exit_soft_leave_thr": float(lev_soft),
+                        "exit_hold_ref_bars": int(state_hold_ref),
+                        "exit_prob": float(exit_prob),
+                        "exit_value_left": float(value_left),
+                        "exit_reason": "Policy_Exit" if policy_exit else "Signal_Flip",
                     }
                 )
                 in_pos = 0
@@ -584,7 +632,7 @@ def run_single_symbol(
                 peak_unreal_atr = float("-inf")
                 l3_aux_state.clear()
                 exit_infer_state.reset()
-    return pd.DataFrame(trades), df
+    return pd.DataFrame(trades), df, runtime_diag
 
 
 def _equity_curve_on_timeline(time_key: pd.Series, trades: pd.DataFrame) -> np.ndarray:
@@ -752,6 +800,110 @@ def summarize_trade_returns(trades: pd.DataFrame, *, label: str) -> dict[str, An
     }
 
 
+def summarize_exit_path_diagnostics(trades: pd.DataFrame, runtime_diag: dict[str, Any], *, label: str) -> dict[str, Any]:
+    t = trades if trades is not None else pd.DataFrame()
+    total = int(len(t))
+    policy_n = int((t["exit_reason"] == "Policy_Exit").sum()) if total > 0 and "exit_reason" in t.columns else 0
+    flip_n = int((t["exit_reason"] == "Signal_Flip").sum()) if total > 0 and "exit_reason" in t.columns else 0
+    by_reason_hold: dict[str, dict[str, float]] = {}
+    if total > 0 and {"exit_reason", "holding_bars"}.issubset(t.columns):
+        for reason, grp in t.groupby("exit_reason"):
+            g = pd.to_numeric(grp["holding_bars"], errors="coerce")
+            by_reason_hold[str(reason)] = {
+                "n": int(len(grp)),
+                "share": float(len(grp) / max(total, 1)),
+                "avg_hold_bars": float(np.nanmean(g)),
+                "p50_hold_bars": float(np.nanmedian(g)),
+                "p90_hold_bars": float(np.nanquantile(g, 0.90)),
+            }
+    hold_hist: dict[str, int] = {}
+    if total > 0 and "holding_bars" in t.columns:
+        vc = pd.to_numeric(t["holding_bars"], errors="coerce").dropna().astype(int).value_counts().sort_index()
+        hold_hist = {str(int(k)): int(v) for k, v in vc.items()}
+    early_steps = int(runtime_diag.get("steps_early", 0))
+    late_steps = int(runtime_diag.get("steps_late", 0))
+    thr_early_sum = float(runtime_diag.get("soft_enter_thr_early_sum", 0.0))
+    thr_late_sum = float(runtime_diag.get("soft_enter_thr_late_sum", 0.0))
+    return {
+        "label": label,
+        "n_trades": total,
+        "policy_exit_share": float(policy_n / max(total, 1)),
+        "flip_exit_share": float(flip_n / max(total, 1)),
+        "runtime_policy_exit_count": int(runtime_diag.get("policy_exit_count", 0)),
+        "runtime_flip_exit_count": int(runtime_diag.get("flip_exit_count", 0)),
+        "entry_count_runtime": int(runtime_diag.get("entries", 0)),
+        "soft_enter_hit_rate_early": float(runtime_diag.get("soft_enter_hits_early", 0) / max(early_steps, 1)),
+        "soft_enter_hit_rate_late": float(runtime_diag.get("soft_enter_hits_late", 0) / max(late_steps, 1)),
+        "soft_enter_thr_early_mean": float(thr_early_sum / max(early_steps, 1)),
+        "soft_enter_thr_late_mean": float(thr_late_sum / max(late_steps, 1)),
+        "holding_bars_histogram": hold_hist,
+        "hold_by_exit_reason": by_reason_hold,
+    }
+
+
+def summarize_regime_diagnostics(trades: pd.DataFrame, *, label: str) -> dict[str, Any]:
+    t = trades if trades is not None else pd.DataFrame()
+    out = {"label": label, "entry_regime_stats": []}
+    if t.empty or "entry_regime_id" not in t.columns:
+        return out
+    arr = pd.to_numeric(t["entry_regime_id"], errors="coerce")
+    t2 = t.loc[arr.notna()].copy()
+    if t2.empty:
+        return out
+    t2["entry_regime_id"] = arr[arr.notna()].astype(int)
+    stats = []
+    for rid, grp in t2.groupby("entry_regime_id"):
+        ret = pd.to_numeric(grp["return"], errors="coerce")
+        hold = pd.to_numeric(grp.get("holding_bars"), errors="coerce")
+        stats.append(
+            {
+                "regime_id": int(rid),
+                "n": int(len(grp)),
+                "share": float(len(grp) / max(len(t2), 1)),
+                "mean_return_frac": float(np.nanmean(ret)),
+                "win_rate": float(np.nanmean(ret > 0.0)),
+                "avg_holding_bars": float(np.nanmean(hold)),
+            }
+        )
+    out["entry_regime_stats"] = sorted(stats, key=lambda x: x["regime_id"])
+    return out
+
+
+def evaluate_symbol_asymmetry_guardrail(summary_blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    by_label = {str(row.get("label")): row for row in summary_blocks}
+    qqq = by_label.get("QQQ")
+    spy = by_label.get("SPY")
+    out = {"enabled": True, "flagged": False, "reasons": [], "metrics": {}}
+    if not qqq or not spy:
+        return out
+    ret_gap = float(qqq.get("mean_return_per_trade_frac", 0.0) - spy.get("mean_return_per_trade_frac", 0.0))
+    sharpe_gap = float(qqq.get("sharpe_trade_annualized", 0.0) - spy.get("sharpe_trade_annualized", 0.0))
+    win_gap = float(qqq.get("win_rate", 0.0) - spy.get("win_rate", 0.0))
+    ret_gap_thr = float(os.environ.get("L3_OOS_SYMBOL_GUARD_MAX_RET_GAP", "0.00012"))
+    sharpe_gap_thr = float(os.environ.get("L3_OOS_SYMBOL_GUARD_MAX_SHARPE_GAP", "0.80"))
+    win_gap_thr = float(os.environ.get("L3_OOS_SYMBOL_GUARD_MAX_WIN_GAP", "0.08"))
+    out["metrics"] = {
+        "mean_return_per_trade_gap": ret_gap,
+        "sharpe_gap": sharpe_gap,
+        "win_rate_gap": win_gap,
+        "thresholds": {
+            "max_ret_gap": ret_gap_thr,
+            "max_sharpe_gap": sharpe_gap_thr,
+            "max_win_gap": win_gap_thr,
+        },
+    }
+    if abs(ret_gap) > ret_gap_thr:
+        out["flagged"] = True
+        out["reasons"].append("mean_return_per_trade_gap_exceeds_threshold")
+    if abs(sharpe_gap) > sharpe_gap_thr:
+        out["flagged"] = True
+        out["reasons"].append("sharpe_gap_exceeds_threshold")
+    if abs(win_gap) > win_gap_thr:
+        out["flagged"] = True
+        out["reasons"].append("win_rate_gap_exceeds_threshold")
+    return out
+
+
 def _print_oos_summary(blocks: list[dict[str, Any]]) -> None:
     print("\n" + "=" * 70)
     print("  OOS performance (sequential compound on closed trades by exit_time)")
@@ -779,6 +931,55 @@ def _print_oos_summary(blocks: list[dict[str, Any]]) -> None:
             f"avg_hold_bars={row['avg_holding_bars']:.1f}",
             flush=True,
         )
+
+
+def _print_exit_path_diagnostics(blocks: list[dict[str, Any]]) -> None:
+    if not blocks:
+        return
+    print("\n" + "=" * 70)
+    print("  Exit-path diagnostics (runtime + closed trades)")
+    print("=" * 70)
+    for row in blocks:
+        n = int(row.get("n_trades", 0))
+        if n <= 0:
+            continue
+        print(
+            f"\n  [{row.get('label')}] trades={n}  policy_exit={100.0 * float(row.get('policy_exit_share', 0.0)):.1f}%  "
+            f"flip_exit={100.0 * float(row.get('flip_exit_share', 0.0)):.1f}%",
+            flush=True,
+        )
+        print(
+            f"    soft_enter_hit_rate early={100.0 * float(row.get('soft_enter_hit_rate_early', 0.0)):.1f}%  "
+            f"late={100.0 * float(row.get('soft_enter_hit_rate_late', 0.0)):.1f}%  "
+            f"thr_mean early={float(row.get('soft_enter_thr_early_mean', float('nan'))):.3f}  "
+            f"late={float(row.get('soft_enter_thr_late_mean', float('nan'))):.3f}",
+            flush=True,
+        )
+        hold_hist = row.get("holding_bars_histogram", {}) or {}
+        if hold_hist:
+            items = sorted(((int(k), int(v)) for k, v in hold_hist.items()), key=lambda x: x[0])
+            top = ", ".join([f"{k}:{v}" for k, v in items[:8]])
+            print(f"    holding_bars histogram(top)={top}", flush=True)
+
+
+def _print_regime_diagnostics(blocks: list[dict[str, Any]]) -> None:
+    if not blocks:
+        return
+    print("\n" + "=" * 70)
+    print("  Entry-regime diagnostics")
+    print("=" * 70)
+    for row in blocks:
+        stats = row.get("entry_regime_stats") or []
+        if not stats:
+            continue
+        print(f"\n  [{row.get('label')}] entry-regime decomposition:", flush=True)
+        for it in stats:
+            print(
+                f"    regime={int(it['regime_id'])}  n={int(it['n'])}  share={100.0*float(it['share']):.1f}%  "
+                f"mean_ret={100.0*float(it['mean_return_frac']):.4f}%  win_rate={100.0*float(it['win_rate']):.1f}%  "
+                f"avg_hold={float(it['avg_holding_bars']):.2f}",
+                flush=True,
+            )
 
 
 def main():
@@ -815,8 +1016,9 @@ def main():
     print("  Artifacts loaded. Starting per-symbol inference + backtest.", flush=True)
     all_trades = []
     plot_tasks: list[tuple[str, pd.DataFrame, pd.DataFrame]] = []
+    diag_by_symbol: dict[str, dict[str, Any]] = {}
     for sym in ["QQQ", "SPY"]:
-        tr_df, price_df = run_single_symbol(
+        tr_df, price_df, sym_diag = run_single_symbol(
             sym,
             l1a_model,
             l1a_meta,
@@ -830,6 +1032,7 @@ def main():
             l3_traj_cfg=l3_tcfg,
             torch_device=TORCH_DEVICE,
         )
+        diag_by_symbol[sym] = dict(sym_diag or {})
         plot_tasks.append((sym, price_df, tr_df))
         if not tr_df.empty:
             all_trades.append(tr_df)
@@ -838,6 +1041,8 @@ def main():
         else:
             print(f"[{sym}] generated 0 trades.", flush=True)
     summary_blocks: list[dict[str, Any]] = []
+    exit_diag_blocks: list[dict[str, Any]] = []
+    regime_diag_blocks: list[dict[str, Any]] = []
     if all_trades:
         combined = pd.concat(all_trades, ignore_index=True)
         combined.to_csv(RESULTS_DIR / "trades_ALL.csv", index=False)
@@ -848,8 +1053,46 @@ def main():
             part = combined[combined["symbol"] == sym] if "symbol" in combined.columns else pd.DataFrame()
             if not part.empty:
                 summary_blocks.append(summarize_trade_returns(part, label=sym))
+                exit_diag_blocks.append(
+                    summarize_exit_path_diagnostics(part, diag_by_symbol.get(sym, {}), label=sym)
+                )
+                regime_diag_blocks.append(summarize_regime_diagnostics(part, label=sym))
         summary_blocks.append(summarize_trade_returns(combined, label="COMBINED"))
+        combined_diag = {
+            "entries": int(sum(int((diag_by_symbol.get(sym) or {}).get("entries", 0)) for sym in ["QQQ", "SPY"])),
+            "policy_exit_count": int(
+                sum(int((diag_by_symbol.get(sym) or {}).get("policy_exit_count", 0)) for sym in ["QQQ", "SPY"])
+            ),
+            "flip_exit_count": int(
+                sum(int((diag_by_symbol.get(sym) or {}).get("flip_exit_count", 0)) for sym in ["QQQ", "SPY"])
+            ),
+            "soft_enter_hits_early": int(
+                sum(int((diag_by_symbol.get(sym) or {}).get("soft_enter_hits_early", 0)) for sym in ["QQQ", "SPY"])
+            ),
+            "soft_enter_hits_late": int(
+                sum(int((diag_by_symbol.get(sym) or {}).get("soft_enter_hits_late", 0)) for sym in ["QQQ", "SPY"])
+            ),
+            "steps_early": int(sum(int((diag_by_symbol.get(sym) or {}).get("steps_early", 0)) for sym in ["QQQ", "SPY"])),
+            "steps_late": int(sum(int((diag_by_symbol.get(sym) or {}).get("steps_late", 0)) for sym in ["QQQ", "SPY"])),
+            "soft_enter_thr_early_sum": float(
+                sum(float((diag_by_symbol.get(sym) or {}).get("soft_enter_thr_early_sum", 0.0)) for sym in ["QQQ", "SPY"])
+            ),
+            "soft_enter_thr_late_sum": float(
+                sum(float((diag_by_symbol.get(sym) or {}).get("soft_enter_thr_late_sum", 0.0)) for sym in ["QQQ", "SPY"])
+            ),
+        }
+        exit_diag_blocks.append(summarize_exit_path_diagnostics(combined, combined_diag, label="COMBINED"))
+        regime_diag_blocks.append(summarize_regime_diagnostics(combined, label="COMBINED"))
+        symbol_guard = evaluate_symbol_asymmetry_guardrail(summary_blocks)
         _print_oos_summary(summary_blocks)
+        _print_exit_path_diagnostics(exit_diag_blocks)
+        _print_regime_diagnostics(regime_diag_blocks)
+        if bool(symbol_guard.get("flagged", False)):
+            print(
+                "\n  [L3][WARN][SYMBOL_GUARD] asymmetry guard flagged: "
+                + ", ".join(symbol_guard.get("reasons", [])),
+                flush=True,
+            )
         eq_rows: list[dict[str, Any]] = []
         for label, df_sub in [("QQQ", combined[combined["symbol"] == "QQQ"]), ("SPY", combined[combined["symbol"] == "SPY"]), ("COMBINED", combined)]:
             if df_sub.empty:
@@ -873,12 +1116,26 @@ def main():
             "oos_start": OOS_START,
             "oos_end": OOS_END,
             "metrics": summary_blocks,
+            "exit_path_diagnostics": exit_diag_blocks,
+            "regime_diagnostics": regime_diag_blocks,
+            "symbol_asymmetry_guard": symbol_guard,
         }
         with open(RESULTS_DIR / "oos_summary.json", "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=str)
     else:
         with open(RESULTS_DIR / "oos_summary.json", "w", encoding="utf-8") as f:
-            json.dump({"oos_start": OOS_START, "oos_end": OOS_END, "metrics": []}, f, indent=2)
+            json.dump(
+                {
+                    "oos_start": OOS_START,
+                    "oos_end": OOS_END,
+                    "metrics": [],
+                    "exit_path_diagnostics": [],
+                    "regime_diagnostics": [],
+                    "symbol_asymmetry_guard": {"enabled": True, "flagged": False, "reasons": []},
+                },
+                f,
+                indent=2,
+            )
 
     metrics_by = {str(b["label"]): b for b in summary_blocks}
     for sym, price_df, tr_df in plot_tasks:

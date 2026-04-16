@@ -112,12 +112,60 @@ def _l3_exit_infer_enabled(meta: Mapping[str, Any] | None) -> bool:
 
 def _l3_exit_infer_params(meta: Mapping[str, Any] | None) -> dict[str, float]:
     m = dict(meta or {})
+    def _pick_float(meta_key: str, env_key: str, default: float, *, allow_env_override: bool = True) -> float:
+        if allow_env_override:
+            ov = os.environ.get(f"{env_key}_OVERRIDE", "").strip()
+            if ov:
+                return float(ov)
+        return float(m.get(meta_key, float(os.environ.get(env_key, str(default)))))
+
+    legacy_min_hold = _pick_float("l3_min_hold_bars", "L3_MIN_HOLD_BARS", 0.0, allow_env_override=True)
     return {
-        "ema_alpha": float(m.get("l3_exit_ema_alpha", float(os.environ.get("L3_EXIT_EMA_ALPHA", "0.3")))),
-        "enter_thr": float(m.get("l3_exit_hyst_enter", float(os.environ.get("L3_EXIT_HYST_ENTER", "0.55")))),
-        "leave_thr": float(m.get("l3_exit_hyst_leave", float(os.environ.get("L3_EXIT_HYST_LEAVE", "0.35")))),
-        "min_hold": float(m.get("l3_min_hold_bars", float(os.environ.get("L3_MIN_HOLD_BARS", "3")))),
+        "ema_alpha": _pick_float("l3_exit_ema_alpha", "L3_EXIT_EMA_ALPHA", 0.3, allow_env_override=True),
+        "enter_thr": _pick_float("l3_exit_hyst_enter", "L3_EXIT_HYST_ENTER", 0.55, allow_env_override=True),
+        "leave_thr": _pick_float("l3_exit_hyst_leave", "L3_EXIT_HYST_LEAVE", 0.35, allow_env_override=True),
+        "legacy_min_hold_ref": float(max(0.0, legacy_min_hold)),
+        "early_patience_strength": _pick_float(
+            "l3_exit_early_patience_strength",
+            "L3_EXIT_EARLY_PATIENCE_STRENGTH",
+            0.10,
+            allow_env_override=True,
+        ),
+        "late_pressure_strength": _pick_float(
+            "l3_exit_late_pressure_strength",
+            "L3_EXIT_LATE_PRESSURE_STRENGTH",
+            0.18,
+            allow_env_override=True,
+        ),
     }
+
+
+def _l3_soft_exit_hysteresis_thresholds(
+    hold_bars: int,
+    *,
+    enter_thr: float,
+    leave_thr: float,
+    hold_ref_bars: int | None,
+    infer_cfg: Mapping[str, float],
+) -> tuple[float, float]:
+    hold_now = float(max(1, int(hold_bars)))
+    legacy_ref = float(max(1.0, float(infer_cfg.get("legacy_min_hold_ref", 1.0))))
+    ref = float(max(1.0, float(hold_ref_bars))) if hold_ref_bars is not None else legacy_ref
+    early_strength = float(np.clip(float(infer_cfg.get("early_patience_strength", 0.10)), 0.0, 0.6))
+    late_strength = float(np.clip(float(infer_cfg.get("late_pressure_strength", 0.18)), 0.0, 0.8))
+    early_frac = float(np.clip((ref - hold_now) / ref, 0.0, 1.0))
+    late_frac = float(np.clip((hold_now - ref) / ref, 0.0, 1.0))
+    ent = float(np.clip(float(enter_thr) + early_strength * early_frac - late_strength * late_frac, 0.02, 0.98))
+    lev = float(
+        np.clip(
+            float(leave_thr) + 0.70 * early_strength * early_frac - 0.70 * late_strength * late_frac,
+            0.01,
+            0.97,
+        )
+    )
+    if lev >= ent - 0.01:
+        lev = max(0.0, ent - 0.01)
+    return ent, lev
 
 
 def l3_exit_decision_live(
@@ -130,29 +178,31 @@ def l3_exit_decision_live(
     value_left_threshold: float,
     value_policy_mode: str,
     value_tie_margin: float,
+    hold_ref_bars: int | None = None,
     meta: Mapping[str, Any] | None = None,
 ) -> tuple[bool, L3ExitInferenceState]:
     """Exit decision for live/backtest: optional EMA + hysteresis + min-hold; else legacy policy.
 
     EMA: first in-trade update sets ``ema_prob`` to the **current** raw calibrated ``p_exit`` (not 0);
-    later bars use exponential smoothing. ``min_hold`` only suppresses *exit* and hysteresis until
-    ``hold_bars >= min_hold``; EMA still updates on earlier bars so the first post-min_hold decision
-    uses a smoothed history.
+    later bars use exponential smoothing. Entry-age behavior is controlled by *soft* threshold
+    adjustment (early patience and late pressure), with no hard min/max hold gate.
     """
     p_raw = float(np.clip(exit_prob_calibrated, 0.0, 1.0))
     ip = _l3_exit_infer_params(meta)
-    min_hold = int(max(0, round(ip["min_hold"])))
     if _l3_exit_infer_enabled(meta):
         alpha = float(np.clip(ip["ema_alpha"], 0.01, 0.99))
         if state.ema_prob is None:
             state.ema_prob = p_raw
         else:
             state.ema_prob = alpha * p_raw + (1.0 - alpha) * float(state.ema_prob)
-        if hold_bars < min_hold:
-            return False, state
         p_s = float(state.ema_prob)
-        ent = float(ip["enter_thr"])
-        lev = float(ip["leave_thr"])
+        ent, lev = _l3_soft_exit_hysteresis_thresholds(
+            hold_bars,
+            enter_thr=float(ip["enter_thr"]),
+            leave_thr=float(ip["leave_thr"]),
+            hold_ref_bars=hold_ref_bars,
+            infer_cfg=ip,
+        )
         if not state.latch_exit:
             if p_s >= ent:
                 state.latch_exit = True
@@ -160,10 +210,17 @@ def l3_exit_decision_live(
             if p_s <= lev:
                 state.latch_exit = False
         return bool(state.latch_exit), state
+    ent_soft, _lev_soft = _l3_soft_exit_hysteresis_thresholds(
+        hold_bars,
+        enter_thr=float(exit_prob_threshold),
+        leave_thr=max(0.01, float(exit_prob_threshold) - 0.20),
+        hold_ref_bars=hold_ref_bars,
+        infer_cfg=ip,
+    )
     ex = l3_should_exit_by_policy(
         p_raw,
         value_left,
-        exit_prob_threshold=exit_prob_threshold,
+        exit_prob_threshold=ent_soft,
         value_left_threshold=value_left_threshold,
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
@@ -1537,6 +1594,10 @@ def _choose_l3_value_policy_mode(
     y_true: np.ndarray,
     pred: np.ndarray,
 ) -> str:
+    forced = (os.environ.get("L3_POLICY_FORCE_MODE", "") or "").strip().lower()
+    if forced in {"prob_only", "tie_break", "hard_gate"}:
+        print(f"  [L3] value-policy mode forced by env: {forced}", flush=True)
+        return forced
     if (os.environ.get("L3_VALUE_MODE", "") or "").strip().lower() == "disabled":
         print("  [L3] value-policy mode forced prob_only (L3_VALUE_MODE=disabled)", flush=True)
         return "prob_only"
@@ -2152,7 +2213,10 @@ def l3_exit_policy_params(
     value_thr = float(params.get("value_left_threshold", meta.get("l3_value_left_threshold", 0.02)))
     hold_map = meta.get("l3_target_horizon_bars_by_state") or {}
     max_hold = int(hold_map.get(state_key, meta.get("l3_target_horizon_bars", _l3_target_horizon_bars(30))))
+    forced_mode = (os.environ.get("L3_POLICY_FORCE_MODE", "") or "").strip().lower()
     mode = str(params.get("value_policy_mode", meta.get("l3_value_policy_mode", "prob_only")))
+    if forced_mode in {"prob_only", "tie_break", "hard_gate"}:
+        mode = forced_mode
     tie_margin = float(params.get("value_tie_margin", meta.get("l3_value_tie_margin", 0.03)))
     return prob_thr, value_thr, max_hold, state_key, mode, tie_margin
 
@@ -2633,6 +2697,50 @@ def l3_group_hazard_by_entry(entry_row_idx: np.ndarray, hazard_probs: np.ndarray
     return {k: np.asarray(v, dtype=np.float64) for k, v in order.items()}
 
 
+def _l3_policy_mode_ablation_metrics(
+    y_exit: np.ndarray,
+    p_exit: np.ndarray,
+    value_true: np.ndarray,
+    *,
+    exit_prob_threshold: float,
+    value_left_threshold: float,
+    value_tie_margin: float,
+) -> dict[str, dict[str, float]]:
+    y = np.asarray(y_exit, dtype=np.int32).ravel()
+    p = np.asarray(p_exit, dtype=np.float64).ravel()
+    v = np.asarray(value_true, dtype=np.float64).ravel()
+    thr = float(np.clip(exit_prob_threshold, 0.0, 1.0))
+    tie_m = float(max(0.0, value_tie_margin))
+    tie_thr = float(max(0.0, thr - tie_m))
+    pred_prob = (p >= thr).astype(np.int32)
+    pred_tie = ((p >= thr) | ((p >= tie_thr) & (v <= float(value_left_threshold)))).astype(np.int32)
+
+    def _metrics(pred: np.ndarray) -> dict[str, float]:
+        hold_mask = y == 0
+        pred_hold = pred == 0
+        exit_rate = float(np.mean(pred))
+        hold_recall = float(np.mean(pred[hold_mask] == 0)) if np.any(hold_mask) else float("nan")
+        hold_precision = float(np.mean(y[pred_hold] == 0)) if np.any(pred_hold) else float("nan")
+        realized = np.where(pred == 1, -v, v)
+        return {
+            "acc": float(accuracy_score(y, pred)),
+            "f1": float(f1_score(y, pred, zero_division=0)),
+            "exit_rate": exit_rate,
+            "hold_recall": hold_recall,
+            "hold_precision": hold_precision,
+            "utility_mean": float(np.mean(realized)),
+            "utility_p10": float(np.quantile(realized, 0.10)),
+        }
+
+    m_prob = _metrics(pred_prob)
+    m_tie = _metrics(pred_tie)
+    return {
+        "prob_only": m_prob,
+        "tie_break": m_tie,
+        "delta_tie_minus_prob": {k: float(m_tie[k] - m_prob[k]) for k in m_prob},
+    }
+
+
 def _log_l3_val_extended(
     X: np.ndarray,
     y_exit: np.ndarray,
@@ -2649,6 +2757,8 @@ def _log_l3_val_extended(
     exit_calibrator: Any = None,
     value_policy_mode: str = "prob_only",
     value_tie_margin: float = 0.03,
+    exit_prob_threshold: float = 0.5,
+    value_left_threshold: float = 0.0,
     exit_policy_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
     out = {
@@ -2665,7 +2775,6 @@ def _log_l3_val_extended(
     yv = y_exit[vm].astype(np.int32)
     ih_hold = feature_cols.index("l3_hold_bars")
     hold_vm = np.asarray(X[vm, ih_hold], dtype=np.int64)
-    min_hold_bars = int(max(0, round(_l3_exit_infer_params(None)["min_hold"])))
     try:
         ll = float(log_loss(yv, p_exit))
     except ValueError:
@@ -2677,8 +2786,6 @@ def _log_l3_val_extended(
     br = brier_binary(yv.astype(np.float64), p_exit)
     ece = ece_binary(yv, p_exit)
     yhat = (p_exit >= 0.5).astype(np.int32)
-    if min_hold_bars > 0:
-        yhat = np.where(hold_vm < min_hold_bars, 0, yhat).astype(np.int32)
     acc = float(accuracy_score(yv, yhat))
     f1 = float(f1_score(yv, yhat, zero_division=0))
     cm = confusion_matrix(yv, yhat, labels=[0, 1])
@@ -2698,14 +2805,6 @@ def _log_l3_val_extended(
         flush=True,
     )
     print(f"    confusion [[TN FP][FN TP]]:\n    {cm}", flush=True)
-    if min_hold_bars > 0:
-        n_early = int(np.sum(hold_vm < min_hold_bars))
-        n_would_exit = int(np.sum((hold_vm < min_hold_bars) & (p_exit >= 0.5)))
-        print(
-            f"    min_hold_bars={min_hold_bars}: val rows in early window={n_early:,}  "
-            f"(of those, raw acc@0.5 would predict exit={n_would_exit:,} -> forced hold)",
-            flush=True,
-        )
     if exit_policy_summary:
         print(
             "    policy-search decomposition: "
@@ -2793,6 +2892,23 @@ def _log_l3_val_extended(
             f"    corr(L2 conf, L3 exit p)={c_ec:.4f}  corr(L2 size, L3 value pred)={c_sz_val:.4f}",
             flush=True,
         )
+    mode_cmp = _l3_policy_mode_ablation_metrics(
+        yv,
+        p_exit,
+        y_value[vm].astype(np.float64),
+        exit_prob_threshold=float(exit_prob_threshold),
+        value_left_threshold=float(value_left_threshold),
+        value_tie_margin=float(value_tie_margin),
+    )
+    print(
+        "    policy ablation(val_report): "
+        f"prob_only[acc={mode_cmp['prob_only']['acc']:.4f},F1={mode_cmp['prob_only']['f1']:.4f},"
+        f"exit_rate={mode_cmp['prob_only']['exit_rate']:.3f},utility_mean={mode_cmp['prob_only']['utility_mean']:.4f}]  "
+        f"tie_break[acc={mode_cmp['tie_break']['acc']:.4f},F1={mode_cmp['tie_break']['f1']:.4f},"
+        f"exit_rate={mode_cmp['tie_break']['exit_rate']:.3f},utility_mean={mode_cmp['tie_break']['utility_mean']:.4f}]  "
+        f"delta(utility_mean)={mode_cmp['delta_tie_minus_prob']['utility_mean']:+.4f}",
+        flush=True,
+    )
 
     t_vm = np.asarray(pd.to_datetime(t_state))[vm]
     order = np.argsort(t_vm)
@@ -2810,7 +2926,9 @@ def _log_l3_val_extended(
         fr_s = float("nan")
     print(
         f"    exit prob flip_rate (time-sorted val): raw={fr:.6f}  ema(alpha={alpha:.2f})={fr_s:.6f}  "
-        f"hysteresis=({infer_cfg['enter_thr']:.2f},{infer_cfg['leave_thr']:.2f})  min_hold={int(round(infer_cfg['min_hold']))}",
+        f"hysteresis=({infer_cfg['enter_thr']:.2f},{infer_cfg['leave_thr']:.2f})  "
+        f"soft_time=(early+{float(infer_cfg['early_patience_strength']):.2f},late-{float(infer_cfg['late_pressure_strength']):.2f})  "
+        f"legacy_hold_ref={int(round(float(infer_cfg['legacy_min_hold_ref'])))}",
         flush=True,
     )
 
@@ -2853,7 +2971,6 @@ def _log_l3_val_extended(
     if int(tm.sum()) >= 5:
         p_t = _apply_l3_exit_calibrator(exit_model.predict(X[tm]).astype(np.float64), exit_calibrator)
         yt = y_exit[tm].astype(np.int32)
-        hold_tm = np.asarray(X[tm, ih_hold], dtype=np.int64)
         try:
             auc_t = float(roc_auc_score(yt, p_t))
         except ValueError:
@@ -2861,14 +2978,29 @@ def _log_l3_val_extended(
         br_t = brier_binary(yt.astype(np.float64), p_t)
         ece_t = ece_binary(yt, p_t)
         yhat_t = (p_t >= 0.5).astype(np.int32)
-        if min_hold_bars > 0:
-            yhat_t = np.where(hold_tm < min_hold_bars, 0, yhat_t).astype(np.int32)
         hold_recall_t = float(np.mean(yhat_t[yt == 0] == 0)) if np.any(yt == 0) else float("nan")
         hold_precision_t = float(np.mean(yt[yhat_t == 0] == 0)) if np.any(yhat_t == 0) else float("nan")
         print(
             f"\n  [L3] holdout — exit AUC={auc_t:.4f}  Brier={br_t:.4f}  ECE={ece_t:.4f}  "
             f"acc@0.5={float(accuracy_score(yt, yhat_t)):.4f}  F1={float(f1_score(yt, yhat_t, zero_division=0)):.4f}  "
             f"hold_recall={hold_recall_t:.4f}  hold_precision={hold_precision_t:.4f}  n={int(tm.sum()):,}",
+            flush=True,
+        )
+        holdout_cmp = _l3_policy_mode_ablation_metrics(
+            yt,
+            p_t,
+            y_value[tm].astype(np.float64),
+            exit_prob_threshold=float(exit_prob_threshold),
+            value_left_threshold=float(value_left_threshold),
+            value_tie_margin=float(value_tie_margin),
+        )
+        print(
+            "    policy ablation(holdout): "
+            f"prob_only[acc={holdout_cmp['prob_only']['acc']:.4f},F1={holdout_cmp['prob_only']['f1']:.4f},"
+            f"exit_rate={holdout_cmp['prob_only']['exit_rate']:.3f},utility_mean={holdout_cmp['prob_only']['utility_mean']:.4f}]  "
+            f"tie_break[acc={holdout_cmp['tie_break']['acc']:.4f},F1={holdout_cmp['tie_break']['f1']:.4f},"
+            f"exit_rate={holdout_cmp['tie_break']['exit_rate']:.3f},utility_mean={holdout_cmp['tie_break']['utility_mean']:.4f}]  "
+            f"delta(utility_mean)={holdout_cmp['delta_tie_minus_prob']['utility_mean']:+.4f}",
             flush=True,
         )
         out["holdout_hold_recall"] = hold_recall_t
@@ -3383,7 +3515,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         f"  [L3] live exit smoothing check: smooth={_l3_exit_infer_enabled(None)}  "
         f"ema_alpha={_ip['ema_alpha']:.2f}  "
         f"hysteresis=({_ip['enter_thr']:.2f},{_ip['leave_thr']:.2f})  "
-        f"min_hold={int(round(_ip['min_hold']))}",
+        f"soft_time=(early+{float(_ip['early_patience_strength']):.2f},late-{float(_ip['late_pressure_strength']):.2f})  "
+        f"legacy_hold_ref={int(round(float(_ip['legacy_min_hold_ref'])))}",
         flush=True,
     )
     if use_hybrid and not value_disabled and os.environ.get("L3_GRU_ABLATION", "1").strip().lower() in {"1", "true", "yes"}:
@@ -3446,6 +3579,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         exit_calibrator=exit_calibrator,
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
+        exit_prob_threshold=float(exit_policy.get("exit_prob_threshold", 0.5)),
+        value_left_threshold=float(exit_policy.get("value_left_threshold", 0.0)),
         exit_policy_summary=exit_policy,
     )
     release_hold_recall_min = _env_float_clipped("L3_RELEASE_MIN_HOLD_RECALL", 0.25, lo=0.0, hi=1.0)
@@ -3555,7 +3690,13 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_exit_ema_alpha": float(os.environ.get("L3_EXIT_EMA_ALPHA", "0.3")),
         "l3_exit_hyst_enter": float(os.environ.get("L3_EXIT_HYST_ENTER", "0.55")),
         "l3_exit_hyst_leave": float(os.environ.get("L3_EXIT_HYST_LEAVE", "0.35")),
-        "l3_min_hold_bars": int(max(0, round(float(os.environ.get("L3_MIN_HOLD_BARS", "3"))))),
+        "l3_min_hold_bars": int(max(0, round(float(os.environ.get("L3_MIN_HOLD_BARS", "0"))))),
+        "l3_exit_early_patience_strength": float(
+            os.environ.get("L3_EXIT_EARLY_PATIENCE_STRENGTH", "0.10")
+        ),
+        "l3_exit_late_pressure_strength": float(
+            os.environ.get("L3_EXIT_LATE_PRESSURE_STRENGTH", "0.18")
+        ),
         "l3_hybrid": bool(use_hybrid),
         "l3_split_config": {
             "oot_start": str(oot_start),
@@ -3690,9 +3831,21 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             ),
             threshold_entry(
                 "L3_MIN_HOLD_BARS",
-                int(max(0, round(float(os.environ.get("L3_MIN_HOLD_BARS", "3"))))),
-                category="safety_constraint",
-                role="live churn control min hold",
+                int(max(0, round(float(os.environ.get("L3_MIN_HOLD_BARS", "0"))))),
+                category="legacy_reference",
+                role="legacy hold reference for soft early-patience shaping (no hard gate)",
+            ),
+            threshold_entry(
+                "L3_EXIT_EARLY_PATIENCE_STRENGTH",
+                float(os.environ.get("L3_EXIT_EARLY_PATIENCE_STRENGTH", "0.10")),
+                category="adaptive_candidate",
+                role="soft early-bar exit threshold uplift",
+            ),
+            threshold_entry(
+                "L3_EXIT_LATE_PRESSURE_STRENGTH",
+                float(os.environ.get("L3_EXIT_LATE_PRESSURE_STRENGTH", "0.18")),
+                category="adaptive_candidate",
+                role="soft late-bar exit threshold easing",
             ),
             threshold_entry(
                 "L3_EXIT_LOSS_BUFFER_ATR",
