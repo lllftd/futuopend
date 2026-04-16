@@ -9,4 +9,9 @@ if _ROOT not in sys.path:
 from backtests.oos_backtest import main
 
 if __name__ == "__main__":
+    # When piping to `tee`, default block-buffering delays stdout vs stderr (warnings).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     main()

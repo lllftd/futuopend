@@ -326,7 +326,12 @@ def _inside_bars_5m(bars: pd.DataFrame) -> pd.DataFrame:
     is_inside = (
         (bars["high"] < prev_high) & (bars["low"] > prev_low)
     ).fillna(False).astype(bool)
-    is_ii = is_inside & is_inside.shift(1).fillna(False).astype(bool)
+    prev_inside = is_inside.shift(1).fillna(False)
+    try:
+        prev_inside = prev_inside.infer_objects(copy=False)
+    except (AttributeError, TypeError):
+        pass
+    is_ii = is_inside & prev_inside.astype(bool)
 
     out = pd.DataFrame(index=bars.index)
     out["time_key"] = bars["time_key"].values

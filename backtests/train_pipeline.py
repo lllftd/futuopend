@@ -383,6 +383,12 @@ def run_lgbm_layers(start_from: str = "layer1"):
     l2_outputs = _artifact_inferred_l2_outputs(df, l1a_outputs, l1b_outputs, l1c_outputs)
     _print_feature_drift_summary("l2", l2_outputs, [c for c in l2_outputs.columns if c.startswith("l2_")])
 
+    if sf == "layer2":
+        print("\n" + "=" * 70)
+        print("  DONE — L2 only (start-from=layer2). Run layer3 separately if needed.")
+        print("=" * 70)
+        return
+
     logger = setup_logger("layer3")
     l3_thr_before = _load_threshold_registry_snapshot(L3_META_FILE)
     try:
@@ -406,7 +412,7 @@ def main():
         default="layer1",
         help="layer1/layer1a: L1a→L1b→L1c→L2→L3 (set L1C_SKIP_PIPELINE=1 to skip L1c train). "
         "layer1b: needs l1a_outputs.pkl, then L1b→L1c→L2→L3. layer1c: prepared cache + L1c only. "
-        "layer2: needs l1a/l1b caches; loads l1c_outputs.pkl if present. "
+        "layer2: needs l1a/l1b caches; loads l1c_outputs.pkl if present; trains L2 only (no L3). "
         "layer3: needs l1a_outputs.pkl + l2_outputs.pkl, L3 only.",
     )
     args = parser.parse_args()

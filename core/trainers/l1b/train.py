@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from statistics import NormalDist
-from typing import Any
+from typing import Any, Callable
 
 import lightgbm as lgb
 import numpy as np
@@ -457,7 +458,12 @@ def _fit_l1b_latent_block(
     return out, meta
 
 
-def _apply_l1b_latent_block(df: pd.DataFrame, latent_meta: dict[str, Any]) -> pd.DataFrame:
+def _apply_l1b_latent_block(
+    df: pd.DataFrame,
+    latent_meta: dict[str, Any],
+    *,
+    on_substage: Callable[[str], None] | None = None,
+) -> pd.DataFrame:
     feature_cols = list(latent_meta.get("feature_cols") or [])
     work = df.copy()
     for col in feature_cols:
@@ -492,10 +498,46 @@ def _apply_l1b_latent_block(df: pd.DataFrame, latent_meta: dict[str, Any]) -> pd
     ae = _L1BTabularAutoencoder(Xz.shape[1], latent_dim, hidden_dim)
     ae.load_state_dict(latent_meta.get("autoencoder_state_dict") or {})
     ae.eval()
-    with torch.no_grad():
-        emb_t, recon_t = ae(torch.from_numpy(Xz))
-    emb = emb_t.numpy().astype(np.float32)
-    recon = recon_t.numpy().astype(np.float32)
+    # macOS: large matmul + default PyTorch/BLAS thread pools can hang or thrash; smaller chunks + 1 thread.
+    _chunk_default = "512" if sys.platform == "darwin" else "2048"
+    chunk = max(256, int(os.environ.get("L1B_LATENT_INFER_CHUNK", _chunk_default)))
+    emb_parts: list[np.ndarray] = []
+    recon_parts: list[np.ndarray] = []
+    chunk_starts = list(range(0, len(Xz), chunk))
+    use_nested_tqdm = (
+        on_substage is None and _lgb_round_tqdm_enabled() and len(chunk_starts) > 1
+    )
+    chunk_it: Any = chunk_starts
+    if use_nested_tqdm:
+        chunk_it = tqdm(
+            chunk_starts,
+            desc="[L1b] latent AE",
+            unit="batch",
+            leave=False,
+            mininterval=0.2,
+            file=TQDM_FILE,
+            dynamic_ncols=True,
+        )
+    _prev_torch_threads = int(torch.get_num_threads())
+    _infer_threads = max(1, int(os.environ.get("L1B_TORCH_INFER_THREADS", "1")))
+    try:
+        torch.set_num_threads(_infer_threads)
+        with torch.inference_mode():
+            for j, start in enumerate(chunk_it):
+                if on_substage is not None and len(chunk_starts) > 1:
+                    on_substage(f"L1b · AE {j + 1}/{len(chunk_starts)}")
+                xb = torch.from_numpy(np.ascontiguousarray(Xz[start : start + chunk]))
+                z_b, recon_b = ae(xb)
+                emb_parts.append(z_b.numpy().astype(np.float32, copy=False))
+                recon_parts.append(recon_b.numpy().astype(np.float32, copy=False))
+                try:
+                    TQDM_FILE.flush()
+                except Exception:
+                    pass
+    finally:
+        torch.set_num_threads(_prev_torch_threads)
+    emb = np.concatenate(emb_parts, axis=0)
+    recon = np.concatenate(recon_parts, axis=0)
     resid = np.mean((Xz - recon) ** 2, axis=1).astype(np.float32)
     novelty_lo = float(latent_meta.get("novelty_lo", 0.0))
     novelty_hi = float(latent_meta.get("novelty_hi", 1.0))
@@ -666,12 +708,19 @@ def _fit_l1b_unsupervised_block(
     return out, meta
 
 
-def _apply_l1b_unsupervised_block(df: pd.DataFrame, unsup_meta: dict[str, Any]) -> pd.DataFrame:
+def _apply_l1b_unsupervised_block(
+    df: pd.DataFrame,
+    unsup_meta: dict[str, Any],
+    *,
+    on_substage: Callable[[str], None] | None = None,
+) -> pd.DataFrame:
     latent_meta = dict(unsup_meta.get("latent_head_meta") or {})
-    latent_outputs = _apply_l1b_latent_block(df, latent_meta)
+    latent_outputs = _apply_l1b_latent_block(df, latent_meta, on_substage=on_substage)
     latent_cols = list(unsup_meta.get("latent_cols") or [])
     centroids = np.asarray(unsup_meta.get("cluster_centroids"), dtype=np.float32)
     cluster_temperature = float(unsup_meta.get("cluster_temperature", 1.0))
+    if on_substage is not None:
+        on_substage("L1b · cluster")
     all_latent = latent_outputs[latent_cols].to_numpy(dtype=np.float32, copy=False)
     cluster_probs, _ = _cluster_probs_from_latent(all_latent, centroids, temperature=cluster_temperature)
     regime_change_raw = _cluster_regime_change_score(df, cluster_probs)
@@ -1407,16 +1456,21 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     train_mask = splits.train_mask
     val_mask = splits.l2_val_mask
     direct_outputs = _build_l1b_direct_semantic_outputs(work)
-    cross = compute_cross_asset_context(work)
-    cross.index = work.index
-    cross = cross.rename(
-        columns={
-            "sector_relative_strength": "l1b_sector_relative_strength",
-            "correlation_regime": "l1b_correlation_regime",
-            "market_breadth": "l1b_market_breadth",
-        }
-    )
     cross_context_reliable = _l1b_cross_context_reliable(work)
+    if cross_context_reliable:
+        cross = compute_cross_asset_context(work)
+        cross.index = work.index
+        cross = cross.rename(
+            columns={
+                "sector_relative_strength": "l1b_sector_relative_strength",
+                "correlation_regime": "l1b_correlation_regime",
+                "market_breadth": "l1b_market_breadth",
+            }
+        )
+    else:
+        cross = pd.DataFrame(index=work.index)
+        for _ctx in L1B_DIRECT_CONTEXT_COLS:
+            cross[_ctx] = np.float32(0.0)
 
     log_layer_banner("[L1b] Tabular market descriptor")
     log_time_key_split(
@@ -1644,8 +1698,16 @@ def load_l1b_market_descriptor() -> tuple[dict[str, lgb.Booster], dict[str, Any]
     return models, meta
 
 
-def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
+def infer_l1b_market_descriptor(
+    models: dict[str, lgb.Booster],
+    meta: dict[str, Any],
+    df: pd.DataFrame,
+    *,
+    infer_stage_pbar: Any | None = None,
+) -> pd.DataFrame:
+    """infer_stage_pbar: optional tqdm from the caller (e.g. ``[QQQ] infer``); L1b substages update its postfix."""
+    # Shallow copy: we only append missing feature / atomic columns (same pattern as L1a infer).
+    work = df.copy(deep=False)
     feature_cols = list(meta["feature_cols"])
     for col in feature_cols:
         if col not in work.columns:
@@ -1657,57 +1719,96 @@ def infer_l1b_market_descriptor(models: dict[str, lgb.Booster], meta: dict[str, 
     dq_lo, dq_hi = float(dq_lo), float(dq_hi)
     edge_clip = dq_meta.get("edge_pred_clip", [0.0, 5.0])
     edge_lo, edge_hi = float(edge_clip[0]), float(edge_clip[1])
-    outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
-    direct_outputs = _build_l1b_direct_semantic_outputs(work)
-    cross = compute_cross_asset_context(work)
-    cross.index = work.index
-    cross = cross.rename(
-        columns={
-            "sector_relative_strength": "l1b_sector_relative_strength",
-            "correlation_regime": "l1b_correlation_regime",
-            "market_breadth": "l1b_market_breadth",
-        }
-    )
-    outputs = pd.concat(
-        [
-            outputs,
-            _compute_l1b_deterministic_outputs(
-                direct_outputs,
-                cross,
-                cross_context_reliable=bool(meta.get("cross_context_reliable", True)),
-            ),
-        ],
-        axis=1,
-    )
     unsup_meta = meta.get("unsupervised_block_meta") or {}
-    if unsup_meta:
-        outputs = pd.concat([outputs, _apply_l1b_unsupervised_block(work, unsup_meta).reset_index(drop=True)], axis=1)
-    for col in sup_cols:
-        if col not in work.columns:
-            work[col] = 0.0
-    X_inf = work[sup_cols].to_numpy(dtype=np.float64, copy=False)
-    edge_model_type = str(dq_meta.get("edge_model_type", "") or "")
-    tau = float(dq_meta.get("edge_candidate_tau", _l1b_edge_candidate_tau()))
-    if edge_model_type == "staged_tradeability":
-        cand_mdl = models.get("l1b_edge_candidate_model")
-        qual_mdl = models.get("l1b_edge_quality_model")
-        if cand_mdl is not None and qual_mdl is not None:
-            cand_p = np.clip(cand_mdl.predict(X_inf).astype(np.float64), 0.0, 1.0)
-            qual_pred = np.clip(qual_mdl.predict(X_inf).astype(np.float64), tau, edge_hi)
-            outputs["l1b_edge_pred"] = np.clip(cand_p * qual_pred, edge_lo, edge_hi).astype(np.float32)
-    else:
-        mdl = models.get("l1b_edge_pred")
-        if mdl is not None:
-            pred = np.clip(mdl.predict(X_inf).astype(np.float64), edge_lo, edge_hi)
-            outputs["l1b_edge_pred"] = pred.astype(np.float32)
-    outputs["l1b_edge_candidate_tau"] = np.full(len(outputs), float(tau), dtype=np.float32)
-    dq_mdl = models.get("l1b_dq_pred")
-    if dq_mdl is not None:
-        dq_pred = np.clip(dq_mdl.predict(X_inf).astype(np.float64), dq_lo, dq_hi)
-        outputs["l1b_dq_pred"] = dq_pred.astype(np.float32)
-    out_cols = list(meta.get("output_cols", L1B_OUTPUT_COLS))
-    for col in out_cols:
-        if col not in outputs.columns:
-            outputs[col] = 0.0
-    _keep = ["symbol", "time_key"] + out_cols
-    return outputs[_keep]
+    infer_steps = 3 if unsup_meta else 2
+    own_pbar = None
+    if infer_stage_pbar is None and _lgb_round_tqdm_enabled():
+        own_pbar = tqdm(
+            total=infer_steps,
+            desc="[L1b] infer",
+            unit="step",
+            leave=False,
+            mininterval=0.2,
+            file=TQDM_FILE,
+            dynamic_ncols=True,
+        )
+
+    def _sub(s: str) -> None:
+        if infer_stage_pbar is not None:
+            infer_stage_pbar.set_postfix_str(s)
+            try:
+                infer_stage_pbar.refresh()
+            except Exception:
+                pass
+        elif own_pbar is not None:
+            own_pbar.set_postfix_str(s)
+        try:
+            TQDM_FILE.flush()
+        except Exception:
+            pass
+
+    try:
+        outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
+        _sub("L1b · semantic")
+        direct_outputs = _build_l1b_direct_semantic_outputs(work)
+        # Exported L1b rows do not include cross-asset columns; deterministic merge only needs row index alignment.
+        cross_shell = pd.DataFrame(index=work.index)
+        outputs = pd.concat(
+            [
+                outputs,
+                _compute_l1b_deterministic_outputs(
+                    direct_outputs,
+                    cross_shell,
+                    cross_context_reliable=bool(meta.get("cross_context_reliable", True)),
+                ),
+            ],
+            axis=1,
+        )
+        if own_pbar is not None:
+            own_pbar.update(1)
+        if unsup_meta:
+            _sub("L1b · unsup")
+            outputs = pd.concat(
+                [
+                    outputs,
+                    _apply_l1b_unsupervised_block(work, unsup_meta, on_substage=_sub).reset_index(drop=True),
+                ],
+                axis=1,
+            )
+            if own_pbar is not None:
+                own_pbar.update(1)
+        _sub("L1b · lgbm")
+        for col in sup_cols:
+            if col not in work.columns:
+                work[col] = 0.0
+        X_inf = work[sup_cols].to_numpy(dtype=np.float64, copy=False)
+        edge_model_type = str(dq_meta.get("edge_model_type", "") or "")
+        tau = float(dq_meta.get("edge_candidate_tau", _l1b_edge_candidate_tau()))
+        if edge_model_type == "staged_tradeability":
+            cand_mdl = models.get("l1b_edge_candidate_model")
+            qual_mdl = models.get("l1b_edge_quality_model")
+            if cand_mdl is not None and qual_mdl is not None:
+                cand_p = np.clip(cand_mdl.predict(X_inf).astype(np.float64), 0.0, 1.0)
+                qual_pred = np.clip(qual_mdl.predict(X_inf).astype(np.float64), tau, edge_hi)
+                outputs["l1b_edge_pred"] = np.clip(cand_p * qual_pred, edge_lo, edge_hi).astype(np.float32)
+        else:
+            mdl = models.get("l1b_edge_pred")
+            if mdl is not None:
+                pred = np.clip(mdl.predict(X_inf).astype(np.float64), edge_lo, edge_hi)
+                outputs["l1b_edge_pred"] = pred.astype(np.float32)
+        outputs["l1b_edge_candidate_tau"] = np.full(len(outputs), float(tau), dtype=np.float32)
+        dq_mdl = models.get("l1b_dq_pred")
+        if dq_mdl is not None:
+            dq_pred = np.clip(dq_mdl.predict(X_inf).astype(np.float64), dq_lo, dq_hi)
+            outputs["l1b_dq_pred"] = dq_pred.astype(np.float32)
+        out_cols = list(meta.get("output_cols", L1B_OUTPUT_COLS))
+        for col in out_cols:
+            if col not in outputs.columns:
+                outputs[col] = 0.0
+        _keep = ["symbol", "time_key"] + out_cols
+        if own_pbar is not None:
+            own_pbar.update(1)
+        return outputs[_keep]
+    finally:
+        if own_pbar is not None:
+            own_pbar.close()

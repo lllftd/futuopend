@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -94,7 +95,12 @@ def _l1a_min_attention_seq_len() -> int:
 
 def _l1a_dataloader_workers(default: int) -> int:
     raw = os.environ.get("L1A_DATALOADER_WORKERS", "").strip()
-    workers = int(raw) if raw else int(default)
+    if raw:
+        workers = int(raw)
+    else:
+        workers = int(default)
+        if sys.platform == "darwin" and workers > 0:
+            workers = 0
     return max(0, min(workers, 4))
 
 
@@ -986,6 +992,7 @@ def materialize_l1a_outputs(
     seq_len: int,
     device: torch.device,
     embed_dim: int | None = None,
+    cold_vol_default: float | None = None,
 ) -> pd.DataFrame:
     X = df[feature_cols].to_numpy(dtype=np.float32, copy=False)
     X = np.nan_to_num((X - mean) / std, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -1002,15 +1009,24 @@ def materialize_l1a_outputs(
         outputs[col] = 0.0
     outputs[L1A_REGIME_COLS] = 1.0 / float(NUM_REGIME_CLASSES)
     outputs[_bounded_scalar_cols()] = 0.0
-    outputs["l1a_vol_forecast"] = float(np.nanmedian(pd.to_numeric(df["lbl_atr"], errors="coerce").fillna(1.0)))
+    atr_series = pd.to_numeric(df["lbl_atr"], errors="coerce")
+    if cold_vol_default is not None and np.isfinite(float(cold_vol_default)):
+        default_vol = float(cold_vol_default)
+    else:
+        n0 = min(max(1, int(seq_len)), int(len(atr_series)))
+        default_vol = float(np.nanmedian(atr_series.iloc[:n0].to_numpy(dtype=np.float64)))
+        if not np.isfinite(default_vol):
+            default_vol = 1.0
+    outputs["l1a_vol_forecast"] = default_vol
     outputs["l1a_is_warm"] = 0.0
     if len(end_idx) == 0:
         return outputs
 
     ds = TensorDataset(torch.from_numpy(windows))
     infer_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
+    infer_bs = max(32, int(os.environ.get("L1A_MATERIALIZE_BATCH_SIZE", "1024")))
     dl_kwargs: dict[str, Any] = {
-        "batch_size": 1024,
+        "batch_size": infer_bs,
         "shuffle": False,
         "num_workers": infer_workers,
         "pin_memory": DEVICE.type == "cuda",
@@ -1075,7 +1091,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     if len(end_idx) == 0:
         raise RuntimeError("L1a: no valid sequence windows were created.")
 
-    targets, clip_meta = _build_l1a_targets(work, fit_mask=splits.train)
+    targets, clip_meta = _build_l1a_targets(work, fit_mask=splits.train_mask)
     window_train = splits.train_mask[end_idx]
     window_cal = splits.cal_mask[end_idx]
     window_val = splits.l2_val_mask[end_idx]
@@ -1235,8 +1251,21 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     if window_cal.sum() != window_val.sum():
         _log_l1a_val_metrics(model, cal_dl, DEVICE, label="cal_full")
 
+    _tr_m = np.asarray(splits.train_mask, dtype=bool)
+    _atr_tr = pd.to_numeric(work["lbl_atr"], errors="coerce").to_numpy(dtype=np.float64)
+    _fin_tr = _tr_m & np.isfinite(_atr_tr)
+    lbl_atr_median_train = float(np.median(_atr_tr[_fin_tr])) if np.any(_fin_tr) else 1.0
+
     outputs = materialize_l1a_outputs(
-        model, work, feature_cols, mean=mean, std=std, seq_len=SEQ_LEN, device=DEVICE, embed_dim=model.embed_dim
+        model,
+        work,
+        feature_cols,
+        mean=mean,
+        std=std,
+        seq_len=SEQ_LEN,
+        device=DEVICE,
+        embed_dim=model.embed_dim,
+        cold_vol_default=lbl_atr_median_train,
     )
     os.makedirs(MODEL_DIR, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(MODEL_DIR, L1A_MODEL_FILE))
@@ -1281,9 +1310,10 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             "range_norm": dict(clip_meta.get("range_norm") or {}),
             "vol_trend": dict(clip_meta.get("vol_trend") or {}),
         },
+        "lbl_atr_median_train": float(lbl_atr_median_train),
     }
     adaptive_min_samples = int(os.environ.get("ADAPTIVE_THRESHOLD_MIN_SAMPLES", "500"))
-    fit_n = int(np.sum(np.asarray(splits.train, dtype=bool)))
+    fit_n = int(np.sum(np.asarray(splits.train_mask, dtype=bool)))
     meta = attach_threshold_registry(
         meta,
         "l1a",
@@ -1414,6 +1444,16 @@ def infer_l1a_market_encoder(model: L1AMarketTCN, meta: dict[str, Any], df: pd.D
     mean = np.asarray(meta["mean"], dtype=np.float32)
     std = np.asarray(meta["std"], dtype=np.float32)
     seq_len = int(meta.get("seq_len", SEQ_LEN))
+    cold_raw = meta.get("lbl_atr_median_train")
+    cold_vol = float(cold_raw) if cold_raw is not None and np.isfinite(float(cold_raw)) else None
     return materialize_l1a_outputs(
-        model, work, feature_cols, mean=mean, std=std, seq_len=seq_len, device=DEVICE, embed_dim=model.embed_dim
+        model,
+        work,
+        feature_cols,
+        mean=mean,
+        std=std,
+        seq_len=seq_len,
+        device=DEVICE,
+        embed_dim=model.embed_dim,
+        cold_vol_default=cold_vol,
     )
