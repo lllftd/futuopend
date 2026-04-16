@@ -494,6 +494,8 @@ def run_single_symbol(
                         max_seq_len=int(l3_traj_cfg.max_seq_len),
                         max_seq_ref=ref,
                         seq_feat_dim=int(l3_traj_cfg.seq_feat_dim),
+                        mfe_norm_scale=float(getattr(l3_traj_cfg, "mfe_norm_scale", 5.0)),
+                        mae_norm_scale=float(getattr(l3_traj_cfg, "mae_norm_scale", 5.0)),
                     )
         else:
             hold += 1

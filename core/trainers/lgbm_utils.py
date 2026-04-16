@@ -14,11 +14,10 @@ import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
-from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
-# Real console stream — `backtests.train_pipeline.Logger` replaces `sys.stderr` with a tee that
-# also writes to logs/; tqdm must not use that tee or progress bars pollute layer*.log.
+# Real console stream for tqdm. `Logger` in train_pipeline only tees stdout to logs/; stderr stays
+# on the console so default tqdm (stderr) does not write into layer*.log.
 TQDM_FILE = getattr(sys, "__stderr__", None) or sys.stderr
 
 from core.indicators import atr as compute_atr

@@ -30,6 +30,9 @@ class L3TrajectoryConfig:
     gru_layers: int = 2
     gru_dropout: float = 0.15
     embed_dim: int = 32
+    # clip(live_mfe / mfe_norm_scale, 0, 1) in step features; fit from data (pred_mfe p99) at L3 build
+    mfe_norm_scale: float = 5.0
+    mae_norm_scale: float = 5.0
 
 
 @dataclass
@@ -39,6 +42,8 @@ class L3TrajRollingState:
     max_seq_len: int = 32
     max_seq_ref: int = 32
     seq_feat_dim: int = 12
+    mfe_norm_scale: float = 5.0
+    mae_norm_scale: float = 5.0
     prev_unreal: float = 0.0
     peak_unreal: float = -1e9
     hist: list[np.ndarray] = field(default_factory=list)
@@ -80,6 +85,8 @@ class L3TrajRollingState:
             float(live_mfe),
             float(live_mae),
             max_seq_ref=self.max_seq_ref,
+            mfe_scale=self.mfe_norm_scale,
+            mae_scale=self.mae_norm_scale,
         )
         self.hist.append(v)
         self.prev_unreal = float(unreal)
@@ -110,6 +117,8 @@ def l3_traj_step_features(
     live_mae: float,
     *,
     max_seq_ref: int = 32,
+    mfe_scale: float = 5.0,
+    mae_scale: float = 5.0,
 ) -> np.ndarray:
     """One bar of trajectory features (ATR-normalized where applicable)."""
     atr = max(float(atr), 1e-6)
@@ -127,6 +136,8 @@ def l3_traj_step_features(
     cos_t = float(np.cos(ang))
     bar_ret = (float(close_now) - float(close_prev)) / atr
     bar_range = (float(high_now) - float(low_now)) / atr
+    ms = max(float(mfe_scale), 1e-6)
+    mas = max(float(mae_scale), 1e-6)
     return np.asarray(
         [
             float(unreal),
@@ -139,8 +150,8 @@ def l3_traj_step_features(
             float(bar_range),
             float(vol_surprise),
             float(regime_div),
-            float(np.clip(live_mfe / 5.0, 0.0, 1.0)),
-            float(np.clip(live_mae / 5.0, 0.0, 1.0)),
+            float(np.clip(live_mfe / ms, 0.0, 1.0)),
+            float(np.clip(live_mae / mas, 0.0, 1.0)),
         ],
         dtype=np.float32,
     )

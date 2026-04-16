@@ -41,23 +41,22 @@ from core.trainers.stack_v2_common import load_output_cache, save_output_cache
 
 
 class Logger:
-    """Redirects stdout and stderr to both the terminal and a specified log file."""
+    """Tee stdout to terminal and the layer log file.
+
+    stderr is left as the process default so tqdm (usually stderr), warnings, and tracebacks
+    do not pollute logs/*.log. Use TQDM_FILE=sys.__stderr__ in trainers when forcing a stream.
+    """
     def __init__(self, filename):
         self.terminal = sys.stdout
         self.log = open(filename, "w")
         self.original_stdout = sys.stdout
-        self.original_stderr = sys.stderr
         sys.stdout = self
-        sys.stderr = self
 
     def write(self, message):
         self.terminal.write(message)
-        # tqdm should use core.trainers.lgbm_utils.TQDM_FILE (sys.__stderr__) so bars never hit this tee.
-        # Fallback: redraw lines use '\r'; skip those so logs stay readable if something writes to sys.stderr.
-        if message and "\r" in message:
-            return
-        self.log.write(message)
-        self.log.flush()
+        if message:
+            self.log.write(message)
+            self.log.flush()
 
     def flush(self):
         self.terminal.flush()
@@ -68,7 +67,6 @@ class Logger:
 
     def close(self):
         sys.stdout = self.original_stdout
-        sys.stderr = self.original_stderr
         self.log.close()
 
 # Fixed layer log filenames (overwrite each run) under logs/

@@ -13,7 +13,6 @@ import pandas as pd
 import torch
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import accuracy_score, f1_score, log_loss, roc_auc_score, confusion_matrix
-from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
 from core.mamba_pa_state import PAStateMamba
@@ -995,7 +994,9 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     # Layer 2a: y = causal HMM argmax on this bar (matches PA features). CSV market_state can lag
     # label_v2/HMM tie logic; pa_hmm_state uses the same softmax as pa_hmm_prob_* with range boost.
     hmm_state = pd.to_numeric(df["pa_hmm_state"], errors="coerce")
-    df["state_label"] = hmm_state.fillna(ms_num).fillna(4).astype(int).clip(0, NUM_REGIME_CLASSES - 1)
+    df["state_label"] = (
+        hmm_state.fillna(ms_num).fillna(UNKNOWN_REGIME_CLASS_ID).astype(int).clip(0, NUM_REGIME_CLASSES - 1)
+    )
 
     feat_cols = _pa_feature_cols(df)
     df = _compute_tcn_derived_features(df, feat_cols)

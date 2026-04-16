@@ -5,7 +5,6 @@ Designed to run on Apple Silicon (MPS) without Triton/CUDA dependencies.
 from __future__ import annotations
 
 import os
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

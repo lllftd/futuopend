@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import sys
@@ -26,6 +27,7 @@ from sklearn.metrics import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import trange, tqdm
@@ -42,6 +44,7 @@ from core.trainers.constants import (
     MODEL_DIR,
     NUM_REGIME_CLASSES,
     REGIME_NOW_PROB_COLS,
+    UNKNOWN_REGIME_CLASS_ID,
 )
 
 from core.trainers.data_prep import _create_tcn_windows
@@ -60,6 +63,78 @@ from core.trainers.stack_v2_common import (
 )
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
 from core.trainers.tcn_constants import DEVICE, SEQ_LEN
+
+
+@dataclass(frozen=True)
+class L1aAmpSettings:
+    """CUDA: opt-in via ``L1A_AMP=1``. macOS + MPS: float16 autocast always on (no env)."""
+
+    enabled: bool
+    device_type: str
+    dtype: torch.dtype
+
+
+def _l1a_is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _l1a_build_amp(device: torch.device) -> tuple[L1aAmpSettings, GradScaler | None]:
+    if _l1a_is_macos() and device.type == "mps":
+        return L1aAmpSettings(True, "mps", torch.float16), None
+    if os.environ.get("L1A_AMP", "0").strip().lower() not in {"1", "true", "yes"}:
+        return L1aAmpSettings(False, device.type, torch.float32), None
+    if device.type != "cuda":
+        return L1aAmpSettings(False, device.type, torch.float32), None
+    raw = (os.environ.get("L1A_AMP_DTYPE", "auto") or "auto").strip().lower()
+    if raw in {"bf16", "bfloat16"}:
+        dt = torch.bfloat16
+    elif raw in {"fp16", "float16"}:
+        dt = torch.float16
+    elif raw == "fp32":
+        return L1aAmpSettings(False, device.type, torch.float32), None
+    else:
+        dt = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler: GradScaler | None = None if dt == torch.bfloat16 else GradScaler(device.type)
+    return L1aAmpSettings(True, device.type, dt), scaler
+
+
+def _l1a_autocast(amp: L1aAmpSettings):
+    return autocast(amp.device_type, enabled=amp.enabled, dtype=amp.dtype)
+
+
+def _l1a_maybe_compile(module: nn.Module) -> nn.Module:
+    if os.environ.get("L1A_TORCH_COMPILE", "0").strip().lower() not in {"1", "true", "yes"}:
+        return module
+    if not hasattr(torch, "compile"):
+        print("  [L1a][warn] L1A_TORCH_COMPILE=1 but torch.compile unavailable", flush=True)
+        return module
+    mode = (os.environ.get("L1A_TORCH_COMPILE_MODE", "default") or "default").strip()
+    print(f"  [L1a] torch.compile(mode={mode!r}) — first step may be slow", flush=True)
+    return torch.compile(module, mode=mode)  # type: ignore[no-any-return]
+
+
+def _l1a_raw_module(module: nn.Module) -> nn.Module:
+    return getattr(module, "_orig_mod", module)
+
+
+def _l1a_state_dict_for_save(module: nn.Module) -> dict[str, Any]:
+    return _l1a_raw_module(module).state_dict()
+
+
+def _l1a_nb(device: torch.device) -> bool:
+    return device.type == "cuda"
+
+
+def _l1a_progress_tqdm_enabled() -> bool:
+    """Batch/epoch tqdm for L1a. When stdout is not a TTY (Cursor, nohup, tee), still show bars on TQDM_FILE unless disabled."""
+    if os.environ.get("DISABLE_TQDM", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if os.environ.get("L1A_DISABLE_TQDM", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if _lgb_round_tqdm_enabled():
+        return True
+    raw = (os.environ.get("L1A_PROGRESS_TQDM", "1") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _bounded_scalar_cols() -> list[str]:
@@ -100,20 +175,36 @@ def _l1a_min_attention_seq_len() -> int:
 
 def _l1a_dataloader_workers(default: int) -> int:
     raw = os.environ.get("L1A_DATALOADER_WORKERS", "").strip()
+    cap = max(1, int(os.environ.get("L1A_DATALOADER_WORKERS_CAP", "8")))
     if raw:
         workers = int(raw)
     else:
         workers = int(default)
         if sys.platform == "darwin" and workers > 0:
             workers = 0
-    return max(0, min(workers, 4))
+    return max(0, min(workers, cap))
 
 
 def _l1a_tcn_channels() -> list[int]:
     raw = os.environ.get("L1A_TCN_CHANNELS", "").strip()
     if raw:
         return [int(x.strip()) for x in raw.split(",") if x.strip()]
-    return [48, 48, 64]
+    # Wider final map: aligns with load_l1a fallback [64,64,128]; use L1A_TCN_CHANNELS to slim.
+    return [64, 64, 128]
+
+
+def _l1a_tcn_kernel_size() -> int:
+    """Causal TCN kernel per layer; k=5 increases receptive field vs k=3 at similar depth."""
+    return max(2, int(os.environ.get("L1A_TCN_KERNEL_SIZE", "3")))
+
+
+def _l1a_tcn_receptive_field_steps(*, n_layers: int, kernel_size: int) -> int:
+    """Stack R_0=1, R_{i+1} = R_i + (k-1)*2^i (L1a uses dilation 2**idx per layer)."""
+    k = int(kernel_size)
+    rf = 1
+    for i in range(int(n_layers)):
+        rf += (k - 1) * (2**i)
+    return int(rf)
 
 
 def _l1a_tcn_dropout() -> float:
@@ -146,6 +237,130 @@ def _l1a_loss_weights() -> dict[str, float]:
     }
 
 
+def _l1a_use_uncertainty_weighting() -> bool:
+    return os.environ.get("L1A_USE_UNCERTAINTY_WEIGHTING", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _l1a_uw_val_metric() -> str:
+    raw = (os.environ.get("L1A_UW_VAL_METRIC", "geom") or "geom").strip().lower()
+    if raw in {"geom", "uw_total", "legacy"}:
+        return raw
+    return "geom"
+
+
+def _l1a_uw_lr_ratio() -> float:
+    return max(1e-6, float(os.environ.get("L1A_UW_LR_RATIO", "2.0")))
+
+
+def _l1a_regime_aux_coef() -> float:
+    return float(os.environ.get("L1A_REGIME_AUX_COEF", os.environ.get("L1A_REGIME_AUX_WEIGHT", "0.20")))
+
+
+def _l1a_transition_persist_coef() -> float:
+    return float(
+        os.environ.get(
+            "L1A_TRANSITION_PERSIST_COEF",
+            os.environ.get("L1A_PERSISTENCE_AUX_WEIGHT", "0.35"),
+        )
+    )
+
+
+def _l1a_uw_init_log_vars(loss_weights: dict[str, float]) -> dict[str, float]:
+    """Match initial precision ~ manual loss_weights (Kendall log(σ²) init)."""
+    if not os.environ.get("L1A_UW_INIT_FROM_WEIGHTS", "1").strip().lower() in {"0", "false", "no"}:
+        pri = {
+            "regime": float(loss_weights["regime"]),
+            "transition": float(loss_weights["transition"]),
+            "volatility": float(loss_weights["vol"] + loss_weights["vol_trend"] + loss_weights["time_in_regime"]),
+            "embedding": float(loss_weights["embed_recon"]),
+        }
+        return {k: math.log(1.0 / max(v, 1e-8)) for k, v in pri.items()}
+    return {name: 0.0 for name in L1aMultiTaskUncertaintyWeights.TASK_ORDER}
+
+
+class L1aMultiTaskUncertaintyWeights(nn.Module):
+    """Kendall et al. homoscedastic uncertainty weighting (multi-task)."""
+
+    TASK_TYPES: dict[str, str] = {
+        "regime": "cls",
+        "transition": "cls",
+        "volatility": "reg",
+        "embedding": "reg",
+    }
+    TASK_ORDER: tuple[str, ...] = ("regime", "transition", "volatility", "embedding")
+
+    def __init__(
+        self,
+        *,
+        init_log_vars: dict[str, float] | None = None,
+        device: torch.device,
+    ):
+        super().__init__()
+        init_log_vars = init_log_vars or {n: 0.0 for n in self.TASK_ORDER}
+        params: dict[str, nn.Parameter] = {}
+        for name in self.TASK_ORDER:
+            v = float(init_log_vars.get(name, 0.0))
+            params[name] = nn.Parameter(torch.tensor([v], dtype=torch.float32, device=device))
+        self.log_vars = nn.ParameterDict(params)
+
+    def weighted_loss(self, losses: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
+        if not losses:
+            z = next(iter(self.log_vars.parameters()))
+            return torch.zeros((), device=z.device, dtype=torch.float32), {}
+        dev = next(iter(losses.values())).device
+        total = torch.zeros((), device=dev, dtype=torch.float32)
+        diag: dict[str, float] = {}
+        for name in self.TASK_ORDER:
+            if name not in losses:
+                continue
+            log_var = self.log_vars[name].view(())
+            raw = losses[name]
+            prec = torch.exp(-log_var)
+            if self.TASK_TYPES[name] == "reg":
+                weighted = 0.5 * prec * raw + 0.5 * log_var
+            else:
+                weighted = prec * raw + 0.5 * log_var
+            total = total + weighted
+            diag[f"uw_{name}_log_var"] = float(log_var.detach().item())
+            diag[f"uw_{name}_eff_weight"] = float(prec.detach().item())
+            diag[f"uw_{name}_raw"] = float(raw.detach().item())
+            diag[f"uw_{name}_weighted"] = float(weighted.detach().item())
+        return total, diag
+
+
+def _l1a_build_uw_module(device: torch.device, loss_weights: dict[str, float]) -> L1aMultiTaskUncertaintyWeights:
+    init = _l1a_uw_init_log_vars(loss_weights)
+    return L1aMultiTaskUncertaintyWeights(init_log_vars=init, device=device).to(device)
+
+
+def _l1a_optimizer(
+    model: L1AMarketTCN,
+    uw: L1aMultiTaskUncertaintyWeights | None,
+    lr: float,
+    wd: float,
+) -> torch.optim.AdamW:
+    if uw is None:
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    ratio = _l1a_uw_lr_ratio()
+    return torch.optim.AdamW(
+        [
+            {"params": list(model.parameters()), "lr": lr, "weight_decay": wd},
+            {"params": list(uw.parameters()), "lr": lr * ratio, "weight_decay": 0.0},
+        ]
+    )
+
+
+def _l1a_clip_grad_norm(
+    model: L1AMarketTCN,
+    uw: L1aMultiTaskUncertaintyWeights | None,
+    max_norm: float,
+) -> None:
+    params: list[torch.nn.Parameter] = list(model.parameters())
+    if uw is not None:
+        params.extend(list(uw.parameters()))
+    torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
 def _l1a_regime_loss(
     regime_train_labels: np.ndarray,
     *,
@@ -156,6 +371,8 @@ def _l1a_regime_loss(
     counts = np.maximum(counts, 1.0)
     inv = counts.sum() / counts
     weights = inv / max(float(np.mean(inv)), 1e-8)
+    unk_scale = float(os.environ.get("L1A_UNKNOWN_REGIME_CLASS_WEIGHT", "0.3"))
+    weights[int(UNKNOWN_REGIME_CLASS_ID)] *= unk_scale
     alpha = torch.tensor(weights, dtype=torch.float32, device=device)
     gamma = float(os.environ.get("L1A_REGIME_FOCAL_GAMMA", "1.5"))
     ls = float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1"))
@@ -315,7 +532,8 @@ def _select_l1a_feature_cols(df: pd.DataFrame, feat_cols: list[str]) -> list[str
         and not c.startswith(("pa_hmm_", "pa_garch_", "pa_hsmm_", "pa_egarch_"))
         and c not in preferred
     ]
-    cols = [c for c in preferred + extra[:12] if c in df.columns]
+    max_extra = max(0, int(os.environ.get("L1A_MAX_EXTRA_FEATURES", "20")))
+    cols = [c for c in preferred + extra[:max_extra] if c in df.columns]
     time_key = pd.to_datetime(df["time_key"])
     minutes = (time_key.dt.hour * 60 + time_key.dt.minute).astype(np.float32)
     df["l1a_session_progress"] = (minutes / (24.0 * 60.0)).astype(np.float32)
@@ -396,6 +614,106 @@ def _l1a_clip_upper(
     return clip, meta
 
 
+def _l1_oof_auto_cap_enabled() -> bool:
+    return os.environ.get("L1_OOF_AUTO_CAP", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _l1a_cap_oof_folds(requested: int, n_pool_windows: int) -> tuple[int, str]:
+    """Cap K so each val fold has enough windows; avoids unstable median(best_epoch) on short spans."""
+    if requested < 2:
+        return requested, ""
+    min_w = max(200, int(os.environ.get("L1_OOF_MIN_WINDOWS_PER_FOLD", "4000")))
+    max_k = max(1, n_pool_windows // max(min_w, 1))
+    max_k = min(max_k, requested, 128)
+    if max_k < 2:
+        return 1, (
+            f"OOF fold cap: requested={requested} pool_windows={n_pool_windows:,} "
+            f"but L1_OOF_MIN_WINDOWS_PER_FOLD={min_w} implies <2 folds → fallback to legacy (L1_OOF_FOLDS=1 path)."
+        )
+    if max_k < requested:
+        per = n_pool_windows // max_k
+        return max_k, (
+            f"OOF folds capped {requested}→{max_k} (~{per:,} val windows/fold, "
+            f"pool_windows={n_pool_windows:,}, L1_OOF_MIN_WINDOWS_PER_FOLD={min_w})."
+        )
+    return requested, ""
+
+
+def _l1a_adaptive_range_clip_enabled() -> bool:
+    return os.environ.get("L1A_ADAPTIVE_RANGE_CLIP", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _l1a_adaptive_vol_forecast_clip_enabled() -> bool:
+    return os.environ.get("L1A_ADAPTIVE_VOL_FORECAST_CLIP", "1").strip().lower() in {"1", "true", "yes"}
+
+
+def _l1a_adaptive_range_norm_ceiling(fit_vals: np.ndarray) -> tuple[float, dict[str, Any]]:
+    vals = np.asarray(fit_vals, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals) & (vals >= 0)]
+    ceiling_min = float(os.environ.get("L1A_RANGE_NORM_CEILING_MIN", "4.0"))
+    ceiling_max = float(os.environ.get("L1A_RANGE_NORM_CEILING_MAX", "20.0"))
+    clip_q = float(np.clip(float(os.environ.get("L1A_RANGE_NORM_CLIP_Q", "0.995")), 0.90, 1.0))
+    meta: dict[str, Any] = {
+        "fit_n": int(vals.size),
+        "ceiling_min": float(ceiling_min),
+        "ceiling_max": float(ceiling_max),
+    }
+    if vals.size == 0:
+        c = float(np.clip(8.0, ceiling_min, ceiling_max))
+        meta.update({"clip": c, "fallback_reason": "no_finite_values", "statistical_principle": "default"})
+        return c, meta
+    med, mad, sigma = _robust_sigma_from_values(vals)
+    if not np.isfinite(sigma) or sigma <= 1e-8:
+        c = float(np.quantile(vals, clip_q))
+        meta["statistical_principle"] = "quantile_clip_fallback_from_zero_mad"
+    else:
+        c = float(med + 4.0 * max(sigma, 1e-8))
+        meta.update(
+            {
+                "statistical_principle": "robust_median_mad_4sigma",
+                "median": float(med),
+                "mad": float(mad),
+                "sigma_robust": float(sigma),
+            }
+        )
+    c = float(np.clip(c, ceiling_min, ceiling_max))
+    meta["clip"] = float(c)
+    return c, meta
+
+
+def _l1a_compute_vol_forecast_materialize_clip(vol_targets: np.ndarray) -> tuple[float, dict[str, Any]]:
+    vals = np.asarray(vol_targets, dtype=np.float64).ravel()
+    vals = vals[np.isfinite(vals) & (vals >= 0)]
+    hard_floor = float(os.environ.get("L1A_VOL_FORECAST_CLIP_FLOOR", "3.0"))
+    hard_ceiling = float(os.environ.get("L1A_VOL_FORECAST_CLIP_CEILING", "15.0"))
+    clip_q = float(np.clip(float(os.environ.get("L1A_VOL_MATERIALIZE_CLIP_Q", "0.995")), 0.90, 1.0))
+    method = (os.environ.get("L1A_VOL_MATERIALIZE_CLIP_METHOD", "mad_z") or "mad_z").strip().lower()
+    meta: dict[str, Any] = {
+        "fit_n": int(vals.size),
+        "method": str(method),
+        "hard_floor": float(hard_floor),
+        "hard_ceiling": float(hard_ceiling),
+    }
+    if vals.size == 0:
+        u = float(np.clip(5.0, hard_floor, hard_ceiling))
+        meta.update({"clip_upper": u, "fallback_reason": "no_finite_values"})
+        return u, meta
+    if method == "mad_z":
+        med, mad, sigma = _robust_sigma_from_values(vals)
+        if not np.isfinite(sigma) or sigma <= 1e-8:
+            u = float(np.quantile(vals, clip_q))
+            meta["statistical_principle"] = "quantile_fallback"
+        else:
+            u = float(med + 4.0 * max(sigma, 1e-8))
+            meta.update({"median": float(med), "sigma_robust": float(sigma), "statistical_principle": "mad_4sigma"})
+    else:
+        u = float(np.quantile(vals, clip_q))
+        meta["statistical_principle"] = "quantile"
+    u = float(np.clip(u, hard_floor, hard_ceiling))
+    meta["clip_upper"] = u
+    return u, meta
+
+
 def _build_l1a_targets(
     df: pd.DataFrame, *, fit_mask: np.ndarray | None = None
 ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
@@ -405,7 +723,12 @@ def _build_l1a_targets(
     high = pd.to_numeric(df["high"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
     low = pd.to_numeric(df["low"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
     symbols = df["symbol"].to_numpy()
-    state = pd.to_numeric(df["state_label"], errors="coerce").fillna(4).to_numpy(dtype=np.int64)
+    state = (
+        pd.to_numeric(df["state_label"], errors="coerce")
+        .fillna(float(UNKNOWN_REGIME_CLASS_ID))
+        .to_numpy(dtype=np.float64)
+    )
+    state = np.clip(state, 0, NUM_REGIME_CLASSES - 1).astype(np.int64)
 
     transition_risk = compute_transition_event_labels(state, symbols, horizon=horizon)
     range_raw = np.clip((high - low) / safe_atr, 0.0, np.inf)
@@ -418,14 +741,24 @@ def _build_l1a_targets(
     fit_vals = range_raw[fit]
     if fit_vals.size == 0:
         fit_vals = range_raw[np.isfinite(range_raw)]
-    range_clip, range_meta = _l1a_clip_upper(
-        fit_vals,
-        mode=clip_mode,
-        quantile_q=clip_q,
-        alpha=clip_alpha,
-        floor=1.0,
-        ceiling=8.0,
-    )
+    if _l1a_adaptive_range_clip_enabled():
+        range_clip, range_meta = _l1a_adaptive_range_norm_ceiling(fit_vals)
+        range_meta = {
+            **range_meta,
+            "adaptive_range_clip": True,
+            "legacy_clip_mode": clip_mode,
+            "legacy_clip_alpha": float(clip_alpha),
+        }
+    else:
+        range_clip, range_meta = _l1a_clip_upper(
+            fit_vals,
+            mode=clip_mode,
+            quantile_q=clip_q,
+            alpha=clip_alpha,
+            floor=1.0,
+            ceiling=8.0,
+        )
+        range_meta = {**range_meta, "adaptive_range_clip": False}
     range_norm = np.clip(range_raw, 0.0, range_clip)
     vol_forecast = _future_mean_by_symbol(range_norm, symbols, horizon=horizon)
     lag = int(os.environ.get("L1A_VOL_TREND_LAG", "5"))
@@ -570,6 +903,7 @@ class L1AMarketTCN(nn.Module):
         seq_len: int = SEQ_LEN,
         readout_type: str | None = None,
         min_attention_seq_len: int | None = None,
+        tcn_kernel_size: int | None = None,
         tcn_dropout: float | None = None,
         readout_dropout: float | None = None,
         head_dropout: float | None = None,
@@ -578,6 +912,7 @@ class L1AMarketTCN(nn.Module):
         super().__init__()
         if channels is None:
             channels = _l1a_tcn_channels()
+        ks = int(tcn_kernel_size) if tcn_kernel_size is not None else _l1a_tcn_kernel_size()
         td = float(tcn_dropout) if tcn_dropout is not None else _l1a_tcn_dropout()
         rd = float(readout_dropout) if readout_dropout is not None else _l1a_readout_dropout()
         hd_drop = float(head_dropout) if head_dropout is not None else _l1a_head_dropout()
@@ -587,10 +922,11 @@ class L1AMarketTCN(nn.Module):
             in_ch = input_dim if idx == 0 else channels[idx - 1]
             layers.append(
                 L1AGatedTemporalBlock(
-                    in_ch, out_ch, kernel_size=3, dilation=2**idx, dropout=td, use_se=use_se
+                    in_ch, out_ch, kernel_size=ks, dilation=2**idx, dropout=td, use_se=use_se
                 )
             )
         self.backbone = nn.Sequential(*layers)
+        self.tcn_kernel_size = ks
         self.shared_dim = channels[-1]
         self.seq_len = seq_len
         self.readout_type = (readout_type or _l1a_readout_type()).strip().lower()
@@ -686,14 +1022,25 @@ def _train_epoch(
     regime_loss: nn.Module,
     transition_loss: nn.Module,
     loss_weights: dict[str, float],
+    amp: L1aAmpSettings,
+    amp_scaler: GradScaler | None,
+    uw_module: L1aMultiTaskUncertaintyWeights | None = None,
+    regime_aux_coef: float | None = None,
+    persist_coef: float | None = None,
 ) -> float:
     model.train()
+    if uw_module is not None:
+        uw_module.train()
     total_loss = 0.0
     total_rows = 0
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
+    rac = float(_l1a_regime_aux_coef() if regime_aux_coef is None else regime_aux_coef)
+    pcoef = float(_l1a_transition_persist_coef() if persist_coef is None else persist_coef)
+    max_gn = float(os.environ.get("L1A_MAX_GRAD_NORM", "1.0"))
+    nb = _l1a_nb(device)
     it = loader
-    if _lgb_round_tqdm_enabled():
+    if _l1a_progress_tqdm_enabled():
         it = tqdm(
             loader,
             leave=False,
@@ -703,38 +1050,56 @@ def _train_epoch(
             unit="batch",
         )
     for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in it:
-        xb = xb.to(device)
-        y_regime = y_regime.to(device)
-        y_transition = y_transition.to(device)
-        y_vol = y_vol.to(device)
-        y_vol_trend = y_vol_trend.to(device)
-        y_time_ir = y_time_ir.to(device)
-        out = model(xb)
-        losses = {
-            "regime": regime_loss(out["regime_logits"], y_regime),
-            "regime_aux": regime_loss(out["base_regime_logits"], y_regime),
-            "vol": mse(out["vol_value"], y_vol),
-            "vol_trend": mse(out["vol_trend_value"], y_vol_trend),
-            "time_in_regime": mse(out["time_in_regime_value"], y_time_ir),
-            "embed_recon": mse(out["embed_recon"], out["shared_repr"].detach()),
-            "transition": transition_loss(out["transition_logit"], y_transition),
-            "state_persistence": bce(out["state_persistence_logit"], 1.0 - y_transition),
-        }
-        loss = (
-            loss_weights["regime"] * losses["regime"]
-            + 0.20 * loss_weights["regime"] * losses["regime_aux"]
-            + loss_weights["vol"] * losses["vol"]
-            + loss_weights["vol_trend"] * losses["vol_trend"]
-            + loss_weights["time_in_regime"] * losses["time_in_regime"]
-            + loss_weights["embed_recon"] * losses["embed_recon"]
-            + loss_weights["transition"] * losses["transition"]
-            + 0.35 * loss_weights["transition"] * losses["state_persistence"]
-        )
+        xb = xb.to(device, non_blocking=nb)
+        y_regime = y_regime.to(device, non_blocking=nb)
+        y_transition = y_transition.to(device, non_blocking=nb)
+        y_vol = y_vol.to(device, non_blocking=nb)
+        y_vol_trend = y_vol_trend.to(device, non_blocking=nb)
+        y_time_ir = y_time_ir.to(device, non_blocking=nb)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(os.environ.get("L1A_MAX_GRAD_NORM", "1.0")))
-        optimizer.step()
-        total_loss += float(loss.item()) * len(xb)
+        with _l1a_autocast(amp):
+            out = model(xb)
+            losses = {
+                "regime": regime_loss(out["regime_logits"], y_regime),
+                "regime_aux": regime_loss(out["base_regime_logits"], y_regime),
+                "vol": mse(out["vol_value"], y_vol),
+                "vol_trend": mse(out["vol_trend_value"], y_vol_trend),
+                "time_in_regime": mse(out["time_in_regime_value"], y_time_ir),
+                "embed_recon": mse(out["embed_recon"], out["shared_repr"].detach()),
+                "transition": transition_loss(out["transition_logit"], y_transition),
+                "state_persistence": bce(out["state_persistence_logit"], 1.0 - y_transition),
+            }
+            if uw_module is not None:
+                grouped = {
+                    "regime": losses["regime"],
+                    "transition": losses["transition"] + pcoef * losses["state_persistence"],
+                    "volatility": losses["vol"] + losses["vol_trend"] + losses["time_in_regime"],
+                    "embedding": losses["embed_recon"],
+                }
+                total_uw, _diag = uw_module.weighted_loss(grouped)
+                loss = total_uw + rac * loss_weights["regime"] * losses["regime_aux"]
+            else:
+                loss = (
+                    loss_weights["regime"] * losses["regime"]
+                    + rac * loss_weights["regime"] * losses["regime_aux"]
+                    + loss_weights["vol"] * losses["vol"]
+                    + loss_weights["vol_trend"] * losses["vol_trend"]
+                    + loss_weights["time_in_regime"] * losses["time_in_regime"]
+                    + loss_weights["embed_recon"] * losses["embed_recon"]
+                    + loss_weights["transition"] * losses["transition"]
+                    + pcoef * loss_weights["transition"] * losses["state_persistence"]
+                )
+        if amp_scaler is not None:
+            amp_scaler.scale(loss).backward()
+            amp_scaler.unscale_(optimizer)
+            _l1a_clip_grad_norm(model, uw_module, max_gn)
+            amp_scaler.step(optimizer)
+            amp_scaler.update()
+        else:
+            loss.backward()
+            _l1a_clip_grad_norm(model, uw_module, max_gn)
+            optimizer.step()
+        total_loss += float(loss.detach().item()) * len(xb)
         total_rows += len(xb)
     return total_loss / max(total_rows, 1)
 
@@ -747,14 +1112,32 @@ def _eval_epoch(
     regime_loss: nn.Module,
     transition_loss: nn.Module,
     loss_weights: dict[str, float],
-) -> float:
+    amp: L1aAmpSettings,
+    uw_module: L1aMultiTaskUncertaintyWeights | None = None,
+    val_metric: str = "legacy",
+    regime_aux_coef: float | None = None,
+    persist_coef: float | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Return (metric_for_early_stop, diagnostics)."""
     model.eval()
-    total_loss = 0.0
+    if uw_module is not None:
+        uw_module.eval()
     total_rows = 0
+    sum_legacy = 0.0
+    sum_regime = 0.0
+    sum_transition = 0.0
+    sum_vol = 0.0
+    sum_vt = 0.0
+    sum_tir = 0.0
+    sum_emb = 0.0
+    sum_uw = 0.0
     mse = nn.MSELoss()
     bce = nn.BCEWithLogitsLoss()
+    rac = float(_l1a_regime_aux_coef() if regime_aux_coef is None else regime_aux_coef)
+    pcoef = float(_l1a_transition_persist_coef() if persist_coef is None else persist_coef)
+    nb = _l1a_nb(device)
     it = loader
-    if _lgb_round_tqdm_enabled():
+    if _l1a_progress_tqdm_enabled():
         it = tqdm(
             loader,
             leave=False,
@@ -765,26 +1148,75 @@ def _eval_epoch(
         )
     with torch.no_grad():
         for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in it:
-            xb = xb.to(device)
-            y_regime = y_regime.to(device)
-            y_transition = y_transition.to(device)
-            y_vol = y_vol.to(device)
-            y_vol_trend = y_vol_trend.to(device)
-            y_time_ir = y_time_ir.to(device)
-            out = model(xb)
-            loss = (
-                loss_weights["regime"] * regime_loss(out["regime_logits"], y_regime)
-                + 0.20 * loss_weights["regime"] * regime_loss(out["base_regime_logits"], y_regime)
-                + loss_weights["vol"] * mse(out["vol_value"], y_vol)
-                + loss_weights["vol_trend"] * mse(out["vol_trend_value"], y_vol_trend)
-                + loss_weights["time_in_regime"] * mse(out["time_in_regime_value"], y_time_ir)
-                + loss_weights["embed_recon"] * mse(out["embed_recon"], out["shared_repr"].detach())
-                + loss_weights["transition"] * transition_loss(out["transition_logit"], y_transition)
-                + 0.35 * loss_weights["transition"] * bce(out["state_persistence_logit"], 1.0 - y_transition)
-            )
-            total_loss += float(loss.item()) * len(xb)
-            total_rows += len(xb)
-    return total_loss / max(total_rows, 1)
+            xb = xb.to(device, non_blocking=nb)
+            y_regime = y_regime.to(device, non_blocking=nb)
+            y_transition = y_transition.to(device, non_blocking=nb)
+            y_vol = y_vol.to(device, non_blocking=nb)
+            y_vol_trend = y_vol_trend.to(device, non_blocking=nb)
+            y_time_ir = y_time_ir.to(device, non_blocking=nb)
+            with _l1a_autocast(amp):
+                out = model(xb)
+                n = len(xb)
+                l_reg = regime_loss(out["regime_logits"], y_regime)
+                l_aux = regime_loss(out["base_regime_logits"], y_regime)
+                l_vol = mse(out["vol_value"], y_vol)
+                l_vt = mse(out["vol_trend_value"], y_vol_trend)
+                l_tir = mse(out["time_in_regime_value"], y_time_ir)
+                l_emb = mse(out["embed_recon"], out["shared_repr"].detach())
+                l_tr = transition_loss(out["transition_logit"], y_transition)
+                l_pers = bce(out["state_persistence_logit"], 1.0 - y_transition)
+                legacy = (
+                    loss_weights["regime"] * l_reg
+                    + rac * loss_weights["regime"] * l_aux
+                    + loss_weights["vol"] * l_vol
+                    + loss_weights["vol_trend"] * l_vt
+                    + loss_weights["time_in_regime"] * l_tir
+                    + loss_weights["embed_recon"] * l_emb
+                    + loss_weights["transition"] * l_tr
+                    + pcoef * loss_weights["transition"] * l_pers
+                )
+                sum_legacy += float(legacy.item()) * n
+                sum_regime += float(l_reg.item()) * n
+                sum_transition += float((l_tr + pcoef * l_pers).item()) * n
+                sum_vol += float(l_vol.item()) * n
+                sum_vt += float(l_vt.item()) * n
+                sum_tir += float(l_tir.item()) * n
+                sum_emb += float(l_emb.item()) * n
+                if uw_module is not None:
+                    grouped = {
+                        "regime": l_reg,
+                        "transition": l_tr + pcoef * l_pers,
+                        "volatility": l_vol + l_vt + l_tir,
+                        "embedding": l_emb,
+                    }
+                    uwt, _ = uw_module.weighted_loss(grouped)
+                    sum_uw += float((uwt + rac * loss_weights["regime"] * l_aux).item()) * n
+                total_rows += n
+    denom = max(total_rows, 1)
+    mean_legacy = sum_legacy / denom
+    g_reg = max(sum_regime / denom, 1e-8)
+    g_tr = max(sum_transition / denom, 1e-8)
+    g_vol = max((sum_vol + sum_vt + sum_tir) / denom, 1e-8)
+    g_emb = max(sum_emb / denom, 1e-8)
+    geom = float(math.exp(0.25 * (math.log(g_reg) + math.log(g_tr) + math.log(g_vol) + math.log(g_emb))))
+    mean_uw = sum_uw / denom if uw_module is not None else mean_legacy
+    vm = val_metric if uw_module is not None else "legacy"
+    if vm == "uw_total" and uw_module is not None:
+        stop = mean_uw
+    elif vm == "geom" and uw_module is not None:
+        stop = geom
+    else:
+        stop = mean_legacy
+    diag = {
+        "val_legacy_weighted": float(mean_legacy),
+        "val_geom_raw_groups": float(geom),
+        "val_uw_total": float(mean_uw),
+        "val_mean_regime_ce": float(sum_regime / denom),
+        "val_mean_transition_group": float(sum_transition / denom),
+        "val_mean_volatility_sum": float((sum_vol + sum_vt + sum_tir) / denom),
+        "val_mean_embed_mse": float(sum_emb / denom),
+    }
+    return float(stop), diag
 
 
 def _l1a_early_stop_best_epoch(
@@ -794,6 +1226,7 @@ def _l1a_early_stop_best_epoch(
     n_feat: int,
     embed_dim: int,
     channels: list[int],
+    tcn_kernel_size: int,
     tcn_dropout: float,
     readout_dropout: float,
     head_dropout: float,
@@ -808,19 +1241,25 @@ def _l1a_early_stop_best_epoch(
     patience: int,
     min_delta: float,
     desc: str,
+    use_uw: bool,
+    uw_val_metric: str,
+    amp: L1aAmpSettings,
 ) -> int:
+    amp_scaler = GradScaler(amp.device_type) if (amp.enabled and amp.dtype == torch.float16) else None
     model = L1AMarketTCN(
         n_feat,
         channels=channels,
         seq_len=SEQ_LEN,
         readout_type=_l1a_readout_type(),
         min_attention_seq_len=_l1a_min_attention_seq_len(),
+        tcn_kernel_size=tcn_kernel_size,
         tcn_dropout=tcn_dropout,
         readout_dropout=readout_dropout,
         head_dropout=head_dropout,
         embed_dim=embed_dim,
     ).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    uw = _l1a_build_uw_module(DEVICE, loss_weights) if use_uw else None
+    optimizer = _l1a_optimizer(model, uw, lr, wd)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
     best_val = float("inf")
     stale = 0
@@ -831,7 +1270,8 @@ def _l1a_early_stop_best_epoch(
         unit="ep",
         leave=False,
         file=TQDM_FILE,
-        disable=not _lgb_round_tqdm_enabled(),
+        mininterval=0.3,
+        disable=not _l1a_progress_tqdm_enabled(),
     )
     for epoch in epoch_bar:
         tr_loss = _train_epoch(
@@ -842,20 +1282,31 @@ def _l1a_early_stop_best_epoch(
             regime_loss=regime_loss,
             transition_loss=transition_loss,
             loss_weights=loss_weights,
+            amp=amp,
+            amp_scaler=amp_scaler,
+            uw_module=uw,
         )
-        va_loss = _eval_epoch(
+        va_stop, va_diag = _eval_epoch(
             model,
             val_dl,
             DEVICE,
             regime_loss=regime_loss,
             transition_loss=transition_loss,
             loss_weights=loss_weights,
+            amp=amp,
+            uw_module=uw,
+            val_metric=uw_val_metric if use_uw else "legacy",
         )
         scheduler.step()
         if hasattr(epoch_bar, "set_postfix"):
-            epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
-        if va_loss < (best_val - min_delta):
-            best_val = va_loss
+            epoch_bar.set_postfix(
+                train=f"{tr_loss:.4f}",
+                val=f"{va_stop:.4f}",
+                leg=f"{va_diag.get('val_legacy_weighted', 0):.4f}",
+                refresh=False,
+            )
+        if va_stop < (best_val - min_delta):
+            best_val = va_stop
             best_ep = epoch + 1
             stale = 0
         else:
@@ -913,7 +1364,14 @@ def _l1a_transition_val_block(
             print(f"    (skip transition quintile lift table: {ex})", flush=True)
 
 
-def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.device, *, label: str) -> None:
+def _log_l1a_val_metrics(
+    model: L1AMarketTCN,
+    val_dl: DataLoader,
+    device: torch.device,
+    *,
+    label: str,
+    amp: L1aAmpSettings,
+) -> None:
     """Validation report for regime calibration, transition event quality, vol regression, and embed stability."""
     model.eval()
     y_true_r: list[np.ndarray] = []
@@ -928,15 +1386,17 @@ def _log_l1a_val_metrics(model: L1AMarketTCN, val_dl: DataLoader, device: torch.
     tr_t, tr_s = [], []
     persist_s: list[np.ndarray] = []
     emb_mse: list[np.ndarray] = []
+    nb = _l1a_nb(device)
     with torch.no_grad():
         for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in val_dl:
-            xb = xb.to(device)
-            y_regime = y_regime.to(device)
-            y_transition = y_transition.to(device)
-            y_vol = y_vol.to(device)
-            y_vol_trend = y_vol_trend.to(device)
-            y_time_ir = y_time_ir.to(device)
-            out = model(xb)
+            xb = xb.to(device, non_blocking=nb)
+            y_regime = y_regime.to(device, non_blocking=nb)
+            y_transition = y_transition.to(device, non_blocking=nb)
+            y_vol = y_vol.to(device, non_blocking=nb)
+            y_vol_trend = y_vol_trend.to(device, non_blocking=nb)
+            y_time_ir = y_time_ir.to(device, non_blocking=nb)
+            with _l1a_autocast(amp):
+                out = model(xb)
             y_true_r.append(y_regime.detach().cpu().numpy())
             regime_prob = torch.softmax(out["regime_logits"], dim=1)
             y_prob_r.append(regime_prob.detach().cpu().numpy())
@@ -1076,6 +1536,8 @@ def materialize_l1a_outputs(
     device: torch.device,
     embed_dim: int | None = None,
     cold_vol_default: float | None = None,
+    vol_forecast_clip_hi: float | None = None,
+    amp: L1aAmpSettings | None = None,
 ) -> pd.DataFrame:
     X = df[feature_cols].to_numpy(dtype=np.float32, copy=False)
     X = np.nan_to_num((X - mean) / std, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -1112,22 +1574,26 @@ def materialize_l1a_outputs(
         "batch_size": infer_bs,
         "shuffle": False,
         "num_workers": infer_workers,
-        "pin_memory": DEVICE.type == "cuda",
+        "pin_memory": device.type == "cuda",
     }
     if infer_workers > 0:
         dl_kwargs["persistent_workers"] = True
+        dl_kwargs["prefetch_factor"] = max(2, int(os.environ.get("L1A_PREFETCH_FACTOR", "4")))
     dl = DataLoader(ds, **dl_kwargs)
     dl_it = dl
-    if _lgb_round_tqdm_enabled():
+    if _l1a_progress_tqdm_enabled():
         dl_it = tqdm(dl, desc="[L1a] materialize outputs", file=TQDM_FILE, mininterval=0.3, unit="batch")
     regime_rows: list[np.ndarray] = []
     scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol", "vol_trend", "time_ir", "persistence"]}
     embeds: list[np.ndarray] = []
+    amp_m = amp if amp is not None else _l1a_build_amp(device)[0]
+    nb = _l1a_nb(device)
     model.eval()
     with torch.no_grad():
         for (xb,) in dl_it:
-            xb = xb.to(device)
-            out = model(xb)
+            xb = xb.to(device, non_blocking=nb)
+            with _l1a_autocast(amp_m):
+                out = model(xb)
             regime_rows.append(torch.softmax(out["regime_logits"], dim=1).cpu().numpy())
             scalar_rows["transition"].append(torch.sigmoid(out["transition_logit"]).cpu().numpy())
             scalar_rows["vol"].append(out["vol_value"].cpu().numpy())
@@ -1142,7 +1608,10 @@ def materialize_l1a_outputs(
     regime = np.concatenate(regime_rows, axis=0)
     outputs.loc[end_idx, L1A_REGIME_COLS] = regime
     outputs.loc[end_idx, "l1a_transition_risk"] = np.concatenate(scalar_rows["transition"], axis=0)
-    outputs.loc[end_idx, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, 5.0)
+    v_hi = float(vol_forecast_clip_hi) if vol_forecast_clip_hi is not None and np.isfinite(float(vol_forecast_clip_hi)) else float(
+        os.environ.get("L1A_VOL_FORECAST_MATERIALIZE_MAX", "5.0")
+    )
+    outputs.loc[end_idx, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, v_hi)
     outputs.loc[end_idx, "l1a_vol_trend"] = np.concatenate(scalar_rows["vol_trend"], axis=0)
     outputs.loc[end_idx, "l1a_time_in_regime"] = np.clip(
         _inverse_time_in_regime_target(np.concatenate(scalar_rows["time_ir"], axis=0)), 0.0, 1.0
@@ -1169,8 +1638,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     feature_cols = _select_l1a_feature_cols(work, feat_cols)
     splits = build_stack_time_splits(work["time_key"])
     l1_fit_mask = np.asarray(splits.train_mask | splits.cal_mask, dtype=bool)
-    n_l1_oof = l1_oof_folds_from_env()
-    norm_mask = l1_fit_mask if n_l1_oof >= 2 else splits.train_mask
+    n_l1_oof_req = l1_oof_folds_from_env()
+    norm_mask = l1_fit_mask if n_l1_oof_req >= 2 else splits.train_mask
     l2_vs = l2_val_start_time()
     Xn, mean, std = _normalize_l1a_matrix(work, feature_cols, norm_mask)
     norm_df = pd.concat([work[["symbol", "time_key"]], pd.DataFrame(Xn, columns=feature_cols)], axis=1)
@@ -1179,15 +1648,40 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         raise RuntimeError("L1a: no valid sequence windows were created.")
 
     targets, clip_meta = _build_l1a_targets(work, fit_mask=norm_mask)
+    raw_sl = pd.to_numeric(work["state_label"], errors="coerce")
+    state_label_missing_rate = float(raw_sl.isna().mean()) if len(raw_sl) else 0.0
+    print(f"  [L1a] state_label missing rate (pre-imputation in targets): {state_label_missing_rate:.4%}", flush=True)
+    if state_label_missing_rate > 0.10:
+        print(
+            "  [L1a][warn] state_label missing > 10%; check labels — unknown regime class used for NaNs.",
+            flush=True,
+        )
+    if _l1a_adaptive_vol_forecast_clip_enabled():
+        vol_forecast_clip_hi, vol_mat_clip_meta = _l1a_compute_vol_forecast_materialize_clip(
+            targets["vol_forecast"][norm_mask]
+        )
+    else:
+        vol_forecast_clip_hi = float(os.environ.get("L1A_VOL_FORECAST_MATERIALIZE_MAX", "5.0"))
+        vol_mat_clip_meta = {"clip_upper": vol_forecast_clip_hi, "fixed": True, "adaptive_disabled": True}
+    print(
+        f"  [L1a] vol_forecast materialize clip hi={vol_forecast_clip_hi:.4f} ({vol_mat_clip_meta.get('statistical_principle', 'fixed')})",
+        flush=True,
+    )
     window_train = splits.train_mask[end_idx]
     window_cal = splits.cal_mask[end_idx]
     window_val = splits.l2_val_mask[end_idx]
     window_pool = l1_fit_mask[end_idx]
     n_w = len(end_idx)
+    n_l1_oof = int(n_l1_oof_req)
+    oof_cap_message = ""
+    if n_l1_oof >= 2 and _l1_oof_auto_cap_enabled():
+        n_l1_oof, oof_cap_message = _l1a_cap_oof_folds(n_l1_oof, int(window_pool.sum()))
+        if oof_cap_message:
+            print(f"  [L1a] {oof_cap_message}", flush=True)
     if n_l1_oof >= 2:
         print(
-            f"  [L1a] blocked time OOF: L1_OOF_FOLDS={n_l1_oof} on train+cal window ends (t < {CAL_END}) "
-            f"(set L1_OOF_FOLDS=1 for legacy train vs l2_val [{l2_vs}, {CAL_END}))",
+            f"  [L1a] blocked time OOF: L1_OOF_FOLDS={n_l1_oof} (requested={n_l1_oof_req}) on train+cal window ends (t < {CAL_END}) "
+            f"(set L1_OOF_FOLDS=1 for legacy train vs l2_val [{l2_vs}, {CAL_END}); L1_OOF_AUTO_CAP=0 to disable capping)",
             flush=True,
         )
         if not window_pool.any():
@@ -1220,7 +1714,11 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     )
     val_ds = TensorDataset(*[tensor[window_val_report] for tensor in ds.tensors])
     cal_ds = TensorDataset(*[tensor[window_cal] for tensor in ds.tensors])
-    batch_size = 512 if FAST_TRAIN_MODE else 1024
+    bs_raw = os.environ.get("L1A_BATCH_SIZE", "").strip()
+    if bs_raw:
+        batch_size = max(32, int(bs_raw))
+    else:
+        batch_size = 512 if FAST_TRAIN_MODE else 1024
     loader_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
     pin_memory = DEVICE.type == "cuda"
     loader_kwargs: dict[str, Any] = {
@@ -1230,8 +1728,16 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     }
     if loader_workers > 0:
         loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = max(2, int(os.environ.get("L1A_PREFETCH_FACTOR", "4")))
     val_dl = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     cal_dl = DataLoader(cal_ds, shuffle=False, **loader_kwargs)
+    n_feat_l1a = len(feature_cols)
+    seq_steps_per_batch = int(batch_size) * int(SEQ_LEN)
+    print(
+        f"  [L1a] batch_size={batch_size}  (~{seq_steps_per_batch:,} seq steps/batch = batch×seq_len, "
+        f"×{n_feat_l1a} feats); smaller L1A_BATCH_SIZE → noisier gradients, larger → smoother",
+        flush=True,
+    )
 
     embed_dim = _l1a_embed_dim()
     log_w_tr = window_pool if n_l1_oof >= 2 else window_train
@@ -1297,19 +1803,92 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     hd_drop = _l1a_head_dropout()
     lr = float(os.environ.get("L1A_LR", "5e-4"))
     wd = float(os.environ.get("L1A_WEIGHT_DECAY", "1e-3"))
-    T0 = max(1, int(os.environ.get("L1A_COS_T0", "5")))
     Tm = max(1, int(os.environ.get("L1A_COS_T_MULT", "2")))
     max_epochs = max(4, int(os.environ.get("L1A_MAX_EPOCHS", "8" if FAST_TRAIN_MODE else "18")))
+    t0_env = os.environ.get("L1A_COS_T0", "").strip()
+    cos_auto = os.environ.get("L1A_COS_AUTO", "1").strip().lower() in {"1", "true", "yes"}
+    if t0_env:
+        T0 = max(1, int(t0_env))
+        t0_source = "env"
+    elif cos_auto:
+        T0 = max(2, max_epochs // (1 + Tm))
+        t0_source = f"auto(max_epochs//(1+T_mult)={max_epochs}//{1 + Tm})"
+    else:
+        T0 = 5
+        t0_source = "default_fixed"
+    span_first_two = T0 + T0 * Tm
+    if span_first_two > max_epochs:
+        print(
+            f"  [L1a][warn] CosineAnnealingWarmRestarts: T0={T0} T_mult={Tm} → first two segments span {span_first_two} epochs "
+            f"> max_epochs={max_epochs}; increase L1A_MAX_EPOCHS or lower L1A_COS_T0 (L1A_COS_AUTO=1 uses T0=max(2, max_epochs//(1+T_mult))).",
+            flush=True,
+        )
+    elif max_epochs < T0 * (1 + Tm + Tm * Tm) and not FAST_TRAIN_MODE:
+        print(
+            f"  [L1a] cosine: T0={T0} T_mult={Tm} max_epochs={max_epochs} (T0 from {t0_source}); "
+            f"third restart cycle would need ~{T0 + T0 * Tm + T0 * Tm * Tm} epochs to complete.",
+            flush=True,
+        )
     patience = max(2, int(os.environ.get("L1A_PATIENCE", "4" if FAST_TRAIN_MODE else "6")))
     min_delta = float(os.environ.get("L1A_EARLY_STOP_MIN_DELTA", "5e-4"))
     l1_final_epochs_after_oof: int | None = None
+
+    tcn_ks = _l1a_tcn_kernel_size()
+    rf_steps = _l1a_tcn_receptive_field_steps(n_layers=len(ch), kernel_size=tcn_ks)
+    print(
+        f"  [L1a] TCN stack: channels={ch}  kernel={tcn_ks}  "
+        f"dilations=1..2^{len(ch) - 1}  receptive_field~{rf_steps} steps / seq_len={SEQ_LEN} "
+        f"({100.0 * rf_steps / max(SEQ_LEN, 1):.1f}% of sequence)",
+        flush=True,
+    )
+
+    use_uw = _l1a_use_uncertainty_weighting()
+    uw_val_metric = _l1a_uw_val_metric()
+    uw_for_meta: L1aMultiTaskUncertaintyWeights | None = None
+    if use_uw:
+        print(
+            f"  [L1a] uncertainty weighting ON (Kendall); val early-stop metric={uw_val_metric!r}  "
+            f"aux regime_coef={_l1a_regime_aux_coef():g}  persist_coef={_l1a_transition_persist_coef():g}  "
+            f"uw_lr_ratio={_l1a_uw_lr_ratio():g}",
+            flush=True,
+        )
+
+    l1a_amp, l1a_train_scaler = _l1a_build_amp(DEVICE)
+    if l1a_amp.enabled:
+        if _l1a_is_macos() and l1a_amp.device_type == "mps":
+            print(
+                f"  [L1a] AMP: macOS MPS float16 autocast (fixed on this platform; GradScaler=n/a)",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [L1a] AMP: dtype={l1a_amp.dtype}  GradScaler={'on' if l1a_train_scaler is not None else 'off (bf16)'}  "
+                f"(CUDA: L1A_AMP_DTYPE=auto|fp16|bf16)",
+                flush=True,
+            )
+    else:
+        print(
+            "  [L1a] AMP off — Apple Silicon + MPS uses float16 autocast automatically; CUDA needs L1A_AMP=1",
+            flush=True,
+        )
 
     if n_l1_oof >= 2:
         w_pool_idx = np.flatnonzero(window_pool)
         tk_sub = work["time_key"].to_numpy()[end_idx[w_pool_idx]]
         fold_masks = time_blocked_fold_masks(tk_sub, np.ones(len(w_pool_idx), bool), n_l1_oof, context="L1a OOF")
         best_eps: list[int] = []
-        for fk, (tr_sub, va_sub) in enumerate(fold_masks):
+        fold_loops = list(enumerate(fold_masks))
+        if _l1a_progress_tqdm_enabled():
+            fold_loops = tqdm(
+                fold_loops,
+                total=len(fold_masks),
+                desc="[L1a] OOF folds",
+                unit="fold",
+                leave=True,
+                file=TQDM_FILE,
+                mininterval=0.5,
+            )
+        for fk, (tr_sub, va_sub) in fold_loops:
             w_tr_f = np.zeros(n_w, dtype=bool)
             w_va_f = np.zeros(n_w, dtype=bool)
             w_tr_f[w_pool_idx[tr_sub]] = True
@@ -1326,6 +1905,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 n_feat=len(feature_cols),
                 embed_dim=embed_dim,
                 channels=ch,
+                tcn_kernel_size=tcn_ks,
                 tcn_dropout=td,
                 readout_dropout=rd,
                 head_dropout=hd_drop,
@@ -1340,6 +1920,9 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 patience=patience,
                 min_delta=min_delta,
                 desc=f"[L1a] oof {fk + 1}/{n_l1_oof}",
+                use_uw=use_uw,
+                uw_val_metric=uw_val_metric,
+                amp=l1a_amp,
             )
             best_eps.append(be)
             print(f"  [L1a] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
@@ -1356,16 +1939,19 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             seq_len=SEQ_LEN,
             readout_type=_l1a_readout_type(),
             min_attention_seq_len=_l1a_min_attention_seq_len(),
+            tcn_kernel_size=tcn_ks,
             tcn_dropout=td,
             readout_dropout=rd,
             head_dropout=hd_drop,
             embed_dim=embed_dim,
         ).to(DEVICE)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        model = _l1a_maybe_compile(model)
+        uw_final = _l1a_build_uw_module(DEVICE, loss_weights) if use_uw else None
+        optimizer = _l1a_optimizer(model, uw_final, lr, wd)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
         print(
             f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
-            f"tcn_channels={ch}  tcn_dropout={td}  "
+            f"tcn_kernel={model.tcn_kernel_size}  tcn_channels={ch}  tcn_dropout={td}  "
             f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
             f"final_epochs={nr} (OOF median)  loss_weights={loss_weights}",
             flush=True,
@@ -1376,7 +1962,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             unit="ep",
             leave=True,
             file=TQDM_FILE,
-            disable=not _lgb_round_tqdm_enabled(),
+            mininterval=0.3,
+            disable=not _l1a_progress_tqdm_enabled(),
         )
         for epoch in epoch_bar:
             tr_loss = _train_epoch(
@@ -1387,11 +1974,15 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 regime_loss=regime_loss,
                 transition_loss=transition_loss,
                 loss_weights=loss_weights,
+                amp=l1a_amp,
+                amp_scaler=l1a_train_scaler,
+                uw_module=uw_final,
             )
             scheduler.step()
             if hasattr(epoch_bar, "set_postfix"):
                 epoch_bar.set_postfix(train=f"{tr_loss:.4f}", refresh=False)
             print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f}", flush=True)
+        uw_for_meta = uw_final
     else:
         regime_loss = _l1a_regime_loss(targets["regime"][end_idx][window_train], device=DEVICE)
         transition_loss = _l1a_transition_loss(targets["transition_risk"][end_idx][window_train], device=DEVICE)
@@ -1403,14 +1994,18 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             seq_len=SEQ_LEN,
             readout_type=_l1a_readout_type(),
             min_attention_seq_len=_l1a_min_attention_seq_len(),
+            tcn_kernel_size=tcn_ks,
             tcn_dropout=td,
             readout_dropout=rd,
             head_dropout=hd_drop,
             embed_dim=embed_dim,
         ).to(DEVICE)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        model = _l1a_maybe_compile(model)
+        uw = _l1a_build_uw_module(DEVICE, loss_weights) if use_uw else None
+        optimizer = _l1a_optimizer(model, uw, lr, wd)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
         best_state: dict[str, torch.Tensor] | None = None
+        best_uw_state: dict[str, torch.Tensor] | None = None
         best_val = float("inf")
         stale = 0
         epoch_bar = trange(
@@ -1419,11 +2014,12 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             unit="ep",
             leave=True,
             file=TQDM_FILE,
-            disable=not _lgb_round_tqdm_enabled(),
+            mininterval=0.3,
+            disable=not _l1a_progress_tqdm_enabled(),
         )
         print(
             f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
-            f"tcn_channels={ch}  tcn_dropout={td}  "
+            f"tcn_kernel={model.tcn_kernel_size}  tcn_channels={ch}  tcn_dropout={td}  "
             f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
             f"max_epochs={max_epochs}  patience={patience}  min_delta={min_delta:g}  loss_weights={loss_weights}",
             flush=True,
@@ -1437,22 +2033,39 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 regime_loss=regime_loss,
                 transition_loss=transition_loss,
                 loss_weights=loss_weights,
+                amp=l1a_amp,
+                amp_scaler=l1a_train_scaler,
+                uw_module=uw,
             )
-            va_loss = _eval_epoch(
+            va_stop, va_diag = _eval_epoch(
                 model,
                 val_dl,
                 DEVICE,
                 regime_loss=regime_loss,
                 transition_loss=transition_loss,
                 loss_weights=loss_weights,
+                amp=l1a_amp,
+                uw_module=uw,
+                val_metric=uw_val_metric if use_uw else "legacy",
             )
             scheduler.step()
             if hasattr(epoch_bar, "set_postfix"):
-                epoch_bar.set_postfix(train=f"{tr_loss:.4f}", val=f"{va_loss:.4f}", refresh=False)
-            print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f}", flush=True)
-            if va_loss < (best_val - min_delta):
-                best_val = va_loss
+                epoch_bar.set_postfix(
+                    train=f"{tr_loss:.4f}",
+                    val=f"{va_stop:.4f}",
+                    leg=f"{va_diag.get('val_legacy_weighted', 0):.4f}",
+                    refresh=False,
+                )
+            print(
+                f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_stop={va_stop:.4f} "
+                f"val_legacy={va_diag.get('val_legacy_weighted', 0):.4f}",
+                flush=True,
+            )
+            if va_stop < (best_val - min_delta):
+                best_val = va_stop
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                if uw is not None:
+                    best_uw_state = {k: v.detach().cpu().clone() for k, v in uw.state_dict().items()}
                 stale = 0
             else:
                 stale += 1
@@ -1461,10 +2074,19 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         if best_state is None:
             raise RuntimeError("L1a: training failed to produce a checkpoint.")
         model.load_state_dict(best_state)
+        if uw is not None and best_uw_state is not None:
+            uw.load_state_dict(best_uw_state)
+        uw_for_meta = uw
 
-    _log_l1a_val_metrics(model, val_dl, DEVICE, label="fit_report" if n_l1_oof >= 2 else "l2_val")
-    if window_cal.sum() != window_val_report.sum():
-        _log_l1a_val_metrics(model, cal_dl, DEVICE, label="cal_full")
+    _log_l1a_val_metrics(
+        model, val_dl, DEVICE, label="fit_report" if n_l1_oof >= 2 else "l2_val", amp=l1a_amp
+    )
+    if window_cal.sum() != window_val_report.sum() and os.environ.get("L1A_SKIP_CAL_FULL_METRICS", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        _log_l1a_val_metrics(model, cal_dl, DEVICE, label="cal_full", amp=l1a_amp)
 
     _tr_m = np.asarray(l1_fit_mask if n_l1_oof >= 2 else splits.train_mask, dtype=bool)
     _atr_tr = pd.to_numeric(work["lbl_atr"], errors="coerce").to_numpy(dtype=np.float64)
@@ -1481,9 +2103,32 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         device=DEVICE,
         embed_dim=model.embed_dim,
         cold_vol_default=lbl_atr_median_train,
+        vol_forecast_clip_hi=vol_forecast_clip_hi,
+        amp=l1a_amp,
     )
     os.makedirs(MODEL_DIR, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(MODEL_DIR, L1A_MODEL_FILE))
+    torch.save(_l1a_state_dict_for_save(model), os.path.join(MODEL_DIR, L1A_MODEL_FILE))
+    if uw_for_meta is not None:
+        uw_meta: dict[str, Any] = {
+            "enabled": True,
+            "val_metric": str(uw_val_metric),
+            "regime_aux_coef": float(_l1a_regime_aux_coef()),
+            "persistence_coef": float(_l1a_transition_persist_coef()),
+            "uw_lr_ratio": float(_l1a_uw_lr_ratio()),
+            "task_groups": dict(L1aMultiTaskUncertaintyWeights.TASK_TYPES),
+            "final_log_vars": {
+                n: float(uw_for_meta.log_vars[n].detach().item()) for n in L1aMultiTaskUncertaintyWeights.TASK_ORDER
+            },
+            "final_eff_weights": {
+                n: float(torch.exp(-uw_for_meta.log_vars[n]).detach().item())
+                for n in L1aMultiTaskUncertaintyWeights.TASK_ORDER
+            },
+            "init_from_loss_weights": bool(
+                not os.environ.get("L1A_UW_INIT_FROM_WEIGHTS", "1").strip().lower() in {"0", "false", "no"}
+            ),
+        }
+    else:
+        uw_meta = {"enabled": False}
     meta = {
         "schema_version": L1A_SCHEMA_VERSION,
         "feature_cols": feature_cols,
@@ -1508,13 +2153,22 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "l1a_state_arch": "tcn_plus_state_structure_decoder",
         "loss_weights": loss_weights,
         "tcn_channels": list(ch),
+        "l1a_tcn_kernel_size": int(tcn_ks),
+        "l1a_tcn_receptive_field_steps": int(rf_steps),
         "tcn_dropout": float(td),
         "readout_dropout": float(rd),
         "head_dropout": float(hd_drop),
         "l1a_lr": float(lr),
         "l1a_weight_decay": float(wd),
         "l1a_cosine_T0": int(T0),
+        "l1a_cosine_T0_source": str(t0_source),
         "l1a_cosine_T_mult": int(Tm),
+        "l1a_cos_auto": bool(cos_auto),
+        "l1a_batch_size": int(batch_size),
+        "l1a_amp_enabled": bool(l1a_amp.enabled),
+        "l1a_amp_dtype": str(l1a_amp.dtype) if l1a_amp.enabled else "float32",
+        "l1a_torch_compile": os.environ.get("L1A_TORCH_COMPILE", "0").strip().lower() in {"1", "true", "yes"},
+        "l1a_seq_steps_per_batch": int(seq_steps_per_batch),
         "l1a_max_epochs": int(max_epochs),
         "l1a_patience": int(patience),
         "l1a_early_stop_min_delta": float(min_delta),
@@ -1527,8 +2181,19 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         },
         "lbl_atr_median_train": float(lbl_atr_median_train),
         "l1_oof_folds": int(n_l1_oof),
+        "l1_oof_folds_requested": int(n_l1_oof_req),
+        "l1_oof_auto_cap": bool(_l1_oof_auto_cap_enabled()),
+        "l1_oof_min_windows_per_fold": max(200, int(os.environ.get("L1_OOF_MIN_WINDOWS_PER_FOLD", "4000"))),
+        "l1_oof_cap_note": str(oof_cap_message),
         "l1_oof_enabled": bool(n_l1_oof >= 2),
         "l1_final_epochs_after_oof": l1_final_epochs_after_oof,
+        "uncertainty_weighting": uw_meta,
+        "state_label_missing_rate": float(state_label_missing_rate),
+        "unknown_regime_class_id": int(UNKNOWN_REGIME_CLASS_ID),
+        "l1a_unknown_regime_class_weight": float(os.environ.get("L1A_UNKNOWN_REGIME_CLASS_WEIGHT", "0.3")),
+        "l1a_vol_forecast_clip_hi": float(vol_forecast_clip_hi),
+        "l1a_vol_forecast_clip_meta": dict(vol_mat_clip_meta),
+        "l1a_max_extra_features": max(0, int(os.environ.get("L1A_MAX_EXTRA_FEATURES", "20"))),
     }
     adaptive_min_samples = int(os.environ.get("ADAPTIVE_THRESHOLD_MIN_SAMPLES", "500"))
     fit_n = int(np.sum(np.asarray(norm_mask, dtype=bool)))
@@ -1629,12 +2294,14 @@ def load_l1a_market_encoder() -> tuple[L1AMarketTCN, dict[str, Any]]:
     rd = float(meta.get("readout_dropout", 0.10))
     hd_drop = float(meta.get("head_dropout", 0.1))
     embed_dim = int(meta.get("embed_dim", _l1a_embed_dim()))
+    tcn_ks_load = int(meta.get("l1a_tcn_kernel_size", 3))
     model = L1AMarketTCN(
         len(feature_cols),
         channels=ch,
         seq_len=int(meta.get("seq_len", SEQ_LEN)),
         readout_type=str(meta.get("readout_type", _l1a_readout_type())),
         min_attention_seq_len=int(meta.get("min_attention_seq_len", _l1a_min_attention_seq_len())),
+        tcn_kernel_size=tcn_ks_load,
         tcn_dropout=td,
         readout_dropout=rd,
         head_dropout=hd_drop,
@@ -1664,6 +2331,8 @@ def infer_l1a_market_encoder(model: L1AMarketTCN, meta: dict[str, Any], df: pd.D
     seq_len = int(meta.get("seq_len", SEQ_LEN))
     cold_raw = meta.get("lbl_atr_median_train")
     cold_vol = float(cold_raw) if cold_raw is not None and np.isfinite(float(cold_raw)) else None
+    vraw = meta.get("l1a_vol_forecast_clip_hi")
+    vclip = float(vraw) if vraw is not None and np.isfinite(float(vraw)) else None
     return materialize_l1a_outputs(
         model,
         work,
@@ -1674,4 +2343,5 @@ def infer_l1a_market_encoder(model: L1AMarketTCN, meta: dict[str, Any], df: pd.D
         device=DEVICE,
         embed_dim=model.embed_dim,
         cold_vol_default=cold_vol,
+        vol_forecast_clip_hi=vclip,
     )

@@ -5,7 +5,7 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data")
 LABELED_SUFFIX = os.environ.get("LABELED_SUFFIX", "_labeled_v2")
 
-NUM_REGIME_CLASSES = 6
+NUM_REGIME_CLASSES = 7
 STATE_NAMES: dict[int, str] = {
     0: "bull_conv",
     1: "bull_div",
@@ -13,8 +13,18 @@ STATE_NAMES: dict[int, str] = {
     3: "bear_div",
     4: "range_conv",
     5: "range_div",
+    6: "unknown",
 }
-REGIME_NOW_PROB_COLS = ["bull_conv", "bull_div", "bear_conv", "bear_div", "range_conv", "range_div"]
+REGIME_NOW_PROB_COLS = [
+    "bull_conv",
+    "bull_div",
+    "bear_conv",
+    "bear_div",
+    "range_conv",
+    "range_div",
+    "unknown",
+]
+UNKNOWN_REGIME_CLASS_ID = NUM_REGIME_CLASSES - 1
 REGIME_PROB_COLS = REGIME_NOW_PROB_COLS
 RANGE_REGIME_INDICES = [4, 5]
 
@@ -76,10 +86,10 @@ PA_STATE_FEATURES = [
 REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
 
 # New dual-view stack schema versions
-L1A_SCHEMA_VERSION = "1.19.0"
-L1B_SCHEMA_VERSION = "1.17.0"
-L2_SCHEMA_VERSION = "1.36.0"
-L3_SCHEMA_VERSION = "1.18.1"
+L1A_SCHEMA_VERSION = "1.20.0"
+L1B_SCHEMA_VERSION = "1.18.0"
+L2_SCHEMA_VERSION = "1.37.0"
+L3_SCHEMA_VERSION = "1.19.0"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"

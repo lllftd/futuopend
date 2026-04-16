@@ -1,4 +1,5 @@
 from core.trainers.l3.train import (
+    l3_cox_covariate_names_from_features,
     L3ExitInferenceState,
     l3_entry_policy_params,
     l3_entry_side_from_l2,
@@ -17,6 +18,7 @@ from core.trainers.l3.trajectory import (
 )
 
 __all__ = [
+    "l3_cox_covariate_names_from_features",
     "L3ExitInferenceState",
     "L3TrajRollingState",
     "L3TrajectoryConfig",

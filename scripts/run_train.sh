@@ -6,6 +6,7 @@
 #   layer1c — prepared dataset cache + train L1c only
 #   layer2 — load l1a + l1b caches, train L2 → L3
 #   layer3 — load l1a + l2 caches, train L3 only
+#   Note: L3_TRAJ_GRU=1 requires L3_OOF_FOLDS=1 (default OOF folds disable fold-wise GRU).
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,37 +23,11 @@ fi
 
 echo "================================================================="
 echo "  Starting Dual-View Training Pipeline from: $START_LAYER"
-echo "  Logs (overwrite for stages that run, under $ROOT/logs/):"
+echo "  Layer logs (fixed paths under $ROOT/logs/, opened per stage by train_pipeline):"
 echo "    layer1a.log layer1b.log layer1c.log layer2.log layer3.log"
 echo "================================================================="
 
 mkdir -p "$ROOT/logs"
-# Pre-create log files so `tail -f` works immediately (only stages that will run).
-case "$START_LAYER" in
-  layer1|layer1a)
-    : > "$ROOT/logs/layer1a.log"
-    : > "$ROOT/logs/layer1b.log"
-    : > "$ROOT/logs/layer1c.log"
-    : > "$ROOT/logs/layer2.log"
-    : > "$ROOT/logs/layer3.log"
-    ;;
-  layer1b)
-    : > "$ROOT/logs/layer1b.log"
-    : > "$ROOT/logs/layer1c.log"
-    : > "$ROOT/logs/layer2.log"
-    : > "$ROOT/logs/layer3.log"
-    ;;
-  layer1c)
-    : > "$ROOT/logs/layer1c.log"
-    ;;
-  layer2)
-    : > "$ROOT/logs/layer2.log"
-    : > "$ROOT/logs/layer3.log"
-    ;;
-  layer3)
-    : > "$ROOT/logs/layer3.log"
-    ;;
-esac
 
 PY=""
 for CANDIDATE in \
