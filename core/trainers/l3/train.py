@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import os
 import pickle
-import re
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -1227,222 +1226,6 @@ def _weighted_quantile(values: np.ndarray, q: float, weights: np.ndarray | None 
     return float(v_s[idx])
 
 
-def _weighted_cdf_at(values: np.ndarray, threshold: float, weights: np.ndarray | None = None) -> float:
-    v = np.asarray(values, dtype=np.float64).ravel()
-    if v.size == 0:
-        return float("nan")
-    thr = float(threshold)
-    if weights is None:
-        return float(np.mean(v <= thr))
-    w = np.asarray(weights, dtype=np.float64).ravel()
-    if w.size != v.size:
-        return float(np.mean(v <= thr))
-    ok = np.isfinite(v) & np.isfinite(w) & (w > 0)
-    if int(np.sum(ok)) == 0:
-        vv = v[np.isfinite(v)]
-        return float(np.mean(vv <= thr)) if vv.size else float("nan")
-    v_ok = v[ok]
-    w_ok = w[ok]
-    hit = v_ok <= thr
-    den = float(np.sum(w_ok))
-    if den <= 0:
-        return float(np.mean(hit))
-    return float(np.sum(w_ok[hit]) / den)
-
-
-def _l3_exit_state_key_fallbacks(state_key: str) -> list[str]:
-    key = str(state_key)
-    out: list[str] = []
-
-    def _push(k: str) -> None:
-        if k and k not in out:
-            out.append(k)
-
-    _push(key)
-    key_no_pa = key.split("_pa_", 1)[0]
-    _push(key_no_pa)
-    hold_re = re.compile(r"_h\d+$")
-    _push(hold_re.sub("", key))
-    _push(hold_re.sub("", key_no_pa))
-    return out
-
-
-def _l3_pick_state_params(
-    mapping: Mapping[str, Mapping[str, Any]] | None,
-    state_key: str,
-) -> tuple[dict[str, Any], str]:
-    if not mapping:
-        return {}, ""
-    for k in _l3_exit_state_key_fallbacks(state_key):
-        if k in mapping:
-            return dict(mapping[k]), str(k)
-    return {}, ""
-
-
-def _l3_build_adaptive_exit_controller(
-    state_keys: np.ndarray,
-    exit_prob: np.ndarray,
-    value_pred: np.ndarray,
-    y_exit: np.ndarray,
-    *,
-    sample_weight: np.ndarray | None,
-    global_policy: Mapping[str, Any],
-) -> dict[str, Any]:
-    keys = np.asarray(state_keys, dtype=object).ravel()
-    prob = np.asarray(exit_prob, dtype=np.float64).ravel()
-    value = np.asarray(value_pred, dtype=np.float64).ravel()
-    y = np.asarray(y_exit, dtype=np.int32).ravel()
-    valid = np.isfinite(prob) & np.isfinite(value)
-    if keys.size != valid.size:
-        return {"enabled": False, "reason": "shape_mismatch"}
-    keys = keys[valid]
-    prob = prob[valid]
-    value = value[valid]
-    y = y[valid]
-    sw = None
-    if sample_weight is not None:
-        sw_raw = np.asarray(sample_weight, dtype=np.float64).ravel()
-        if sw_raw.size == valid.size:
-            sw = np.clip(sw_raw[valid], 0.0, np.inf)
-    if keys.size == 0:
-        return {"enabled": False, "reason": "empty_valid_rows"}
-    global_prob_thr = float(global_policy.get("exit_prob_threshold", 0.55))
-    global_value_thr = float(global_policy.get("value_left_threshold", 0.02))
-    prob_q = float(np.clip(_weighted_cdf_at(prob, global_prob_thr, sw), 0.05, 0.98))
-    value_q = float(np.clip(_weighted_cdf_at(value, global_value_thr, sw), 0.05, 0.98))
-    global_exit_rate = float(_weighted_mean(y.astype(np.float64), sw))
-    min_rows = int(max(40, _env_int_clipped("L3_ADAPTIVE_EXIT_MIN_ROWS", 120, lo=20, hi=5000)))
-    shrink_rows = float(max(min_rows, _env_int_clipped("L3_ADAPTIVE_EXIT_SHRINK_ROWS", 240, lo=40, hi=20000)))
-    feedback_gain = float(_env_float_clipped("L3_ADAPTIVE_EXIT_FEEDBACK_GAIN", 0.40, lo=0.0, hi=2.0))
-    max_delta = float(_env_float_clipped("L3_ADAPTIVE_EXIT_MAX_DELTA", 0.12, lo=0.0, hi=0.30))
-    by_state: dict[str, dict[str, Any]] = {}
-    covered_rows = 0
-    covered_weight = 0.0
-    total_weight = float(np.sum(sw)) if sw is not None else float(keys.size)
-    for key in sorted({str(k) for k in keys.tolist()}):
-        m = keys == key
-        n = int(np.sum(m))
-        if n < min_rows:
-            continue
-        w = None if sw is None else sw[m]
-        state_exit_rate = float(_weighted_mean(y[m].astype(np.float64), w))
-        # State-conditioned quantile thresholds anchored to globally selected operating quantiles.
-        state_prob_q_thr = float(np.clip(_weighted_quantile(prob[m], prob_q, w), 0.03, 0.97))
-        state_value_q_thr = float(_weighted_quantile(value[m], value_q, w))
-        confidence = float(np.clip(n / (n + shrink_rows), 0.05, 0.95))
-        feedback_delta = float(np.clip((global_exit_rate - state_exit_rate) * feedback_gain, -max_delta, max_delta))
-        blended_prob = float(
-            np.clip(
-                (1.0 - confidence) * global_prob_thr + confidence * state_prob_q_thr + feedback_delta,
-                0.03,
-                0.97,
-            )
-        )
-        blended_value = float((1.0 - confidence) * global_value_thr + confidence * state_value_q_thr)
-        by_state[key] = {
-            "rows": int(n),
-            "state_exit_rate": float(state_exit_rate),
-            "blend_confidence": float(confidence),
-            "feedback_delta": float(feedback_delta),
-            "quantile_prob_threshold": float(state_prob_q_thr),
-            "quantile_value_threshold": float(state_value_q_thr),
-            "adaptive_prob_threshold": float(blended_prob),
-            "adaptive_value_threshold": float(blended_value),
-        }
-        covered_rows += int(n)
-        covered_weight += float(np.sum(w)) if w is not None else float(n)
-    return {
-        "enabled": True,
-        "prob_quantile_anchor": float(prob_q),
-        "value_quantile_anchor": float(value_q),
-        "global_exit_rate": float(global_exit_rate),
-        "global_prob_threshold": float(global_prob_thr),
-        "global_value_threshold": float(global_value_thr),
-        "min_rows": int(min_rows),
-        "shrink_rows": float(shrink_rows),
-        "feedback_gain": float(feedback_gain),
-        "max_delta": float(max_delta),
-        "rows_total": int(keys.size),
-        "rows_covered": int(covered_rows),
-        "row_coverage": float(covered_rows / max(int(keys.size), 1)),
-        "weight_total": float(total_weight),
-        "weight_covered": float(covered_weight),
-        "weight_coverage": float(covered_weight / max(total_weight, 1e-12)),
-        "states_learned": int(len(by_state)),
-        "global": {
-            "adaptive_prob_threshold": float(global_prob_thr),
-            "adaptive_value_threshold": float(global_value_thr),
-            "feedback_delta": 0.0,
-            "blend_confidence": 0.0,
-        },
-        "by_state": by_state,
-    }
-
-
-def _l3_log_adaptive_exit_controller_summary(controller: Mapping[str, Any]) -> None:
-    if not bool(controller.get("enabled", False)):
-        print(f"  [L3] adaptive exit summary: disabled reason={controller.get('reason', '')}", flush=True)
-        return
-    by_state_raw = controller.get("by_state", {})
-    by_state = by_state_raw if isinstance(by_state_raw, Mapping) else {}
-    n_states = int(controller.get("states_learned", len(by_state)))
-    prob_vals: list[float] = []
-    value_vals: list[float] = []
-    delta_vals: list[float] = []
-    conf_vals: list[float] = []
-    state_rows: list[tuple[str, int, float, float]] = []
-    for key, cfg in by_state.items():
-        if not isinstance(cfg, Mapping):
-            continue
-        p = float(cfg.get("adaptive_prob_threshold", float("nan")))
-        v = float(cfg.get("adaptive_value_threshold", float("nan")))
-        d = float(cfg.get("feedback_delta", float("nan")))
-        c = float(cfg.get("blend_confidence", float("nan")))
-        r = int(cfg.get("rows", 0))
-        if np.isfinite(p):
-            prob_vals.append(p)
-        if np.isfinite(v):
-            value_vals.append(v)
-        if np.isfinite(d):
-            delta_vals.append(d)
-        if np.isfinite(c):
-            conf_vals.append(c)
-        state_rows.append((str(key), r, p, d))
-    if n_states <= 0:
-        print(
-            f"  [L3] adaptive exit summary: enabled but no states passed min_rows={int(controller.get('min_rows', 0))}",
-            flush=True,
-        )
-        return
-    prob_arr = np.asarray(prob_vals, dtype=np.float64) if prob_vals else np.asarray([float("nan")], dtype=np.float64)
-    value_arr = np.asarray(value_vals, dtype=np.float64) if value_vals else np.asarray([float("nan")], dtype=np.float64)
-    delta_arr = np.asarray(delta_vals, dtype=np.float64) if delta_vals else np.asarray([float("nan")], dtype=np.float64)
-    conf_arr = np.asarray(conf_vals, dtype=np.float64) if conf_vals else np.asarray([float("nan")], dtype=np.float64)
-    print(
-        f"  [L3] adaptive exit coverage(in-sample): rows={int(controller.get('rows_covered', 0))}/{int(controller.get('rows_total', 0))}  "
-        f"row_cov={float(controller.get('row_coverage', float('nan'))):.3f}  "
-        f"weight_cov={float(controller.get('weight_coverage', float('nan'))):.3f}  states={n_states}",
-        flush=True,
-    )
-    print(
-        f"  [L3] adaptive threshold dist: prob p10/p50/p90="
-        f"{float(np.nanquantile(prob_arr, 0.10)):.4f}/{float(np.nanquantile(prob_arr, 0.50)):.4f}/{float(np.nanquantile(prob_arr, 0.90)):.4f}  "
-        f"value p10/p50/p90={float(np.nanquantile(value_arr, 0.10)):.4f}/{float(np.nanquantile(value_arr, 0.50)):.4f}/{float(np.nanquantile(value_arr, 0.90)):.4f}",
-        flush=True,
-    )
-    print(
-        f"  [L3] adaptive feedback dist: delta mean/p10/p50/p90="
-        f"{float(np.nanmean(delta_arr)):.4f}/{float(np.nanquantile(delta_arr, 0.10)):.4f}/{float(np.nanquantile(delta_arr, 0.50)):.4f}/{float(np.nanquantile(delta_arr, 0.90)):.4f}  "
-        f"blend_conf mean={float(np.nanmean(conf_arr)):.4f}",
-        flush=True,
-    )
-    top_n = int(max(3, min(8, _env_int_clipped("L3_ADAPTIVE_EXIT_LOG_TOPN", 5, lo=1, hi=20))))
-    top_rows = sorted(state_rows, key=lambda x: x[1], reverse=True)[:top_n]
-    top_repr = " | ".join([f"{k}:n={r},p={p:.4f},d={d:+.4f}" for k, r, p, d in top_rows if np.isfinite(p) and np.isfinite(d)])
-    if top_repr:
-        print(f"  [L3] adaptive top states: {top_repr}", flush=True)
-
-
 def _estimate_half_life_ar1(values: np.ndarray) -> float:
     x = np.asarray(values, dtype=np.float64).ravel()
     x = x[np.isfinite(x)]
@@ -2438,28 +2221,13 @@ def l3_exit_policy_params(
             )[0]
         )
     )
-    params, _matched_exit_key = _l3_pick_state_params(meta.get("l3_exit_policy_by_state"), state_key)
+    params = (meta.get("l3_exit_policy_by_state") or {}).get(state_key, {})
     prob_thr = float(params.get("exit_prob_threshold", meta.get("l3_exit_prob_threshold", 0.55)))
     split_bar = int(params.get("early_hold_split_bar", meta.get("l3_policy_early_hold_split_bar", 3)))
     prob_thr_early = float(params.get("exit_prob_threshold_early", meta.get("l3_exit_prob_threshold_early", prob_thr)))
     prob_thr_late = float(params.get("exit_prob_threshold_late", meta.get("l3_exit_prob_threshold_late", prob_thr)))
     prob_thr = prob_thr_early if int(hold_bars) < split_bar else prob_thr_late
     value_thr = float(params.get("value_left_threshold", meta.get("l3_value_left_threshold", 0.02)))
-    adaptive_meta = meta.get("l3_exit_adaptive_controller")
-    if isinstance(adaptive_meta, Mapping) and bool(adaptive_meta.get("enabled")):
-        adaptive_state, _matched_adaptive_key = _l3_pick_state_params(
-            adaptive_meta.get("by_state"),  # type: ignore[arg-type]
-            state_key,
-        )
-        adaptive_global = adaptive_meta.get("global", {})
-        if np.isfinite(float(adaptive_state.get("adaptive_prob_threshold", float("nan")))):
-            prob_thr = float(np.clip(float(adaptive_state.get("adaptive_prob_threshold", prob_thr)), 0.03, 0.97))
-        elif np.isfinite(float(adaptive_global.get("adaptive_prob_threshold", float("nan")))):
-            prob_thr = float(np.clip(float(adaptive_global.get("adaptive_prob_threshold", prob_thr)), 0.03, 0.97))
-        if np.isfinite(float(adaptive_state.get("adaptive_value_threshold", float("nan")))):
-            value_thr = float(adaptive_state.get("adaptive_value_threshold", value_thr))
-        elif np.isfinite(float(adaptive_global.get("adaptive_value_threshold", float("nan")))):
-            value_thr = float(adaptive_global.get("adaptive_value_threshold", value_thr))
     hold_map = meta.get("l3_target_horizon_bars_by_state") or {}
     max_hold = int(hold_map.get(state_key, meta.get("l3_target_horizon_bars", _l3_target_horizon_bars(30))))
     forced_mode = (os.environ.get("L3_POLICY_FORCE_MODE", "") or "").strip().lower()
@@ -3742,21 +3510,15 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             f"hold_recall_floor_hint={report_hold_recall_floor_hint:.4f}",
             flush=True,
         )
-    exit_prob_tune_policy = _apply_l3_exit_calibrator(exit_model.predict(X_lgb[tune_idx]).astype(np.float64), exit_calibrator)
-    value_pred_tune_policy = (
+    exit_policy, exit_policy_by_state = _l3_search_conditional_exit_policy(
+        exit_state_keys,
+        _apply_l3_exit_calibrator(exit_model.predict(X_lgb[tune_idx]).astype(np.float64), exit_calibrator),
         _l3_value_predict_hurdle(
             X_lgb[tune_idx],
             value_model,
             value_nonzero_model,
             prob_power=value_hurdle_prob_power,
-        )
-        if not value_disabled
-        else np.zeros(int(tune_idx.size), dtype=np.float64)
-    )
-    exit_policy, exit_policy_by_state = _l3_search_conditional_exit_policy(
-        exit_state_keys,
-        exit_prob_tune_policy,
-        value_pred_tune_policy,
+        ) if not value_disabled else np.zeros(int(tune_idx.size), dtype=np.float64),
         y_exit[tune_idx],
         y_value_true=y_value[tune_idx],
         value_policy_mode=value_policy_mode,
@@ -3765,22 +3527,6 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         hold_bars=X[tune_idx, hold_idx].astype(np.float64),
         report_guardrail=report_guardrail,
     )
-    adaptive_exit_controller = _l3_build_adaptive_exit_controller(
-        exit_state_keys,
-        exit_prob_tune_policy,
-        value_pred_tune_policy,
-        y_exit[tune_idx],
-        sample_weight=tune_weights,
-        global_policy=exit_policy,
-    )
-    print(
-        f"  [L3] adaptive exit controller: enabled={adaptive_exit_controller.get('enabled', False)}  "
-        f"states={adaptive_exit_controller.get('states_learned', 0)}  "
-        f"prob_q_anchor={adaptive_exit_controller.get('prob_quantile_anchor', float('nan')):.3f}  "
-        f"feedback_gain={adaptive_exit_controller.get('feedback_gain', float('nan')):.3f}",
-        flush=True,
-    )
-    _l3_log_adaptive_exit_controller_summary(adaptive_exit_controller)
     _ip = _l3_exit_infer_params(None)
     print(
         f"  [L3] live exit smoothing check: smooth={_l3_exit_infer_enabled(None)}  "
@@ -4003,7 +3749,6 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         },
         "l3_exit_policy_search": exit_policy,
         "l3_exit_policy_by_state": exit_policy_by_state,
-        "l3_exit_adaptive_controller": adaptive_exit_controller,
         "l3_release_guard": {
             "enabled": True,
             "flagged": bool(hold_recall_release_flag),
