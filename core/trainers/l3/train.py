@@ -181,7 +181,7 @@ def l3_exit_decision_live(
     hold_ref_bars: int | None = None,
     meta: Mapping[str, Any] | None = None,
 ) -> tuple[bool, L3ExitInferenceState]:
-    """Exit decision for live/backtest: optional EMA + hysteresis + min-hold; else legacy policy.
+    """Exit decision for live/backtest: optional EMA + hysteresis; else direct policy.
 
     EMA: first in-trade update sets ``ema_prob`` to the **current** raw calibrated ``p_exit`` (not 0);
     later bars use exponential smoothing. Entry-age behavior is controlled by *soft* threshold
@@ -203,11 +203,28 @@ def l3_exit_decision_live(
             hold_ref_bars=hold_ref_bars,
             infer_cfg=ip,
         )
+        mode = str(value_policy_mode).strip().lower()
+        enter_exit = l3_should_exit_by_policy(
+            p_s,
+            value_left,
+            exit_prob_threshold=ent,
+            value_left_threshold=value_left_threshold,
+            value_policy_mode=mode,
+            value_tie_margin=value_tie_margin,
+        )
+        leave_exit = l3_should_exit_by_policy(
+            p_s,
+            value_left,
+            exit_prob_threshold=lev,
+            value_left_threshold=value_left_threshold,
+            value_policy_mode=mode,
+            value_tie_margin=value_tie_margin,
+        )
         if not state.latch_exit:
-            if p_s >= ent:
+            if enter_exit:
                 state.latch_exit = True
         else:
-            if p_s <= lev:
+            if not leave_exit:
                 state.latch_exit = False
         return bool(state.latch_exit), state
     ent_soft, _lev_soft = _l3_soft_exit_hysteresis_thresholds(
