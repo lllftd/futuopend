@@ -335,8 +335,18 @@ class PAOptionsMonitor(SymbolMonitor):
         exit_price, exit_reason = None, None
         
         if pos.direction == 1:
-            if low <= pos.stop_price: exit_price, exit_reason = pos.stop_price, "stop_loss"
-            elif high >= pos.take_profit: exit_price, exit_reason = pos.take_profit, "take_profit"
+            hit_stop = low <= pos.stop_price
+            hit_tp = high >= pos.take_profit
+            stop_in_profit_zone = pos.stop_price >= pos.entry_price
+            crossed_tp_sl = pos.stop_price >= pos.take_profit
+
+            if hit_stop and hit_tp and crossed_tp_sl:
+                exit_price, exit_reason = pos.take_profit, "take_profit"
+            elif hit_stop:
+                reason = "trailing_stop" if stop_in_profit_zone else "stop_loss"
+                exit_price, exit_reason = pos.stop_price, reason
+            elif hit_tp:
+                exit_price, exit_reason = pos.take_profit, "take_profit"
             elif bar_time >= pos.time_stop_deadline: exit_price, exit_reason = close, "time_stop"
             else:
                 mfe = high - pos.entry_price
@@ -346,8 +356,18 @@ class PAOptionsMonitor(SymbolMonitor):
                     new_sl = max(new_sl_ema, new_sl_mfe)
                     if new_sl > pos.stop_price: pos.stop_price = new_sl
         else:
-            if high >= pos.stop_price: exit_price, exit_reason = pos.stop_price, "stop_loss"
-            elif low <= pos.take_profit: exit_price, exit_reason = pos.take_profit, "take_profit"
+            hit_stop = high >= pos.stop_price
+            hit_tp = low <= pos.take_profit
+            stop_in_profit_zone = pos.stop_price <= pos.entry_price
+            crossed_tp_sl = pos.stop_price <= pos.take_profit
+
+            if hit_stop and hit_tp and crossed_tp_sl:
+                exit_price, exit_reason = pos.take_profit, "take_profit"
+            elif hit_stop:
+                reason = "trailing_stop" if stop_in_profit_zone else "stop_loss"
+                exit_price, exit_reason = pos.stop_price, reason
+            elif hit_tp:
+                exit_price, exit_reason = pos.take_profit, "take_profit"
             elif bar_time >= pos.time_stop_deadline: exit_price, exit_reason = close, "time_stop"
             else:
                 mfe = pos.entry_price - low

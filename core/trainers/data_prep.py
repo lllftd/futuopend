@@ -446,8 +446,9 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
 
     if not (os.path.exists(meta_path) and os.path.exists(model_path)):
         raise RuntimeError(
-            f"Missing TCN checkpoint under {MODEL_DIR}: need tcn_meta.pkl and {TCN_STATE_DICT_BASENAME!r} "
-            "(from Layer 1 / backtests.train_pipeline). Retrain: ./scripts/run_train.sh layer1"
+            f"Missing TCN checkpoint under {MODEL_DIR}: need tcn_meta.pkl and {TCN_STATE_DICT_BASENAME!r}. "
+            "Train the PAStateTCN stack first: PYTHONPATH=. python backtests/train_tcn_layer1.py "
+            "(train_pipeline layer1/layer1a does not create these files)."
         )
 
     import pickle
@@ -623,7 +624,8 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 oof = pickle.load(f)
             if "regime_probs" not in oof:
                 raise RuntimeError(
-                    f"{oof_path} is missing 'regime_probs' (transition). Retrain Layer 1 via ./scripts/run_train.sh layer1"
+                    f"{oof_path} is missing 'regime_probs' (transition). "
+                    "Re-run: PYTHONPATH=. python backtests/train_tcn_layer1.py"
                 )
 
             oof_df = pd.DataFrame({
@@ -635,7 +637,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
                 raise RuntimeError(
                     f"{oof_path} regime_probs has width {rp.shape[1]} but TCN_REGIME_FUT_PROB_COLS "
                     f"expects {len(TCN_REGIME_FUT_PROB_COLS)} (e.g. old 6-class cache vs binary transition). "
-                    f"Delete {oof_path} and re-train Layer 1 (TCN)."
+                    f"Delete {oof_path} and re-run: PYTHONPATH=. python backtests/train_tcn_layer1.py"
                 )
             for j, col in enumerate(TCN_REGIME_FUT_PROB_COLS):
                 oof_df[col] = rp[:, j]
@@ -649,7 +651,7 @@ def _compute_tcn_derived_features(df: pd.DataFrame, base_feat_cols: list[str]) -
             if oem.shape[1] != bottleneck_dim:
                 raise RuntimeError(
                     f"tcn_oof_cache.pkl embed width {oem.shape[1]} != bottleneck_dim {bottleneck_dim} "
-                    f"from tcn_meta.pkl. Retrain Layer 1 via ./scripts/run_train.sh layer1"
+                    f"from tcn_meta.pkl. Re-run: PYTHONPATH=. python backtests/train_tcn_layer1.py"
                 )
             for j in range(bottleneck_dim):
                 oof_df[f"tcn_emb_{j}"] = oem[:, j]
@@ -878,7 +880,8 @@ def _compute_mamba_derived_features(df: pd.DataFrame, base_feat_cols: list[str])
                 oof = pickle.load(f)
             if "regime_probs" not in oof:
                 raise RuntimeError(
-                    f"{oof_path} is missing 'regime_probs' (transition). Retrain Layer 1 via ./scripts/run_train.sh layer1"
+                    f"{oof_path} is missing 'regime_probs' (transition). "
+                    "Re-run: PYTHONPATH=. python backtests/train_tcn_layer1.py"
                 )
 
             oof_df = pd.DataFrame({

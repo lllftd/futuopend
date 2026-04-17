@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import math
 import os
 import pickle
@@ -637,6 +638,76 @@ def _l1a_cap_oof_folds(requested: int, n_pool_windows: int) -> tuple[int, str]:
             f"pool_windows={n_pool_windows:,}, L1_OOF_MIN_WINDOWS_PER_FOLD={min_w})."
         )
     return requested, ""
+
+
+def _l1a_oof_parallel_jobs_from_env() -> int:
+    return max(1, int(os.environ.get("L1A_OOF_JOBS", "1")))
+
+
+def _l1a_oof_cuda_device_ids_for_rotation() -> list[str]:
+    raw = os.environ.get("L1A_OOF_CUDA_DEVICES", "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return [str(i) for i in range(torch.cuda.device_count())]
+
+
+def _l1a_resolve_oof_parallel_plan(
+    *,
+    n_folds: int,
+    device_type: str,
+    requested_jobs: int,
+) -> tuple[int, list[str | None], str]:
+    """Return (max_workers, cuda_visible_devices per fold or None, log note)."""
+    folds = max(1, int(n_folds))
+    req = max(1, int(requested_jobs))
+    jobs = min(req, folds)
+    if device_type == "mps":
+        if req > 1:
+            return 1, [None] * folds, "L1a OOF: multiprocessing disabled on MPS (L1A_OOF_JOBS>1 ignored)."
+        return 1, [None] * folds, ""
+    if device_type == "cuda":
+        allow_multi = os.environ.get("L1A_OOF_ALLOW_MULTI_PROC_SINGLE_GPU", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        cids = _l1a_oof_cuda_device_ids_for_rotation()
+        if not cids:
+            return 1, [None] * folds, "L1a OOF: no CUDA devices for rotation; using sequential OOF."
+        per_fold = [cids[i % len(cids)] for i in range(folds)]
+        if len(cids) == 1 and req > 1 and not allow_multi:
+            return 1, [None] * folds, (
+                "L1a OOF: L1A_OOF_JOBS>1 with one visible GPU → sequential folds. "
+                "Set L1A_OOF_CUDA_DEVICES=0,1,... or L1A_OOF_ALLOW_MULTI_PROC_SINGLE_GPU=1."
+            )
+        if len(cids) == 1 and allow_multi:
+            max_workers = min(jobs, folds)
+            return max_workers, [cids[0]] * folds, ""
+        max_workers = min(jobs, folds, len(cids))
+        return max_workers, per_fold, ""
+    n_cpu = max(1, os.cpu_count() or 4)
+    cap = max(1, int(os.environ.get("L1A_OOF_CPU_MAX_WORKERS", str(max(1, n_cpu // 2)))))
+    max_workers = min(jobs, folds, cap)
+    if max_workers < req:
+        return max_workers, [None] * folds, (
+            f"L1a OOF: L1A_OOF_JOBS capped to {max_workers} (CPU L1A_OOF_CPU_MAX_WORKERS={cap})."
+        )
+    return max_workers, [None] * folds, ""
+
+
+def _l1a_oof_loader_kwargs_for_worker(base: dict[str, Any]) -> dict[str, Any]:
+    kw = {k: v for k, v in base.items() if k not in {"persistent_workers", "prefetch_factor"}}
+    kw["num_workers"] = max(0, int(os.environ.get("L1A_OOF_DATALOADER_WORKERS", "0")))
+    return kw
+
+
+def _l1a_oof_worker_torch_threads(parallel: int) -> int:
+    n_cpu = max(1, os.cpu_count() or 4)
+    default_cap = max(1, min(8, (n_cpu + 1) // 2))
+    base = max(1, int(os.environ.get("TORCH_CPU_THREADS", str(default_cap))))
+    div = max(1, int(parallel))
+    cap = max(1, base // div)
+    return max(1, int(os.environ.get("L1A_OOF_TORCH_THREADS", str(cap))))
 
 
 def _l1a_adaptive_range_clip_enabled() -> bool:
@@ -1316,6 +1387,71 @@ def _l1a_early_stop_best_epoch(
     return max(1, int(best_ep))
 
 
+def _l1a_oof_fold_worker(payload: dict[str, Any]) -> tuple[int, int]:
+    """Picklable entry point for ProcessPoolExecutor (set CUDA_VISIBLE_DEVICES before importing torch project code)."""
+    cuda_vis = payload.get("cuda_visible_devices")
+    if cuda_vis is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_vis)
+    os.environ["L1A_DISABLE_TQDM"] = "1"
+    tt = max(1, int(payload.get("torch_threads", 1)))
+    try:
+        torch.set_num_threads(tt)
+        inter = max(1, min(2, max(1, tt // 4)))
+        torch.set_num_interop_threads(inter)
+    except RuntimeError:
+        pass
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from core.trainers.tcn_constants import DEVICE
+
+    fk = int(payload["fk"])
+    n_l1_oof = int(payload["n_l1_oof"])
+    n_w = int(payload["n_w"])
+    w_pool_idx = np.asarray(payload["w_pool_idx"], dtype=np.int64)
+    tr_sub = np.asarray(payload["tr_sub"], dtype=bool)
+    va_sub = np.asarray(payload["va_sub"], dtype=bool)
+    tensors: tuple[torch.Tensor, ...] = payload["tensors"]
+
+    w_tr_f = np.zeros(n_w, dtype=bool)
+    w_va_f = np.zeros(n_w, dtype=bool)
+    w_tr_f[w_pool_idx[tr_sub]] = True
+    w_va_f[w_pool_idx[va_sub]] = True
+
+    regime_loss_f = _l1a_regime_loss(tensors[1][w_tr_f], device=DEVICE)
+    transition_loss_f = _l1a_transition_loss(tensors[2][w_tr_f], device=DEVICE)
+    train_ds_f = TensorDataset(*[tensor[w_tr_f] for tensor in tensors])
+    val_ds_f = TensorDataset(*[tensor[w_va_f] for tensor in tensors])
+    train_dl_f = DataLoader(train_ds_f, shuffle=True, **payload["loader_kwargs"])
+    val_dl_f = DataLoader(val_ds_f, shuffle=False, **payload["loader_kwargs"])
+    amp = payload["amp"]
+    be = _l1a_early_stop_best_epoch(
+        train_dl_f,
+        val_dl_f,
+        n_feat=int(payload["n_feat"]),
+        embed_dim=int(payload["embed_dim"]),
+        channels=list(payload["channels"]),
+        tcn_kernel_size=int(payload["tcn_kernel_size"]),
+        tcn_dropout=float(payload["tcn_dropout"]),
+        readout_dropout=float(payload["readout_dropout"]),
+        head_dropout=float(payload["head_dropout"]),
+        regime_loss=regime_loss_f,
+        transition_loss=transition_loss_f,
+        loss_weights=dict(payload["loss_weights"]),
+        lr=float(payload["lr"]),
+        wd=float(payload["wd"]),
+        T0=int(payload["T0"]),
+        Tm=int(payload["Tm"]),
+        max_epochs=int(payload["max_epochs"]),
+        patience=int(payload["patience"]),
+        min_delta=float(payload["min_delta"]),
+        desc=str(payload["desc"]),
+        use_uw=bool(payload["use_uw"]),
+        uw_val_metric=str(payload["uw_val_metric"]),
+        amp=amp,
+    )
+    return fk, int(be)
+
+
 def _l1a_transition_val_block(
     label: str,
     y_true: np.ndarray,
@@ -1633,6 +1769,10 @@ def materialize_l1a_outputs(
 def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrainingBundle:
     train_started_at = datetime.now().astimezone()
     train_started_perf = time.perf_counter()
+    l1a_oof_par_requested = 1
+    l1a_oof_par_workers = 1
+    l1a_oof_par_note = ""
+    l1a_oof_fold_cuda_vis: list[str | None] = []
     print(f"  [L1a] training started at {train_started_at.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
     work = df.copy(deep=False)
     feature_cols = _select_l1a_feature_cols(work, feat_cols)
@@ -1876,56 +2016,118 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         w_pool_idx = np.flatnonzero(window_pool)
         tk_sub = work["time_key"].to_numpy()[end_idx[w_pool_idx]]
         fold_masks = time_blocked_fold_masks(tk_sub, np.ones(len(w_pool_idx), bool), n_l1_oof, context="L1a OOF")
-        best_eps: list[int] = []
-        fold_loops = list(enumerate(fold_masks))
-        if _l1a_progress_tqdm_enabled():
-            fold_loops = tqdm(
-                fold_loops,
-                total=len(fold_masks),
-                desc="[L1a] OOF folds",
-                unit="fold",
-                leave=True,
-                file=TQDM_FILE,
-                mininterval=0.5,
+        l1a_oof_par_requested = int(_l1a_oof_parallel_jobs_from_env())
+        l1a_oof_par_workers, l1a_oof_fold_cuda_vis, l1a_oof_par_note = _l1a_resolve_oof_parallel_plan(
+            n_folds=n_l1_oof,
+            device_type=DEVICE.type,
+            requested_jobs=l1a_oof_par_requested,
+        )
+        if l1a_oof_par_note:
+            print(f"  [L1a] {l1a_oof_par_note}", flush=True)
+        if l1a_oof_par_workers > 1:
+            print(
+                f"  [L1a] OOF multiprocessing: L1A_OOF_JOBS={l1a_oof_par_requested} → "
+                f"max_workers={l1a_oof_par_workers} (folds={n_l1_oof})",
+                flush=True,
             )
-        for fk, (tr_sub, va_sub) in fold_loops:
-            w_tr_f = np.zeros(n_w, dtype=bool)
-            w_va_f = np.zeros(n_w, dtype=bool)
-            w_tr_f[w_pool_idx[tr_sub]] = True
-            w_va_f[w_pool_idx[va_sub]] = True
-            regime_loss_f = _l1a_regime_loss(targets["regime"][end_idx][w_tr_f], device=DEVICE)
-            transition_loss_f = _l1a_transition_loss(targets["transition_risk"][end_idx][w_tr_f], device=DEVICE)
-            train_ds_f = TensorDataset(*[tensor[w_tr_f] for tensor in ds.tensors])
-            val_ds_f = TensorDataset(*[tensor[w_va_f] for tensor in ds.tensors])
-            train_dl_f = DataLoader(train_ds_f, shuffle=True, **loader_kwargs)
-            val_dl_f = DataLoader(val_ds_f, shuffle=False, **loader_kwargs)
-            be = _l1a_early_stop_best_epoch(
-                train_dl_f,
-                val_dl_f,
-                n_feat=len(feature_cols),
-                embed_dim=embed_dim,
-                channels=ch,
-                tcn_kernel_size=tcn_ks,
-                tcn_dropout=td,
-                readout_dropout=rd,
-                head_dropout=hd_drop,
-                regime_loss=regime_loss_f,
-                transition_loss=transition_loss_f,
-                loss_weights=loss_weights,
-                lr=lr,
-                wd=wd,
-                T0=T0,
-                Tm=Tm,
-                max_epochs=max_epochs,
-                patience=patience,
-                min_delta=min_delta,
-                desc=f"[L1a] oof {fk + 1}/{n_l1_oof}",
-                use_uw=use_uw,
-                uw_val_metric=uw_val_metric,
-                amp=l1a_amp,
-            )
-            best_eps.append(be)
-            print(f"  [L1a] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
+        best_eps: list[int]
+        if l1a_oof_par_workers > 1:
+            loader_kw_worker = _l1a_oof_loader_kwargs_for_worker(loader_kwargs)
+            oof_threads = _l1a_oof_worker_torch_threads(l1a_oof_par_workers)
+            for t in ds.tensors:
+                t.share_memory_()
+            payloads: list[dict[str, Any]] = []
+            for fk, (tr_sub, va_sub) in enumerate(fold_masks):
+                cuda_slot = l1a_oof_fold_cuda_vis[fk] if fk < len(l1a_oof_fold_cuda_vis) else None
+                payloads.append(
+                    {
+                        "cuda_visible_devices": cuda_slot,
+                        "torch_threads": oof_threads,
+                        "fk": fk,
+                        "n_l1_oof": n_l1_oof,
+                        "n_w": n_w,
+                        "w_pool_idx": w_pool_idx,
+                        "tr_sub": np.asarray(tr_sub, dtype=bool),
+                        "va_sub": np.asarray(va_sub, dtype=bool),
+                        "tensors": ds.tensors,
+                        "loader_kwargs": loader_kw_worker,
+                        "n_feat": len(feature_cols),
+                        "embed_dim": embed_dim,
+                        "channels": ch,
+                        "tcn_kernel_size": tcn_ks,
+                        "tcn_dropout": td,
+                        "readout_dropout": rd,
+                        "head_dropout": hd_drop,
+                        "loss_weights": loss_weights,
+                        "lr": lr,
+                        "wd": wd,
+                        "T0": T0,
+                        "Tm": Tm,
+                        "max_epochs": max_epochs,
+                        "patience": patience,
+                        "min_delta": min_delta,
+                        "desc": f"[L1a] oof {fk + 1}/{n_l1_oof}",
+                        "use_uw": use_uw,
+                        "uw_val_metric": uw_val_metric,
+                        "amp": l1a_amp,
+                    }
+                )
+            with concurrent.futures.ProcessPoolExecutor(max_workers=l1a_oof_par_workers) as pool:
+                results = list(pool.map(_l1a_oof_fold_worker, payloads))
+            best_eps = [int(be) for _, be in results]
+            for fk, be in enumerate(best_eps):
+                print(f"  [L1a] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
+        else:
+            fold_loops = list(enumerate(fold_masks))
+            if _l1a_progress_tqdm_enabled():
+                fold_loops = tqdm(
+                    fold_loops,
+                    total=len(fold_masks),
+                    desc="[L1a] OOF folds",
+                    unit="fold",
+                    leave=True,
+                    file=TQDM_FILE,
+                    mininterval=0.5,
+                )
+            best_eps = []
+            for fk, (tr_sub, va_sub) in fold_loops:
+                w_tr_f = np.zeros(n_w, dtype=bool)
+                w_va_f = np.zeros(n_w, dtype=bool)
+                w_tr_f[w_pool_idx[tr_sub]] = True
+                w_va_f[w_pool_idx[va_sub]] = True
+                regime_loss_f = _l1a_regime_loss(targets["regime"][end_idx][w_tr_f], device=DEVICE)
+                transition_loss_f = _l1a_transition_loss(targets["transition_risk"][end_idx][w_tr_f], device=DEVICE)
+                train_ds_f = TensorDataset(*[tensor[w_tr_f] for tensor in ds.tensors])
+                val_ds_f = TensorDataset(*[tensor[w_va_f] for tensor in ds.tensors])
+                train_dl_f = DataLoader(train_ds_f, shuffle=True, **loader_kwargs)
+                val_dl_f = DataLoader(val_ds_f, shuffle=False, **loader_kwargs)
+                be = _l1a_early_stop_best_epoch(
+                    train_dl_f,
+                    val_dl_f,
+                    n_feat=len(feature_cols),
+                    embed_dim=embed_dim,
+                    channels=ch,
+                    tcn_kernel_size=tcn_ks,
+                    tcn_dropout=td,
+                    readout_dropout=rd,
+                    head_dropout=hd_drop,
+                    regime_loss=regime_loss_f,
+                    transition_loss=transition_loss_f,
+                    loss_weights=loss_weights,
+                    lr=lr,
+                    wd=wd,
+                    T0=T0,
+                    Tm=Tm,
+                    max_epochs=max_epochs,
+                    patience=patience,
+                    min_delta=min_delta,
+                    desc=f"[L1a] oof {fk + 1}/{n_l1_oof}",
+                    use_uw=use_uw,
+                    uw_val_metric=uw_val_metric,
+                    amp=l1a_amp,
+                )
+                best_eps.append(be)
+                print(f"  [L1a] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
         nr = int(np.clip(np.median(best_eps), 1, max_epochs))
         l1_final_epochs_after_oof = int(nr)
         print(f"  [L1a] OOF median best_epoch -> final_epochs={nr}", flush=True)
@@ -2186,6 +2388,10 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "l1_oof_min_windows_per_fold": max(200, int(os.environ.get("L1_OOF_MIN_WINDOWS_PER_FOLD", "4000"))),
         "l1_oof_cap_note": str(oof_cap_message),
         "l1_oof_enabled": bool(n_l1_oof >= 2),
+        "l1a_oof_parallel_jobs_requested": int(l1a_oof_par_requested),
+        "l1a_oof_parallel_workers_effective": int(l1a_oof_par_workers),
+        "l1a_oof_parallel_note": str(l1a_oof_par_note),
+        "l1a_oof_fold_cuda_visible": list(l1a_oof_fold_cuda_vis),
         "l1_final_epochs_after_oof": l1_final_epochs_after_oof,
         "uncertainty_weighting": uw_meta,
         "state_label_missing_rate": float(state_label_missing_rate),
