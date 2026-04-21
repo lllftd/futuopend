@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class L1cConfig:
+    seq_len: int = 60
+    predict_horizon: int = 10
+    symbols: tuple[str, ...] = ("QQQ", "SPY")
+
+    input_dim: int | None = None
+    embed_dim: int = 48
+    num_heads: int = 4
+    num_layers: int = 2
+    ff_dim: int = 96
+    conv_kernel_size: int = 5
+    conv_hidden_dim: int = 48
+    conv_dropout: float = 0.20
+
+    attn_dropout: float = 0.25
+    ff_dropout: float = 0.28
+    embed_dropout: float = 0.25
+
+    # Stochastic depth: skip an entire transformer block this fraction of forwards (train only).
+    layer_drop: float = 0.08
+
+    batch_size: int = 512
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    max_epochs: int = 48
+    patience: int = 5
+    min_epochs: int = 6
+    early_stop_min_delta: float = 5e-4
+
+    # Regression target loss (Huber on standardized forward return).
+    huber_delta: float = 2.0
+    strength_aux_weight: float = 0.10
+
+    # LR schedule: CosineAnnealingWarmRestarts (T_0, T_mult); set T0=0 to disable (plateau only).
+    cosine_t0: int = 5
+    cosine_t_mult: int = 2
+
+    max_train_features: int = 40

@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Local outputs and runtime artifacts
+results/
+*.log
+lgbm_models/
+data/*.csv
+data/.tcn_*.dat
+data/.pa_feature_cache/
+
+# IDE/runtime local folders
+.cursor/
