@@ -1,6 +1,6 @@
 """Single source of truth for layer-wise feature policy (pool vs selectors).
 
-``prepare_dataset`` builds ``feat_cols``; L1a/L1b/L1c consume subsets. This module
+``prepare_dataset`` builds ``feat_cols``; L1a/L1b consume subsets (L1c archived). This module
 documents coverage and supplies shared column lists so prefix rules are not scattered.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Any, FrozenSet
 
-from core.trainers.constants import BO_FEAT_COLS, PA_CTX_FEATURES
+from core.trainers.constants import BO_FEAT_COLS, PA_CTX_FEATURES, PA_STRADDLE_FEATURES
 
 # --- L1a / L1b pa_ctx stagger (default ON): L1a = short-horizon / composite ctx; L1b = structural ctx ---
 L1A_PREFERRED_CORE: tuple[str, ...] = (
@@ -33,14 +33,8 @@ L1A_PREFERRED_CORE: tuple[str, ...] = (
     "pa_bo_dist_vwap",
 )
 
-# Sequence-friendly ctx (overlapping setups + follow-through + range pressure).
-L1A_CTX_DYNAMIC_COLUMNS: tuple[str, ...] = (
-    "pa_ctx_setup_long",
-    "pa_ctx_setup_short",
-    "pa_ctx_follow_through_long",
-    "pa_ctx_follow_through_short",
-    "pa_ctx_range_pressure",
-)
+# Sequence-friendly ctx (straddle stack: range pressure only; directional ctx dropped from LGBM).
+L1A_CTX_DYNAMIC_COLUMNS: tuple[str, ...] = ("pa_ctx_range_pressure",)
 
 # Legacy L1a ctx block (includes structure_veto) when stagger is disabled.
 L1A_CTX_LEGACY_COLUMNS: tuple[str, ...] = L1A_CTX_DYNAMIC_COLUMNS + ("pa_ctx_structure_veto",)
@@ -90,9 +84,10 @@ def l1_ctx_stagger_enabled() -> bool:
 
 
 def l1a_preferred_columns() -> tuple[str, ...]:
+    straddle = tuple(PA_STRADDLE_FEATURES)
     if l1_ctx_stagger_enabled():
-        return L1A_PREFERRED_CORE + L1A_CTX_DYNAMIC_COLUMNS
-    return L1A_PREFERRED_CORE + L1A_CTX_LEGACY_COLUMNS
+        return L1A_PREFERRED_CORE + L1A_CTX_DYNAMIC_COLUMNS + straddle
+    return L1A_PREFERRED_CORE + L1A_CTX_LEGACY_COLUMNS + straddle
 
 
 def l1b_base_pref_columns() -> tuple[str, ...]:
@@ -120,7 +115,7 @@ def l1a_extra_accepts_pa_ctx(name: str) -> bool:
 
 
 # --- Prepared dataset: which downstream layers need which expensive blocks ---
-_DEFAULT_PREP_TARGETS: FrozenSet[str] = frozenset({"l1a", "l1b", "l1c", "l2"})
+_DEFAULT_PREP_TARGETS: FrozenSet[str] = frozenset({"l1a", "l1b", "l2"})
 
 
 def parse_prep_layer_targets() -> FrozenSet[str]:
@@ -132,13 +127,13 @@ def parse_prep_layer_targets() -> FrozenSet[str]:
 
 
 def prep_needs_tcn_derivatives(targets: FrozenSet[str]) -> bool:
-    """TCN forward + ``tcn_*`` columns are only required when L1c is in the prep target set."""
-    return "l1c" in targets
+    """TCN forward + ``tcn_*`` columns: opt in via ``PREPARED_DATASET_LAYER_TARGETS`` including ``l1c`` (archived) or ``tcn``."""
+    return "l1c" in targets or "tcn" in targets
 
 
 def prep_needs_mamba(targets: FrozenSet[str]) -> bool:
-    """Mamba block is experimental; only run if opted in *and* targets include L1c."""
-    return "l1c" in targets
+    """Mamba block is experimental; only run if opted in *and* targets include ``mamba`` or legacy ``l1c``."""
+    return "mamba" in targets or "l1c" in targets
 
 
 LAYER_FEATURE_COVERAGE: dict[str, dict[str, Any]] = {
@@ -146,12 +141,13 @@ LAYER_FEATURE_COVERAGE: dict[str, dict[str, Any]] = {
         "numeric_pa_or": "From ``_pa_feature_cols`` after PA+labels merge (excludes string tag cols).",
         "bo": f"Always merged into pool after ``ensure_breakout_features``: {list(BO_FEAT_COLS)}",
         "pa_ctx": f"Merged after ``ensure_structure_context_features``: {list(PA_CTX_FEATURES)}",
-        "tcn": "Optional; appended when ``prep_needs_tcn_derivatives(targets)`` (default: l1c in targets).",
-        "mamba": "Optional; ``ENABLE_EXPERIMENTAL_MAMBA`` + checkpoint + l1c in prep targets.",
+        "pa_straddle": f"Merged into LGBM pool (causal 1m): {list(PA_STRADDLE_FEATURES)}",
+        "tcn": "Optional; when targets include ``tcn`` or legacy ``l1c`` (see prep_needs_tcn_derivatives).",
+        "mamba": "Optional; ``ENABLE_EXPERIMENTAL_MAMBA`` + checkpoint + targets include ``mamba`` or legacy ``l1c``.",
     },
     "l1a": {
         "selector": "_select_l1a_feature_cols",
-        "preferred": "l1a_preferred_columns() — dynamic ctx only when L1_CTX_STAGGER=1 (default).",
+        "preferred": "l1a_preferred_columns() — range_pressure + straddle vol features (+ legacy ctx_veto when stagger off).",
         "extra_policy": f"Ranked ``pa_*`` from feat_cols excluding prefixes {L1A_EXTRA_EXCLUDE_PREFIXES}; "
         "under stagger, non-dynamic ``pa_ctx_*`` excluded from extras.",
     },
@@ -160,8 +156,8 @@ LAYER_FEATURE_COVERAGE: dict[str, dict[str, Any]] = {
         "base_pref": "l1b_base_pref_columns() — structural ctx only when stagger; full ctx when L1_CTX_STAGGER=0",
     },
     "l1c": {
-        "selector": "_select_l1c_feature_cols",
-        "pool": "First N or gain/MI-ranked from feat_cols (see L1C_FEATURE_SELECT).",
+        "selector": "(archived) archive/l1c/",
+        "pool": "Layer removed from main pipeline; see archive/train_layer1c_only.py.",
     },
     "l2": {
         "selector": "_build_l2_frame",

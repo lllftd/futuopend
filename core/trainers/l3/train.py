@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pickle
 import time
@@ -35,6 +36,7 @@ from core.trainers.constants import (
     L2_META_FILE,
     L2_OUTPUT_CACHE_FILE,
     L2_SCHEMA_VERSION,
+    L2_USE_VIXY,
     L3_COX_FILE,
     L3_EXIT_FILE,
     L3_META_FILE,
@@ -45,6 +47,7 @@ from core.trainers.constants import (
     MODEL_DIR,
     PA_STATE_FEATURES,
     TEST_END,
+    VIXY_DATA_PATH,
 )
 
 try:
@@ -87,9 +90,14 @@ from core.trainers.l3.trajectory import (
     L3TrajectoryConfig,
     l3_encode_trajectories,
     l3_trajectory_embed_importance_ratio,
+    l3_traj_step_features_straddle,
     l3_traj_step_features,
     train_l3_trajectory_encoder,
 )
+from core.trainers.l3.feature_engineering import build_straddle_features
+from core.trainers.l3.iv_models import build_base_iv_series
+from core.trainers.l3.iv_scenarios import dte_grid_days, generate_iv_scenarios, scenario_count
+from core.trainers.l3.straddle_simulator import StraddleSimulator
 from core.trainers.pa_state_controls import (
     ensure_pa_state_features,
     pa_state_arrays_from_frame,
@@ -288,12 +296,63 @@ def _l3_extra_merged_feature_columns() -> list[str]:
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
-def _l3_policy_matrix_column_names(extra_merged: list[str]) -> list[str]:
+def _l3_straddle_sim_mode_enabled(meta: Mapping[str, Any] | None = None) -> bool:
+    if meta is not None and "l3_trade_semantics" in meta:
+        return str(meta.get("l3_trade_semantics", "")).strip().lower() == "straddle_bs_sim"
+    return os.environ.get("L3_STRADDLE_SIM_MODE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _l3_straddle_feature_columns() -> list[str]:
     return [
+        "rv_5",
+        "rv_15",
+        "rv_30",
+        "rv_60",
+        "rv_120",
+        "rv_390",
+        "parkinson_vol_15",
+        "parkinson_vol_30",
+        "parkinson_vol_60",
+        "parkinson_vol_390",
+        "gk_vol_30",
+        "gk_vol_60",
+        "gk_vol_390",
+        "rv_acceleration",
+        "vol_of_vol",
+        "abs_return_5",
+        "abs_return_15",
+        "abs_return_30",
+        "abs_return_60",
+        "intraday_range",
+        "range_vs_close",
+        "volume_zscore",
+        "volume_spike",
+        "efficiency_ratio",
+        "gap",
+        "minute_of_day",
+        "day_of_week",
+        "l3_base_iv",
+    ]
+
+
+def _l3_policy_matrix_column_names(extra_merged: list[str]) -> list[str]:
+    cols = [
+        "l2_straddle_on",
+        "l2_range_pred",
+        "l2_gate_prob",
         "l2_decision_confidence",
         "l2_size",
         "l2_pred_mfe",
         "l2_pred_mae",
+        *(
+            [
+                "l2_predicted_profit",
+                "l3_l2_vol_regime_id",
+                "l2_regime_size_mult",
+            ]
+            if _l3_straddle_sim_mode_enabled()
+            else []
+        ),
         *[f"l2_entry_regime_{idx}" for idx in range(len(L1A_REGIME_COLS))],
         "l2_entry_vol",
         *L1A_REGIME_COLS,
@@ -328,6 +387,30 @@ def _l3_policy_matrix_column_names(extra_merged: list[str]) -> list[str]:
         "l3_regret_velocity",
         "l3_trade_quality_bayes",
     ]
+    if _l3_straddle_sim_mode_enabled():
+        cols.extend(
+            [
+                "l3_straddle_value_rel",
+                "l3_straddle_pnl_pct",
+                "l3_straddle_theta",
+                "l3_straddle_vega",
+                "l3_straddle_gamma",
+                "l3_straddle_iv",
+                "l3_straddle_entry_iv",
+                "l3_straddle_t_remaining",
+                "l3_underlying_abs_move",
+                "l3_underlying_gap_abs",
+                "l3_theta_burn_rate",
+                "l3_iv_rv_spread",
+                "l3_remaining_dte_ratio",
+                "l3_vixy_max_since_entry",
+                "l3_vixy_rel_entry",
+                "l3_roll_pnl_vol_5",
+                "l3_pnl_path_curvature",
+                *_l3_straddle_feature_columns(),
+            ]
+        )
+    return cols
 
 
 def _l3_validate_hysteresis_env() -> None:
@@ -435,6 +518,23 @@ def _l3_policy_dataset_fingerprint(
             "L3_LATE_HOLD_MIN_BARS": os.environ.get("L3_LATE_HOLD_MIN_BARS", ""),
             "L3_LATE_HOLD_RAMP": os.environ.get("L3_LATE_HOLD_RAMP", ""),
             "L3_LATE_HOLD_RAMP_EPS_FLOOR": os.environ.get("L3_LATE_HOLD_RAMP_EPS_FLOOR", ""),
+            "L3_TRUST_L2_ENTRY": os.environ.get("L3_TRUST_L2_ENTRY", ""),
+            "L3_ENTRY_MIN_CONFIDENCE": os.environ.get("L3_ENTRY_MIN_CONFIDENCE", ""),
+            "L3_ENTRY_MIN_SIZE": os.environ.get("L3_ENTRY_MIN_SIZE", ""),
+            "L3_STRADDLE_SIM_MODE": os.environ.get("L3_STRADDLE_SIM_MODE", ""),
+            "L3_STRADDLE_BASE_IV_MODEL": os.environ.get("L3_STRADDLE_BASE_IV_MODEL", ""),
+            "L3_STRADDLE_IV_SCENARIOS": os.environ.get("L3_STRADDLE_IV_SCENARIOS", ""),
+            "L3_STRADDLE_IV_PATH_MODE": os.environ.get("L3_STRADDLE_IV_PATH_MODE", ""),
+            "L3_STRADDLE_DTE_GRID": os.environ.get("L3_STRADDLE_DTE_GRID", ""),
+            "L3_STRADDLE_SCENARIO_COUNT": os.environ.get("L3_STRADDLE_SCENARIO_COUNT", ""),
+            "L3_STRADDLE_RISK_FREE_RATE": os.environ.get("L3_STRADDLE_RISK_FREE_RATE", ""),
+            "L3_STRADDLE_MAX_HOLD_MINUTES": os.environ.get("L3_STRADDLE_MAX_HOLD_MINUTES", ""),
+            "L3_STRADDLE_IV_RISK_PREMIUM": os.environ.get("L3_STRADDLE_IV_RISK_PREMIUM", ""),
+            "L3_STRADDLE_VALUE_TARGET": os.environ.get("L3_STRADDLE_VALUE_TARGET", ""),
+            "L3_VALUE_THETA_NET_SCALE": os.environ.get("L3_VALUE_THETA_NET_SCALE", ""),
+            "L3_VALUE_BINARY_HURDLE": os.environ.get("L3_VALUE_BINARY_HURDLE", ""),
+            "L3_VALUE_TERNARY_THRESH": os.environ.get("L3_VALUE_TERNARY_THRESH", ""),
+            "L3_POLICY_SHARPE_SCORE_WEIGHT": os.environ.get("L3_POLICY_SHARPE_SCORE_WEIGHT", ""),
         },
         "df_hash": _hash_frame_columns(
             df,
@@ -446,13 +546,18 @@ def _l3_policy_dataset_fingerprint(
             [
                 "symbol",
                 "time_key",
-                "l2_decision_class",
+                "l2_straddle_on",
+                "l2_gate_prob",
+                "l2_range_pred",
                 "l2_decision_confidence",
                 "l2_size",
+                "l2_predicted_profit",
                 "l2_pred_mfe",
                 "l2_pred_mae",
                 *[f"l2_entry_regime_{idx}" for idx in range(len(L1A_REGIME_COLS))],
                 "l2_entry_vol",
+                "l2_vol_regime",
+                "l2_regime_size_mult",
             ],
         ),
         "upstream_schema": _l3_upstream_schema_fingerprint(),
@@ -736,6 +841,11 @@ def _l3_prepare_value_targets(
         clipped_frac = float(np.mean((below | above)[finite_train])) if finite_train.any() else 0.0
         y[below] = clip_lo
         y[above] = clip_hi
+    transform = (os.environ.get("L3_VALUE_TARGET_TRANSFORM", "signed_log1p").strip().lower() or "signed_log1p")
+    if transform not in {"none", "signed_log1p"}:
+        transform = "signed_log1p"
+    if transform == "signed_log1p":
+        y = (np.sign(y.astype(np.float64)) * np.log1p(np.abs(y.astype(np.float64)))).astype(np.float32)
     objective = (os.environ.get("L3_VALUE_OBJECTIVE", "huber").strip().lower() or "huber")
     if objective not in {"huber", "fair", "regression"}:
         objective = "huber"
@@ -749,6 +859,7 @@ def _l3_prepare_value_targets(
         "clip_lo": float(clip_lo),
         "clip_hi": float(clip_hi),
         "train_clipped_frac": float(clipped_frac),
+        "target_transform": str(transform),
         "objective": str(objective),
         "metric": str(metric),
     }
@@ -759,6 +870,15 @@ def _l3_prepare_value_targets(
     elif objective == "fair":
         stats["fair_c"] = _env_float_clipped("L3_VALUE_FAIR_C", 1.0, lo=0.10, hi=10.0)
     return y, stats
+
+
+def _l3_inverse_value_target_transform(pred: np.ndarray, prep: dict[str, Any] | None = None) -> np.ndarray:
+    arr = np.asarray(pred, dtype=np.float64).ravel()
+    cfg = dict(prep or {})
+    transform = str(cfg.get("target_transform", "none")).strip().lower() or "none"
+    if transform == "signed_log1p":
+        arr = np.sign(arr) * np.expm1(np.abs(arr))
+    return arr
 
 
 def _l3_value_lgb_params(exit_params: dict[str, Any], *, seed: int, prep: dict[str, float | str | bool]) -> dict[str, Any]:
@@ -804,10 +924,12 @@ def _l3_value_predict_hurdle(
     value_nonzero_model: lgb.Booster | None,
     *,
     prob_power: float = 1.0,
+    prep: dict[str, Any] | None = None,
 ) -> np.ndarray:
     if value_reg_model is None:
         return np.zeros(len(X), dtype=np.float64)
-    mu = value_reg_model.predict(X).astype(np.float64)
+    mu_model = value_reg_model.predict(X).astype(np.float64)
+    mu = _l3_inverse_value_target_transform(mu_model, prep)
     if value_nonzero_model is None:
         return mu
     p_nz = np.clip(value_nonzero_model.predict(X).astype(np.float64), 0.0, 1.0)
@@ -923,6 +1045,27 @@ def _l3_entry_policy_defaults() -> tuple[float, float]:
     return min_conf, min_size
 
 
+def _l3_trust_l2_entry_enabled() -> bool:
+    """If True, skip entry-policy grid search: L2 is the sole entry layer; L3 only learns exit."""
+    return os.environ.get("L3_TRUST_L2_ENTRY", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _l3_entry_policy_trust_l2_fixed() -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Fixed thresholds from env (defaults 0/0 so l2_straddle_on + L2 conf/size gate entries)."""
+    mc = float(np.clip(float(os.environ.get("L3_ENTRY_MIN_CONFIDENCE", "0.0")), 0.0, 1.0))
+    ms = float(max(0.0, float(os.environ.get("L3_ENTRY_MIN_SIZE", "0.0"))))
+    global_policy: dict[str, float] = {
+        "min_confidence": mc,
+        "min_size": ms,
+        "score": float("nan"),
+        "trade_rate": float("nan"),
+        "precision_active": float("nan"),
+        "correct_side": float("nan"),
+        "avg_abs_edge": float("nan"),
+    }
+    return global_policy, {}
+
+
 def _l3_lookup_policy_map(
     state_keys: np.ndarray,
     mapping: dict[str, dict[str, float]] | None,
@@ -939,17 +1082,6 @@ def _l3_lookup_policy_map(
             if name in params:
                 out[name][m] = float(params[name])
     return out
-
-
-def _l3_entry_policy_config(state_key: str | None, meta: dict[str, Any] | None = None) -> tuple[float, float]:
-    base_conf, base_size = _l3_entry_policy_defaults()
-    if meta is None or state_key is None:
-        return base_conf, base_size
-    params = (meta.get("l3_entry_policy_by_state") or {}).get(str(state_key), {})
-    return (
-        float(params.get("min_confidence", meta.get("l3_entry_min_confidence", base_conf))),
-        float(params.get("min_size", meta.get("l3_entry_min_size", base_size))),
-    )
 
 
 def _l3_exit_epsilon_atr() -> float:
@@ -1444,6 +1576,23 @@ def _l3_exp_decay_weights(
     return w, {"mode": "exp_decay", "half_life_days": float(hl_days), "half_life_rows": float(hl_rows), "lambda": lambda_}
 
 
+def _l3_policy_sharpe_score_term(
+    realized: np.ndarray,
+    value_true: np.ndarray,
+    sw: np.ndarray | None,
+) -> float:
+    """Optional add-on to policy score: Sharpe-like uplift mean(realized / std(y_true)) (straddle profit focus)."""
+    w = float(os.environ.get("L3_POLICY_SHARPE_SCORE_WEIGHT", "0.0"))
+    if w <= 0.0:
+        return 0.0
+    vt = np.asarray(value_true, dtype=np.float64).ravel()
+    fin = np.isfinite(vt)
+    if not fin.any():
+        return 0.0
+    vsd = float(np.std(vt[fin])) + 1e-6
+    return w * float(_weighted_mean(realized / vsd, sw))
+
+
 def _l3_search_exit_policy(
     exit_prob: np.ndarray,
     value_pred: np.ndarray,
@@ -1604,6 +1753,7 @@ def _l3_search_exit_policy(
                         - exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
                         - miss_exit_penalty * miss_exit
                     )
+                    utility_score += _l3_policy_sharpe_score_term(realized, value_true, sw)
                 hold_recall_contrib = hold_recall_w * hold_recall
                 exit_rate_penalty_contrib = exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
                 score = (
@@ -1754,6 +1904,7 @@ def _l3_search_exit_policy(
                             - exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
                             - miss_exit_penalty * miss_exit
                         )
+                        utility_score += _l3_policy_sharpe_score_term(realized, value_true, sw)
                     hold_recall_contrib = hold_recall_w * hold_recall
                     exit_rate_penalty_contrib = exit_rate_penalty * max(0.0, exit_rate - target_exit_rate)
                     score = (
@@ -2548,6 +2699,527 @@ def l3_should_exit_by_policy(
     return prob >= float(exit_prob_threshold)
 
 
+def _l3_straddle_risk_free_rate() -> float:
+    return float(os.environ.get("L3_STRADDLE_RISK_FREE_RATE", "0.04"))
+
+
+def _l3_straddle_max_hold_minutes(default_max_hold: int) -> int:
+    raw = os.environ.get("L3_STRADDLE_MAX_HOLD_MINUTES", "").strip()
+    if raw:
+        return max(30, int(raw))
+    return max(int(default_max_hold), 390)
+
+
+def _l3_straddle_iv_path_mode() -> str:
+    return (os.environ.get("L3_STRADDLE_IV_PATH_MODE", "garch_plus_scenarios") or "garch_plus_scenarios").strip().lower()
+
+
+def _l3_regime_name_to_id(name: str) -> float:
+    order = {
+        "low_vol_stable": 0.0,
+        "low_vol_rising": 1.0,
+        "mid_vol": 2.0,
+        "high_vol_stable": 3.0,
+        "high_vol_falling": 4.0,
+    }
+    return float(order.get(str(name), -1.0))
+
+
+def _l3_attach_vixy_for_straddle_if_needed(merged: pd.DataFrame) -> pd.DataFrame:
+    """Align VIXY ratio features for path-aware straddle columns (reuse L2 helper)."""
+    if not L2_USE_VIXY or "vixy_level_ma60_ratio" in merged.columns:
+        return merged
+    try:
+        from core.features.vixy_features import attach_vixy_features_to_l2_merged
+
+        attach_vixy_features_to_l2_merged(merged, path=VIXY_DATA_PATH)
+    except Exception as ex:
+        print(f"  [L3] VIXY attach skipped in straddle prep: {ex}", flush=True)
+    return merged
+
+
+def _l3_straddle_value_target_mode() -> str:
+    return (os.environ.get("L3_STRADDLE_VALUE_TARGET", "future_gain") or "future_gain").strip().lower()
+
+
+def _l3_compute_straddle_value_y(
+    future_gain: np.ndarray,
+    trade_df: pd.DataFrame,
+    rv_seg: np.ndarray,
+    *,
+    mode: str | None = None,
+) -> np.ndarray:
+    """Value head label for straddle rows: future_gain (default), Sharpe-like, theta-adjusted, binary, or 3-class."""
+    fg = np.asarray(future_gain, dtype=np.float64).ravel()
+    m = (mode or _l3_straddle_value_target_mode()).strip().lower()
+    if m in {"", "future_gain", "default"}:
+        return fg.astype(np.float32)
+    rv = np.maximum(np.asarray(rv_seg, dtype=np.float64).ravel(), 1e-4)
+    if m in {"sharpe_proxy", "sharpe"}:
+        return np.clip(fg / rv, -50.0, 50.0).astype(np.float32)
+    if m in {"theta_net", "theta_adj"}:
+        th = np.abs(trade_df["theta"].to_numpy(dtype=np.float64))
+        sc = float(os.environ.get("L3_VALUE_THETA_NET_SCALE", "1.0"))
+        return (fg - sc * th).astype(np.float32)
+    if m in {"binary_hurdle", "hurdle_binary"}:
+        thr = float(os.environ.get("L3_VALUE_BINARY_HURDLE", "0.02"))
+        return (fg > thr).astype(np.float32)
+    if m in {"ternary_q", "quantile_3", "three_class"}:
+        raw = (os.environ.get("L3_VALUE_TERNARY_THRESH", "0.015,0.045") or "0.015,0.045").strip().split(",")
+        lo = float(raw[0]) if len(raw) > 0 else 0.015
+        hi = float(raw[1]) if len(raw) > 1 else 0.045
+        y = np.where(fg < lo, 0.0, np.where(fg < hi, 1.0, 2.0))
+        return y.astype(np.float32)
+    return fg.astype(np.float32)
+
+
+def _l3_prepare_straddle_merged_frame(merged: pd.DataFrame) -> pd.DataFrame:
+    out = build_straddle_features(merged, timestamp_col="time_key")
+    out["l3_base_iv"] = build_base_iv_series(out, timestamp_col="time_key", close_col="close")
+    if "l2_vol_regime" in out.columns:
+        out["l3_l2_vol_regime_id"] = out["l2_vol_regime"].astype(str).map(_l3_regime_name_to_id).fillna(-1.0)
+    else:
+        out["l3_l2_vol_regime_id"] = -1.0
+    if "l2_regime_size_mult" not in out.columns:
+        out["l2_regime_size_mult"] = 1.0
+    if "l2_predicted_profit" not in out.columns:
+        out["l2_predicted_profit"] = 0.0
+    out = _l3_attach_vixy_for_straddle_if_needed(out)
+    return out
+
+
+def _l3_build_straddle_policy_dataset(
+    merged: pd.DataFrame,
+    *,
+    max_hold: int,
+    traj_cfg: L3TrajectoryConfig | None,
+    build_traj: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    merged = _l3_prepare_straddle_merged_frame(merged)
+    extra_merged = _l3_extra_merged_feature_columns()
+    for c in extra_merged:
+        if c not in merged.columns:
+            raise ValueError(f"L3_MERGED_EXTRA_FEATURE_COLUMNS: missing column {c!r} in merged frame")
+    feature_cols = _l3_policy_matrix_column_names(extra_merged)
+    print(f"  [L3] straddle value target mode={_l3_straddle_value_target_mode()!r}", flush=True)
+    symbols = merged["symbol"].to_numpy()
+    times = pd.to_datetime(merged["time_key"]).to_numpy()
+    close_px = pd.to_numeric(merged["close"], errors="coerce").to_numpy(dtype=np.float64)
+    current_regime = merged[L1A_REGIME_COLS].to_numpy(dtype=np.float32, copy=False)
+    entry_regime = merged[[f"l2_entry_regime_{idx}" for idx in range(len(L1A_REGIME_COLS))]].to_numpy(dtype=np.float32, copy=False)
+    current_vol = merged["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
+    entry_vol = merged["l2_entry_vol"].to_numpy(dtype=np.float32, copy=False)
+    straddle_on_arr = pd.to_numeric(merged.get("l2_straddle_on", 0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    decision_class = np.ones(len(merged), dtype=np.int64)
+    decision_class[straddle_on_arr > 0.5] = 0
+    decision_conf = merged["l2_decision_confidence"].to_numpy(dtype=np.float32, copy=False)
+    size = merged["l2_size"].to_numpy(dtype=np.float32, copy=False)
+    pred_mfe = merged["l2_pred_mfe"].to_numpy(dtype=np.float32, copy=False)
+    pred_mae = merged["l2_pred_mae"].to_numpy(dtype=np.float32, copy=False)
+    safe_atr = np.where(
+        pd.to_numeric(merged["lbl_atr"], errors="coerce").fillna(0.0).to_numpy() > 1e-3,
+        merged["lbl_atr"].to_numpy(dtype=np.float64),
+        1e-3,
+    )
+    pa_state = _l3_pa_dict_from_frame(merged)
+    oot_mask = (times >= np.datetime64(CAL_END)) & (times < np.datetime64(TEST_END))
+    policy_vol_quantiles = _policy_vol_quantiles(current_vol, fit_mask=oot_mask)
+    state_keys_all = _append_pa_bucket_to_state_keys(
+        _state_keys_from_regime_vol(current_regime, current_vol, vol_quantiles=policy_vol_quantiles),
+        pa_state_bucket_labels_from_frame(merged) if _l3_pa_policy_enabled() else None,
+    )
+    target_horizon_global, target_horizon_by_state = _l3_target_horizon_by_state(
+        state_keys_all[oot_mask] if oot_mask.any() else state_keys_all,
+        np.full(int(max(1, np.sum(oot_mask) if oot_mask.any() else len(merged))), float(np.median(dte_grid_days())) * 390.0, dtype=np.float32),
+        max_hold=_l3_straddle_max_hold_minutes(max_hold),
+        pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
+    )
+    if _l3_trust_l2_entry_enabled():
+        entry_policy_global, entry_policy_by_state = _l3_entry_policy_trust_l2_fixed()
+        print(
+            f"  [L3] entry policy: TRUST_L2_ENTRY=1 (straddle sim)  "
+            f"min_conf={entry_policy_global['min_confidence']:.4f}  min_size={entry_policy_global['min_size']:.4f}  states=0",
+            flush=True,
+        )
+    else:
+        edge_atr = _decision_edge_atr_array(merged).astype(np.float64)
+        tau_edge = float(max(0.0, float(os.environ.get("STACK_DECISION_EDGE_TAU", "0.05"))))
+        entry_policy_global, entry_policy_by_state = _l3_search_entry_policy(
+            state_keys_all[oot_mask] if oot_mask.any() else state_keys_all,
+            decision_class[oot_mask] if oot_mask.any() else decision_class,
+            decision_conf[oot_mask] if oot_mask.any() else decision_conf,
+            size[oot_mask] if oot_mask.any() else size,
+            edge_atr[oot_mask] if oot_mask.any() else edge_atr,
+            tau_edge,
+            pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
+        )
+    entry_policy_arrays = _l3_lookup_policy_map(
+        state_keys_all,
+        entry_policy_by_state,
+        defaults={
+            "min_confidence": float(entry_policy_global["min_confidence"]),
+            "min_size": float(entry_policy_global["min_size"]),
+        },
+    )
+    policy_loss_buffer_base, policy_loss_buffer_meta = _resolve_l3_policy_loss_buffer_atr(merged, oot_mask)
+    base_iv = pd.to_numeric(merged["l3_base_iv"], errors="coerce").fillna(0.25).to_numpy(dtype=np.float64)
+    if os.environ.get("L3_TRAJ_MFE_SCALE", "").strip():
+        traj_mfe_scale = max(float(os.environ["L3_TRAJ_MFE_SCALE"]), 1e-6)
+    else:
+        traj_mfe_scale = max(float(np.nanquantile(np.maximum(pred_mfe.astype(np.float64), 0.0), 0.99)), 1.0)
+    if os.environ.get("L3_TRAJ_MAE_SCALE", "").strip():
+        traj_mae_scale = max(float(os.environ["L3_TRAJ_MAE_SCALE"]), 1e-6)
+    else:
+        traj_mae_scale = max(float(np.nanquantile(np.maximum(pred_mae.astype(np.float64), 0.0), 0.99)), 1.0)
+    _t_base = traj_cfg or L3TrajectoryConfig()
+    _t_cfg_eff = replace(_t_base, mfe_norm_scale=float(traj_mfe_scale), mae_norm_scale=float(traj_mae_scale))
+    _t_max = _t_cfg_eff.max_seq_len
+    _t_ref = max(_t_max, int(_l3_straddle_max_hold_minutes(max_hold)))
+    simulator = StraddleSimulator(risk_free_rate=_l3_straddle_risk_free_rate())
+    run_end = np.empty(len(merged), dtype=np.int32)
+    run_start = 0
+    for idx in range(1, len(merged) + 1):
+        if idx == len(merged) or symbols[idx] != symbols[run_start]:
+            run_end[run_start:idx] = idx
+            run_start = idx
+    rows_x_blocks: list[np.ndarray] = []
+    rows_exit_blocks: list[np.ndarray] = []
+    rows_value_blocks: list[np.ndarray] = []
+    rows_time_blocks: list[np.ndarray] = []
+    rows_entry_blocks: list[np.ndarray] = []
+    rows_from_model_blocks: list[np.ndarray] = []
+    rows_traj: list[np.ndarray] = []
+    rows_traj_len: list[int] = []
+    n_policy_signals_model = 0
+    n_policy_signals_truth = 0
+    max_hold_minutes = _l3_straddle_max_hold_minutes(max_hold)
+    dtes = dte_grid_days()
+    row_it = range(len(merged))
+    if _lgb_round_tqdm_enabled():
+        row_it = tqdm(row_it, desc="[L3] straddle dataset", unit="bar", leave=False, file=_tqdm_stream(), mininterval=1.0)
+    for i in row_it:
+        if i + 2 >= len(merged) or run_end[i] <= i + 1:
+            continue
+        min_confidence = float(entry_policy_arrays["min_confidence"][i])
+        min_size = float(entry_policy_arrays["min_size"][i])
+        model_side = l3_entry_side_from_l2(
+            int(decision_class[i]),
+            float(decision_conf[i]),
+            float(size[i]),
+            min_confidence=min_confidence,
+            min_size=min_size,
+        )
+        if model_side == 0.0:
+            continue
+        n_policy_signals_model += 1
+        available = int(run_end[i] - (i + 1))
+        if available <= 2:
+            continue
+        rng_i = np.random.default_rng(int(i) + 17)
+        for dte in dtes:
+            horizon = min(available, max_hold_minutes, int(dte * 390))
+            if horizon <= 2:
+                continue
+            if _l3_straddle_iv_path_mode() in {"garch", "proxy", "deterministic"}:
+                scenario_map = {"proxy_0": np.full(horizon, float(base_iv[i]), dtype=np.float32)}
+            else:
+                scenario_map = generate_iv_scenarios(float(base_iv[i]), horizon, rng=rng_i, n_scenarios=scenario_count())
+            for _scenario_name, iv_path in scenario_map.items():
+                trade_df = simulator.simulate_trade(
+                    merged,
+                    entry_idx=i,
+                    dte_days=dte,
+                    entry_iv=float(base_iv[i]),
+                    iv_path=iv_path,
+                    max_minutes=horizon,
+                    timestamp_col="time_key",
+                    base_iv_col="l3_base_iv",
+                )
+                if trade_df.empty:
+                    continue
+                n_steps = len(trade_df)
+                idx_arr = np.arange(i + 1, i + 1 + n_steps, dtype=np.int32)
+                holds = trade_df["minute"].to_numpy(dtype=np.float32)
+                pnl_pct = trade_df["pnl_pct"].to_numpy(dtype=np.float32)
+                straddle_value_rel = (trade_df["straddle_value"].to_numpy(dtype=np.float32) / max(float(trade_df["entry_value"].iloc[0]), 1e-6)).astype(np.float32)
+                live_mfe_seg = np.maximum.accumulate(np.maximum(pnl_pct, 0.0)).astype(np.float32)
+                peak_pnl = np.maximum.accumulate(pnl_pct.astype(np.float64))
+                drawdown_from_peak = (peak_pnl - pnl_pct.astype(np.float64)).astype(np.float32)
+                live_mae_seg = np.maximum.accumulate(np.maximum(-pnl_pct, 0.0)).astype(np.float32)
+                future_best = np.maximum.accumulate(pnl_pct[::-1])[::-1].astype(np.float32)
+                future_gain_left = (future_best - pnl_pct).astype(np.float32)
+                live_edge_seg = (live_mfe_seg - live_mae_seg).astype(np.float32)
+                regime_div_seg = _kl_divergence(np.repeat(entry_regime[i : i + 1], n_steps, axis=0), current_regime[idx_arr]).astype(np.float32, copy=False)
+                safe_entry_vol = max(float(entry_vol[i]), 1e-3)
+                vol_surprise_seg = (current_vol[idx_arr] / safe_entry_vol).astype(np.float32, copy=False)
+                log_h_seg = np.log1p(holds).astype(np.float32, copy=False)
+                h_sq_seg = ((holds * holds) / 100.0).astype(np.float32, copy=False)
+                h_bkt_seg = np.searchsorted(np.array([3, 8, 15, 30, 999], dtype=np.int64), holds.astype(np.int64), side="right").astype(np.float32)
+                close_seg = close_px[idx_arr].astype(np.float64, copy=False)
+                atr_d = max(float(safe_atr[i]), 1e-6)
+                vel3 = np.zeros(n_steps, dtype=np.float32)
+                for j in range(n_steps):
+                    j0 = max(0, j - 3)
+                    vel3[j] = float((close_seg[j] - close_seg[j0]) / atr_d)
+                reg_div_d = regime_div_seg.astype(np.float64, copy=False)
+                mom_rd = np.zeros(n_steps, dtype=np.float32)
+                for j in range(n_steps):
+                    j0 = max(0, j - 3)
+                    mom_rd[j] = float(reg_div_d[j] - reg_div_d[j0])
+                vs = vol_surprise_seg.astype(np.float64, copy=False)
+                vs_acc = np.zeros(n_steps, dtype=np.float32)
+                for j in range(n_steps):
+                    if j >= 2:
+                        vs_acc[j] = float(vs[j] - 2.0 * vs[j - 1] + vs[j - 2])
+                cr = current_regime[idx_arr].astype(np.float64, copy=False)
+                rid = np.argmax(cr, axis=1).astype(np.int32, copy=False)
+                stab = np.zeros(n_steps, dtype=np.float32)
+                for j in range(n_steps):
+                    lo = max(0, j - 2)
+                    stab[j] = float(np.mean(rid[lo : j + 1] == rid[j]))
+                if "l2_gate_prob" in merged.columns:
+                    gp = np.clip(pd.to_numeric(merged["l2_gate_prob"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64), 0.0, 1.0)
+                    neutral = (1.0 - gp).astype(np.float64)
+                else:
+                    neutral = np.where(decision_class == 1, 1.0, 0.25).astype(np.float64)
+                aux_block = _l3_episode_aux_feature_block(
+                    n_steps=n_steps,
+                    idx_arr=idx_arr,
+                    entry_i=i,
+                    side=float(model_side),
+                    decision_class=decision_class,
+                    decision_conf=decision_conf,
+                    size=size,
+                    neutral=neutral,
+                    entry_regime_row=entry_regime[i],
+                    current_regime=current_regime,
+                    unreal_seg=pnl_pct,
+                    min_conf_arr=entry_policy_arrays["min_confidence"],
+                    min_size_arr=entry_policy_arrays["min_size"],
+                    drawdown_from_peak=drawdown_from_peak,
+                )
+                rng_i_row = float(merged["l2_range_pred"].iloc[i]) if "l2_range_pred" in merged.columns else 0.0
+                gp_i = float(merged["l2_gate_prob"].iloc[i]) if "l2_gate_prob" in merged.columns else float(decision_conf[i])
+                dyn_scalar_parts: list[np.ndarray] = [
+                    np.full(n_steps, float(straddle_on_arr[i]), dtype=np.float32),
+                    np.full(n_steps, rng_i_row, dtype=np.float32),
+                    np.full(n_steps, gp_i, dtype=np.float32),
+                    np.full(n_steps, decision_conf[i], dtype=np.float32),
+                    np.full(n_steps, size[i], dtype=np.float32),
+                    np.full(n_steps, pred_mfe[i], dtype=np.float32),
+                    np.full(n_steps, pred_mae[i], dtype=np.float32),
+                    np.full(n_steps, float(pd.to_numeric(merged.get("l2_predicted_profit", 0.0), errors="coerce").iloc[i]) if "l2_predicted_profit" in merged.columns else 0.0, dtype=np.float32),
+                    np.full(n_steps, float(merged["l3_l2_vol_regime_id"].iloc[i]), dtype=np.float32),
+                    np.full(n_steps, float(merged["l2_regime_size_mult"].iloc[i]), dtype=np.float32),
+                ]
+                straddle_dyn_parts: list[np.ndarray] = [
+                    straddle_value_rel,
+                    pnl_pct,
+                    trade_df["theta"].to_numpy(dtype=np.float32),
+                    trade_df["vega"].to_numpy(dtype=np.float32),
+                    trade_df["gamma"].to_numpy(dtype=np.float32),
+                    trade_df["iv"].to_numpy(dtype=np.float32),
+                    np.asarray(trade_df["entry_iv"].to_numpy(dtype=np.float32), dtype=np.float32),
+                    trade_df["T_remaining"].to_numpy(dtype=np.float32),
+                    trade_df["underlying_abs_move"].to_numpy(dtype=np.float32),
+                    trade_df["underlying_gap_abs"].to_numpy(dtype=np.float32),
+                ]
+                if "rv_60" in merged.columns:
+                    rv_seg = merged.loc[idx_arr, "rv_60"].to_numpy(dtype=np.float64)
+                else:
+                    rv_seg = np.full(n_steps, 0.25, dtype=np.float64)
+                theta_arr = trade_df["theta"].to_numpy(dtype=np.float64)
+                Trem = trade_df["T_remaining"].to_numpy(dtype=np.float64)
+                T0 = max(float(trade_df["T_remaining"].iloc[0]), 1e-8)
+                rem_rat = (Trem / T0).astype(np.float32)
+                theta_burn = (np.abs(theta_arr) / np.maximum(Trem, 1e-8)).astype(np.float32)
+                iv_arr = trade_df["iv"].to_numpy(dtype=np.float64)
+                iv_rv_spread = (iv_arr - rv_seg).astype(np.float32)
+                if "vixy_level_ma60_ratio" in merged.columns:
+                    vtrack = pd.to_numeric(merged["vixy_level_ma60_ratio"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float64)
+                    v0 = float(vtrack[i]) if np.isfinite(vtrack[i]) else 1.0
+                    seg = vtrack[idx_arr]
+                    vixy_run = (np.maximum.accumulate(seg) / max(v0, 1e-6)).astype(np.float32)
+                    vixy_rel = (seg / max(v0, 1e-6)).astype(np.float32)
+                else:
+                    vixy_run = np.ones(n_steps, dtype=np.float32)
+                    vixy_rel = np.ones(n_steps, dtype=np.float32)
+                pnlp = pnl_pct.astype(np.float64)
+                roll_vol = np.zeros(n_steps, dtype=np.float32)
+                for jj in range(n_steps):
+                    lo = max(0, jj - 4)
+                    if jj - lo >= 1:
+                        roll_vol[jj] = float(np.std(pnlp[lo : jj + 1]))
+                curv = np.zeros(n_steps, dtype=np.float32)
+                if n_steps >= 3:
+                    curv[2:] = np.abs(np.diff(pnlp, n=2)).astype(np.float32)
+                straddle_extra_parts = [
+                    theta_burn,
+                    iv_rv_spread,
+                    rem_rat,
+                    vixy_run,
+                    vixy_rel,
+                    roll_vol,
+                    curv,
+                ]
+                engineered_parts = [merged.loc[idx_arr, c].to_numpy(dtype=np.float32, copy=False) for c in _l3_straddle_feature_columns()]
+                extra_parts = [merged.loc[idx_arr, _xc].to_numpy(dtype=np.float32, copy=False) for _xc in extra_merged]
+                stack_parts: list[np.ndarray] = dyn_scalar_parts
+                stack_parts.extend(
+                    [
+                        np.repeat(entry_regime[i : i + 1], n_steps, axis=0),
+                        np.full(n_steps, entry_vol[i], dtype=np.float32),
+                        current_regime[idx_arr],
+                        current_vol[idx_arr].astype(np.float32, copy=False),
+                        regime_div_seg,
+                        vol_surprise_seg,
+                        holds,
+                        pnl_pct.astype(np.float32, copy=False),
+                        live_mfe_seg,
+                        live_mae_seg,
+                        live_edge_seg,
+                        np.full(n_steps, float(model_side), dtype=np.float32),
+                        log_h_seg,
+                        h_sq_seg,
+                        h_bkt_seg,
+                        drawdown_from_peak,
+                        vel3,
+                        mom_rd,
+                        vs_acc,
+                        stab,
+                        merged.loc[idx_arr, PA_STATE_FEATURES].to_numpy(dtype=np.float32, copy=False),
+                        *extra_parts,
+                        aux_block,
+                        *straddle_dyn_parts,
+                        *straddle_extra_parts,
+                        *engineered_parts,
+                    ]
+                )
+                feat_block = np.column_stack(stack_parts).astype(np.float32, copy=False)
+                step_trend = np.asarray(pa_state["pa_state_trend_strength"][idx_arr], dtype=np.float32)
+                step_follow = np.asarray(pa_state["pa_state_followthrough_quality"][idx_arr], dtype=np.float32)
+                step_range = np.asarray(pa_state["pa_state_range_risk"][idx_arr], dtype=np.float32)
+                step_breakout = np.asarray(pa_state["pa_state_breakout_failure_risk"][idx_arr], dtype=np.float32)
+                step_pullback = np.asarray(pa_state["pa_state_pullback_exhaustion"][idx_arr], dtype=np.float32)
+                if _l3_pa_targets_enabled():
+                    eps_arr = (_l3_exit_epsilon_atr() * pa_exit_eps_multiplier(step_range, step_breakout, step_pullback, step_trend, step_follow)).astype(np.float32)
+                    loss_buffer_arr = (policy_loss_buffer_base * pa_exit_loss_buffer_multiplier(step_range, step_breakout, step_pullback, step_trend)).astype(np.float32)
+                else:
+                    eps_arr = np.full(n_steps, _l3_exit_epsilon_atr(), dtype=np.float32)
+                    loss_buffer_arr = np.full(n_steps, policy_loss_buffer_base, dtype=np.float32)
+                last_step = np.arange(n_steps) == (n_steps - 1)
+                exit_block = (last_step | (future_gain_left <= eps_arr) | (drawdown_from_peak >= loss_buffer_arr)).astype(np.int32, copy=False)
+                rows_x_blocks.append(feat_block)
+                rows_exit_blocks.append(exit_block)
+                rows_value_blocks.append(
+                    _l3_compute_straddle_value_y(future_gain_left, trade_df, rv_seg, mode=_l3_straddle_value_target_mode())
+                )
+                rows_time_blocks.append(times[idx_arr])
+                rows_entry_blocks.append(np.full(n_steps, int(i), dtype=np.int64))
+                rows_from_model_blocks.append(np.full(n_steps, 1, dtype=np.int32))
+                if build_traj:
+                    traj_hist = np.zeros((_t_max, _t_cfg_eff.seq_feat_dim), dtype=np.float32)
+                    traj_len_cur = 0
+                    peak_unreal = -1e9
+                    prev_unreal = 0.0
+                    price_rel = trade_df["underlying"].to_numpy(dtype=np.float32) / max(float(close_px[i]), 1e-6)
+                    for local_idx in range(n_steps):
+                        peak_unreal = max(peak_unreal, float(pnl_pct[local_idx]))
+                        tvec = l3_traj_step_features_straddle(
+                            float(pnl_pct[local_idx]),
+                            prev_unreal,
+                            peak_unreal,
+                            int(holds[local_idx]),
+                            np.datetime64(trade_df["timestamp"].iloc[local_idx]),
+                            float(price_rel[max(local_idx - 1, 0)]),
+                            float(price_rel[local_idx]),
+                            float(trade_df["underlying_abs_move"].iloc[local_idx]),
+                            float(trade_df["iv"].iloc[local_idx]),
+                            float(vol_surprise_seg[local_idx]),
+                            float(regime_div_seg[local_idx]),
+                            float(trade_df["vega"].iloc[local_idx]),
+                            float(abs(trade_df["theta"].iloc[local_idx])),
+                            max_seq_ref=_t_ref,
+                            mfe_scale=_t_cfg_eff.mfe_norm_scale,
+                            mae_scale=_t_cfg_eff.mae_norm_scale,
+                        )
+                        prev_unreal = float(pnl_pct[local_idx])
+                        if traj_len_cur < _t_max:
+                            traj_hist[traj_len_cur] = tvec
+                            traj_len_cur += 1
+                        else:
+                            traj_hist[:-1] = traj_hist[1:]
+                            traj_hist[-1] = tvec
+                        rows_traj.append(traj_hist.copy())
+                        rows_traj_len.append(traj_len_cur)
+    if not rows_x_blocks:
+        print("  [L3] straddle policy dataset empty: no valid L2 straddle entries / simulated paths.", flush=True)
+        return (
+            np.empty((0, len(feature_cols)), dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype="datetime64[ns]"),
+            feature_cols,
+            np.empty(0, dtype=np.int64),
+            np.empty((0, _t_max, _t_cfg_eff.seq_feat_dim), dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
+            {
+                "policy_state_vol_quantiles": policy_vol_quantiles,
+                "l3_entry_policy": entry_policy_global,
+                "l3_entry_policy_by_state": entry_policy_by_state,
+                "l3_trust_l2_entry": bool(_l3_trust_l2_entry_enabled()),
+                "l3_target_horizon_bars": target_horizon_global,
+                "l3_target_horizon_bars_by_state": target_horizon_by_state,
+                "l3_traj_cfg_dict": asdict(_t_cfg_eff),
+                "l3_policy_loss_buffer": dict(policy_loss_buffer_meta),
+                "pa_target_semantics": "straddle simulator mode with PA-aware hold/exit scaling",
+                "l3_trade_semantics": "straddle_bs_sim",
+                "l3_iv_model": _l3_straddle_iv_path_mode(),
+                "l3_straddle_dte_grid": dtes,
+                "l3_straddle_scenario_count": scenario_count(),
+                "l3_straddle_value_target": _l3_straddle_value_target_mode(),
+            },
+        )
+    print(
+        f"  [L3] straddle policy dataset: entry signals model={n_policy_signals_model:,}  "
+        f"policy_rows={sum(int(x.shape[0]) for x in rows_x_blocks):,}  dtes={dtes}  "
+        f"scenario_count={scenario_count()}  target_horizon_global={target_horizon_global}",
+        flush=True,
+    )
+    return (
+        np.concatenate(rows_x_blocks, axis=0).astype(np.float32, copy=False),
+        np.concatenate(rows_exit_blocks, axis=0).astype(np.int32, copy=False),
+        np.concatenate(rows_value_blocks, axis=0).astype(np.float32, copy=False),
+        np.concatenate(rows_time_blocks, axis=0),
+        feature_cols,
+        np.concatenate(rows_entry_blocks, axis=0).astype(np.int64, copy=False),
+        (
+            np.stack(rows_traj, axis=0).astype(np.float32, copy=False)
+            if build_traj and rows_traj
+            else np.empty((0, _t_max, _t_cfg_eff.seq_feat_dim), dtype=np.float32)
+        ),
+        (np.asarray(rows_traj_len, dtype=np.int32) if build_traj and rows_traj_len else np.empty(0, dtype=np.int32)),
+        np.concatenate(rows_from_model_blocks, axis=0).astype(np.int32, copy=False),
+        {
+            "policy_state_vol_quantiles": policy_vol_quantiles,
+            "l3_entry_policy": entry_policy_global,
+            "l3_entry_policy_by_state": entry_policy_by_state,
+            "l3_trust_l2_entry": bool(_l3_trust_l2_entry_enabled()),
+            "l3_target_horizon_bars": target_horizon_global,
+            "l3_target_horizon_bars_by_state": target_horizon_by_state,
+            "l3_traj_cfg_dict": asdict(_t_cfg_eff),
+            "l3_policy_loss_buffer": dict(policy_loss_buffer_meta),
+            "l3_trade_semantics": "straddle_bs_sim",
+            "l3_iv_model": _l3_straddle_iv_path_mode(),
+            "l3_straddle_dte_grid": dtes,
+            "l3_straddle_scenario_count": scenario_count(),
+            "l3_straddle_max_hold_minutes": max_hold_minutes,
+            "l3_straddle_value_target": _l3_straddle_value_target_mode(),
+        },
+    )
+
+
 def _build_l3_policy_dataset(
     df: pd.DataFrame,
     l1a_outputs: pd.DataFrame,
@@ -2563,6 +3235,13 @@ def _build_l3_policy_dataset(
         .merge(l1a_outputs, on=["symbol", "time_key"], how="left")
         .merge(l2_outputs, on=["symbol", "time_key"], how="left")
     )
+    if _l3_straddle_sim_mode_enabled():
+        return _l3_build_straddle_policy_dataset(
+            merged,
+            max_hold=max_hold,
+            traj_cfg=traj_cfg,
+            build_traj=build_traj,
+        )
     merged = ensure_pa_state_features(merged)
     pa_state = _l3_pa_dict_from_frame(merged)
     extra_merged = _l3_extra_merged_feature_columns()
@@ -2581,9 +3260,9 @@ def _build_l3_policy_dataset(
     entry_regime = merged[[f"l2_entry_regime_{idx}" for idx in range(len(L1A_REGIME_COLS))]].to_numpy(dtype=np.float32, copy=False)
     current_vol = merged["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
     entry_vol = merged["l2_entry_vol"].to_numpy(dtype=np.float32, copy=False)
-    decision_class = (
-        pd.to_numeric(merged["l2_decision_class"], errors="coerce").fillna(1).astype(np.int64).to_numpy()
-    )
+    straddle_on_arr = pd.to_numeric(merged.get("l2_straddle_on", 0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    decision_class = np.ones(len(merged), dtype=np.int64)
+    decision_class[straddle_on_arr > 0.5] = 0
     decision_conf = merged["l2_decision_confidence"].to_numpy(dtype=np.float32, copy=False)
     size = merged["l2_size"].to_numpy(dtype=np.float32, copy=False)
     edge_atr = _decision_edge_atr_array(merged).astype(np.float64)
@@ -2627,15 +3306,24 @@ def _build_l3_policy_dataset(
         max_hold=max_hold,
         pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
     )
-    entry_policy_global, entry_policy_by_state = _l3_search_entry_policy(
-        state_keys_all[oot_mask] if oot_mask.any() else state_keys_all,
-        decision_class[oot_mask] if oot_mask.any() else decision_class,
-        decision_conf[oot_mask] if oot_mask.any() else decision_conf,
-        size[oot_mask] if oot_mask.any() else size,
-        edge_atr[oot_mask] if oot_mask.any() else edge_atr,
-        tau_edge,
-        pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
-    )
+    if _l3_trust_l2_entry_enabled():
+        entry_policy_global, entry_policy_by_state = _l3_entry_policy_trust_l2_fixed()
+        print(
+            f"  [L3] entry policy: TRUST_L2_ENTRY=1 (skip grid; L2 opens, L3 exit-only)  "
+            f"min_conf={entry_policy_global['min_confidence']:.4f}  min_size={entry_policy_global['min_size']:.4f}  "
+            f"states=0",
+            flush=True,
+        )
+    else:
+        entry_policy_global, entry_policy_by_state = _l3_search_entry_policy(
+            state_keys_all[oot_mask] if oot_mask.any() else state_keys_all,
+            decision_class[oot_mask] if oot_mask.any() else decision_class,
+            decision_conf[oot_mask] if oot_mask.any() else decision_conf,
+            size[oot_mask] if oot_mask.any() else size,
+            edge_atr[oot_mask] if oot_mask.any() else edge_atr,
+            tau_edge,
+            pa_state=None if not _l3_pa_targets_enabled() else {k: v[oot_mask] if oot_mask.any() else v for k, v in pa_state.items()},
+        )
     entry_policy_arrays = _l3_lookup_policy_map(
         state_keys_all,
         entry_policy_by_state,
@@ -2644,7 +3332,10 @@ def _build_l3_policy_dataset(
             "min_size": float(entry_policy_global["min_size"]),
         },
     )
-    if "l2_decision_neutral" in merged.columns:
+    if "l2_gate_prob" in merged.columns:
+        gp = np.clip(pd.to_numeric(merged["l2_gate_prob"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64), 0.0, 1.0)
+        neutral = (1.0 - gp).astype(np.float64)
+    elif "l2_decision_neutral" in merged.columns:
         neutral = pd.to_numeric(merged["l2_decision_neutral"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float64)
     else:
         neutral = np.where(decision_class == 1, 1.0, 0.25).astype(np.float64)
@@ -2727,7 +3418,15 @@ def _build_l3_policy_dataset(
         low_seg = low_px[idx_arr]
         close_seg = close_px[idx_arr]
         safe_entry_vol = max(float(entry_vol[i]), 1e-3)
-        if side > 0.0:
+        play_straddle = straddle_on_arr[i] > 0.5
+        if play_straddle:
+            # Symmetric path: reward larger of up/down excursion; simplified straddle mark-to-market on unreal.
+            up_leg = np.maximum(0.0, (high_seg - entry_price) / atr)
+            dn_leg = np.maximum(0.0, (entry_price - low_seg) / atr)
+            fav_seg = np.maximum(up_leg, dn_leg)
+            adv_seg = np.minimum(up_leg, dn_leg)
+            unreal_seg = np.abs(close_seg - entry_price) / atr
+        elif side > 0.0:
             fav_seg = np.maximum(0.0, (high_seg - entry_price) / atr)
             adv_seg = np.maximum(0.0, (entry_price - low_seg) / atr)
             unreal_seg = (close_seg - entry_price) / atr
@@ -2784,7 +3483,12 @@ def _build_l3_policy_dataset(
             min_size_arr=entry_policy_arrays["min_size"],
             drawdown_from_peak=drawdown_from_peak,
         )
+        rng_i = float(merged["l2_range_pred"].iloc[i]) if "l2_range_pred" in merged.columns else 0.0
+        gp_i = float(merged["l2_gate_prob"].iloc[i]) if "l2_gate_prob" in merged.columns else float(decision_conf[i])
         _stack_parts: list[np.ndarray] = [
+            np.full(n_steps, float(straddle_on_arr[i]), dtype=np.float32),
+            np.full(n_steps, rng_i, dtype=np.float32),
+            np.full(n_steps, gp_i, dtype=np.float32),
             np.full(n_steps, decision_conf[i], dtype=np.float32),
             np.full(n_steps, size[i], dtype=np.float32),
             np.full(n_steps, pred_mfe[i], dtype=np.float32),
@@ -2922,6 +3626,7 @@ def _build_l3_policy_dataset(
                 "policy_state_vol_quantiles": policy_vol_quantiles,
                 "l3_entry_policy": entry_policy_global,
                 "l3_entry_policy_by_state": entry_policy_by_state,
+                "l3_trust_l2_entry": bool(_l3_trust_l2_entry_enabled()),
                 "l3_target_horizon_bars": target_horizon_global,
                 "l3_target_horizon_bars_by_state": target_horizon_by_state,
                 "pa_target_semantics": "PA-aware continuation thresholds, horizon scaling, and entry-quality scoring are applied inside dataset/target construction",
@@ -2969,26 +3674,13 @@ def _build_l3_policy_dataset(
             "policy_state_vol_quantiles": policy_vol_quantiles,
             "l3_entry_policy": entry_policy_global,
             "l3_entry_policy_by_state": entry_policy_by_state,
+            "l3_trust_l2_entry": bool(_l3_trust_l2_entry_enabled()),
             "l3_target_horizon_bars": target_horizon_global,
             "l3_target_horizon_bars_by_state": target_horizon_by_state,
             "l3_traj_cfg_dict": asdict(_t_cfg_eff),
             "l3_policy_loss_buffer": dict(policy_loss_buffer_meta),
         },
     )
-
-
-def l3_survival_from_hazard(hazard_probs: np.ndarray) -> np.ndarray:
-    """Discrete survival S(t)=prod_{s<=t}(1-h(s)) for ordered hazard per episode."""
-    h = np.clip(np.asarray(hazard_probs, dtype=np.float64).ravel(), 0.0, 1.0)
-    return np.cumprod(1.0 - h)
-
-
-def l3_group_hazard_by_entry(entry_row_idx: np.ndarray, hazard_probs: np.ndarray) -> dict[int, np.ndarray]:
-    """Map entry bar index -> hazard sequence in row order (contiguous per entry in builder)."""
-    order: dict[int, list[float]] = {}
-    for e, p in zip(np.asarray(entry_row_idx).tolist(), np.asarray(hazard_probs).tolist()):
-        order.setdefault(int(e), []).append(float(p))
-    return {k: np.asarray(v, dtype=np.float64) for k, v in order.items()}
 
 
 def _l3_policy_mode_ablation_metrics(
@@ -3048,6 +3740,7 @@ def _log_l3_val_extended(
     *,
     value_nonzero_model: lgb.Booster | None = None,
     value_hurdle_prob_power: float = 1.0,
+    value_prep: dict[str, Any] | None = None,
     exit_calibrator: Any = None,
     value_policy_mode: str = "prob_only",
     value_tie_margin: float = 0.03,
@@ -3177,6 +3870,7 @@ def _log_l3_val_extended(
             value_model,
             value_nonzero_model,
             prob_power=value_hurdle_prob_power,
+            prep=value_prep,
         )
         c_sz_val = float("nan")
         if "l2_size" in feature_cols:
@@ -3234,6 +3928,7 @@ def _log_l3_val_extended(
             value_model,
             value_nonzero_model,
             prob_power=value_hurdle_prob_power,
+            prep=value_prep,
         )
         vv_true = y_value[vm].astype(np.float64)
         mae_v = float(mean_absolute_error(vv_true, vv_pred))
@@ -3493,7 +4188,8 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         value_prep["hurdle_nonzero_train_rows"] = int(value_nonzero_train.sum())
         value_prep["hurdle_nonzero_val_rows"] = int(value_nonzero_val.sum())
         print(
-            f"  [L3] value target prep: objective={value_prep['objective']} metric={value_prep['metric']}  "
+            f"  [L3] value target prep: transform={value_prep.get('target_transform', 'none')}  "
+            f"objective={value_prep['objective']} metric={value_prep['metric']}  "
             f"clip={bool(value_prep['clip_enabled'])} q=[{float(value_prep['clip_lo_q']):.2f}, {float(value_prep['clip_hi_q']):.2f}]  "
             f"train_clip=[{float(value_prep['clip_lo']):.4f}, {float(value_prep['clip_hi']):.4f}]  "
             f"train_clipped_frac={float(value_prep['train_clipped_frac']):.3f}",
@@ -3989,6 +4685,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             value_model,
             value_nonzero_model,
             prob_power=value_hurdle_prob_power,
+            prep=value_prep,
         )
         value_policy_mode = _choose_l3_value_policy_mode(y_value[val_tune_mask], value_pred_tune)
         value_tie_margin = _derive_l3_value_tie_margin(y_value[val_tune_mask], value_pred_tune)
@@ -4044,6 +4741,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
             value_model,
             value_nonzero_model,
             prob_power=value_hurdle_prob_power,
+            prep=value_prep,
         ) if not value_disabled else np.zeros(int(tune_idx.size), dtype=np.float64),
         y_exit[tune_idx],
         y_value_true=y_value[tune_idx],
@@ -4083,12 +4781,16 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         p_hybrid = _apply_l3_exit_calibrator(exit_model.predict(X_lgb[val_report_mask]).astype(np.float64), exit_calibrator)
         auc_static = float(roc_auc_score(y_exit[val_report_mask].astype(np.int32), p_static))
         auc_hybrid = float(roc_auc_score(y_exit[val_report_mask].astype(np.int32), p_hybrid))
-        v_static = static_value_model.predict(X[val_report_mask]).astype(np.float64)
+        v_static = _l3_inverse_value_target_transform(
+            static_value_model.predict(X[val_report_mask]).astype(np.float64),
+            value_prep,
+        )
         v_hybrid = _l3_value_predict_hurdle(
             X_lgb[val_report_mask],
             value_model,
             value_nonzero_model,
             prob_power=value_hurdle_prob_power,
+            prep=value_prep,
         )
         r2_static = float(r2_score(y_value[val_report_mask].astype(np.float64), v_static)) if len(np.unique(y_value[val_report_mask])) > 1 else float("nan")
         r2_hybrid = float(r2_score(y_value[val_report_mask].astype(np.float64), v_hybrid)) if len(np.unique(y_value[val_report_mask])) > 1 else float("nan")
@@ -4119,6 +4821,7 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         value_model,
         value_nonzero_model=value_nonzero_model,
         value_hurdle_prob_power=value_hurdle_prob_power,
+        value_prep=value_prep,
         exit_calibrator=exit_calibrator,
         value_policy_mode=value_policy_mode,
         value_tie_margin=value_tie_margin,
@@ -4250,6 +4953,14 @@ def train_l3_exit_manager(df: pd.DataFrame, l1a_outputs: pd.DataFrame, l2_output
         "l3_allow_truth_fallback": os.environ.get("L3_ALLOW_TRUTH_FALLBACK", "0").strip().lower() in {"1", "true", "yes"},
         "l3_entry_min_confidence": entry_min_confidence,
         "l3_entry_min_size": entry_min_size,
+        "l3_trust_l2_entry": bool(dataset_policy.get("l3_trust_l2_entry", False)),
+        "l3_trade_semantics": str(dataset_policy.get("l3_trade_semantics", "underlying_atr_path")),
+        "l3_iv_model": str(dataset_policy.get("l3_iv_model", "")),
+        "l3_straddle_dte_grid": list(dataset_policy.get("l3_straddle_dte_grid", [])),
+        "l3_straddle_scenario_count": int(dataset_policy.get("l3_straddle_scenario_count", 0) or 0),
+        "l3_straddle_max_hold_minutes": int(dataset_policy.get("l3_straddle_max_hold_minutes", 0) or 0),
+        "l3_straddle_value_target": str(dataset_policy.get("l3_straddle_value_target", "future_gain")),
+        "l3_straddle_risk_free_rate": float(_l3_straddle_risk_free_rate()),
         "policy_state_vol_quantiles": dataset_policy.get("policy_state_vol_quantiles", []),
         "l3_entry_policy_by_state": dataset_policy.get("l3_entry_policy_by_state", {}),
         "l3_target_horizon_bars": int(dataset_policy.get("l3_target_horizon_bars", _l3_target_horizon_bars(max_hold))),

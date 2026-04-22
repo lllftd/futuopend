@@ -1,5 +1,5 @@
-# Full stack L1a→L1b→L1c→L2→L3 starting from PA feature build (invalidate PA disk cache, then train_pipeline layer1).
-# Does not delete TCN/Mamba checkpoints under lgbm_models/ (needed for prepare_dataset when L1c targets are on).
+# Full stack L1a→L1b→L2→L3 starting from PA feature build (invalidate PA disk cache, then train_pipeline layer1).
+# Does not delete TCN/Mamba checkpoints under lgbm_models/ (needed when prep pulls TCN/Mamba derivatives).
 #
 # Usage (repo root):
 #   .\scripts\run_full_pipeline_from_pa_gpu.ps1
@@ -103,9 +103,6 @@ if (-not $KeepStackModels) {
         "l1b_outputs.pkl",
         "l1b_edge_pred.txt",
         "l1b_dq_pred.txt",
-        "l1c_direction.pt",
-        "l1c_direction_meta.pkl",
-        "l1c_outputs.pkl",
         "l2_trade_gate.txt",
         "l2_direction.txt",
         "l2_trade_gate_calibrator.pkl",

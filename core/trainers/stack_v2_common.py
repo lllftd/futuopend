@@ -9,6 +9,7 @@ import pandas as pd
 
 from core.trainers.constants import (
     CAL_END,
+    L1B_EXPAND_OOF_VAL_WINDOWS,
     L1_EXPAND_OOF_VAL_WINDOWS,
     MODEL_DIR,
     TEST_END,
@@ -48,6 +49,48 @@ def l1_expand_oof_val_windows() -> list[tuple[np.datetime64, np.datetime64]]:
     for vs, ve in pairs:
         if not (vs < ve):
             raise ValueError(f"Invalid expanding OOF window {vs} .. {ve}")
+    return pairs
+
+
+def l1a_expand_oof_val_windows_from_env() -> list[tuple[np.datetime64, np.datetime64]] | None:
+    """Optional L1a-only expanding OOF windows; does not change L1b/L2 stack constants.
+
+    Env ``L1A_EXPAND_OOF_VAL_WINDOWS``: comma-separated ``start:end`` pairs (``[start,end)`` val segments),
+    e.g. ``2022-07-01:2024-01-01,2024-01-01:2024-07-01`` for two folds. Empty = use ``L1_EXPAND_OOF_VAL_WINDOWS``.
+    """
+    raw = (os.environ.get("L1A_EXPAND_OOF_VAL_WINDOWS", "") or "").strip()
+    if not raw:
+        return None
+    out: list[tuple[np.datetime64, np.datetime64]] = []
+    for segment in raw.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if ":" not in segment:
+            raise ValueError(
+                "L1A_EXPAND_OOF_VAL_WINDOWS segments must be start:end, e.g. 2022-01-01:2023-01-01. "
+                f"Got: {segment!r}"
+            )
+        a, b = segment.split(":", 1)
+        vs, ve = np.datetime64(a.strip()), np.datetime64(b.strip())
+        if not (vs < ve):
+            raise ValueError(f"Invalid L1a OOF window {vs} .. {ve} (need start < end)")
+        out.append((vs, ve))
+    if not out:
+        return None
+    return out
+
+
+def l1b_expand_oof_val_windows() -> list[tuple[np.datetime64, np.datetime64]]:
+    """L1b supervised expanding OOF when L1a features are in-matrix (fit pool starts at ``TRAIN_END``)."""
+    pairs: list[tuple[np.datetime64, np.datetime64]] = []
+    for a, b in L1B_EXPAND_OOF_VAL_WINDOWS:
+        pairs.append((np.datetime64(str(a).strip()), np.datetime64(str(b).strip())))
+    if not pairs:
+        raise RuntimeError("L1B_EXPAND_OOF_VAL_WINDOWS is empty.")
+    for vs, ve in pairs:
+        if not (vs < ve):
+            raise ValueError(f"Invalid L1b expanding OOF window {vs} .. {ve}")
     return pairs
 
 
@@ -266,33 +309,6 @@ def compute_transition_event_labels(state_label: np.ndarray, symbols: np.ndarray
     return labels
 
 
-def compute_cross_asset_context(df: pd.DataFrame) -> pd.DataFrame:
-    work = df[["symbol", "time_key", "close"]].copy()
-    work["ret_1"] = work.groupby("symbol")["close"].pct_change().fillna(0.0)
-    pivot = work.pivot(index="time_key", columns="symbol", values="ret_1").fillna(0.0)
-    market_mean = pivot.mean(axis=1)
-    breadth = (pivot.gt(0).mean(axis=1) * 2.0 - 1.0).astype(np.float32)
-    centered = pivot.sub(market_mean, axis=0)
-    out = work[["symbol", "time_key"]].copy()
-    try:
-        centered_stacked = centered.stack(future_stack=True)
-    except TypeError:
-        centered_stacked = centered.stack(dropna=False)
-    out["sector_relative_strength"] = centered_stacked.reindex(
-        pd.MultiIndex.from_frame(work[["time_key", "symbol"]])
-    ).to_numpy(dtype=np.float32, copy=False)
-    out["market_breadth"] = work["time_key"].map(breadth).astype(np.float32)
-    corr_map: dict[str, float] = {}
-    if pivot.shape[1] >= 2:
-        corr = pivot.rolling(20, min_periods=5).corr()
-        for ts, block in corr.groupby(level=0):
-            vals = block.droplevel(0).to_numpy(dtype=np.float32, copy=False)
-            finite = vals[np.isfinite(vals)]
-            corr_map[ts] = float(finite.mean()) if finite.size else 0.0
-    out["correlation_regime"] = work["time_key"].map(corr_map).fillna(0.0).astype(np.float32)
-    return out
-
-
 def log_label_baseline(head_name: str, y: np.ndarray, task: str = "auto") -> None:
     """Print compact label diagnostics before fitting a head."""
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -327,38 +343,6 @@ def log_label_baseline(head_name: str, y: np.ndarray, task: str = "auto") -> Non
     nuniq = len(np.unique(np.round(finite, 6)))
     if nuniq <= 3:
         print(f"    WARNING: only {nuniq} unique rounded values; label may be degenerate.", flush=True)
-
-
-def diagnose_l1b_leakage(models: dict, feat_names: dict[str, list[str]] | list[str]) -> tuple[list[str], list[str]]:
-    """Summarize top feature concentration for trained L1b models."""
-    print("\n  [L1b] leakage diagnostic", flush=True)
-    print(f"  {'head':<30s} {'top1_feat':<30s} {'top1%':>7s} {'top3%':>7s}", flush=True)
-    print(f"  {'-' * 80}", flush=True)
-    deterministic_heads: list[str] = []
-    learned_heads: list[str] = []
-    for head_name, model in models.items():
-        if isinstance(feat_names, dict):
-            head_feat_names = list(feat_names.get(head_name) or [])
-        else:
-            head_feat_names = list(feat_names)
-        imp = np.asarray(model.feature_importance(importance_type="gain"), dtype=np.float64)
-        total = float(np.sum(imp))
-        if total <= 0.0:
-            print(f"  {head_name:<30s} {'(zero importance)':<30s} {'n/a':>7s} {'n/a':>7s}", flush=True)
-            continue
-        order = np.argsort(imp)[::-1]
-        top1_idx = int(order[0])
-        top1_pct = float(imp[top1_idx] / total)
-        top3_pct = float(np.sum(imp[order[:3]]) / total)
-        top1_name = head_feat_names[top1_idx] if 0 <= top1_idx < len(head_feat_names) else f"feat[{top1_idx}]"
-        print(f"  {head_name:<30s} {top1_name:<30s} {top1_pct:>6.1%} {top3_pct:>6.1%}", flush=True)
-        if top3_pct > 0.85:
-            deterministic_heads.append(head_name)
-        else:
-            learned_heads.append(head_name)
-    print(f"  [L1b] diag deterministic-ish={deterministic_heads}", flush=True)
-    print(f"  [L1b] diag learned-ish={learned_heads}", flush=True)
-    return deterministic_heads, learned_heads
 
 
 def save_output_cache(df: pd.DataFrame, filename: str) -> str:

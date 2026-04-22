@@ -1,14 +1,16 @@
-"""Train L1c only; writes l1c_direction.pt, meta, and l1c_outputs.pkl.
+"""Train L1c only (archived — not invoked by backtests/train_pipeline).
+
+Writes l1c_direction.pt, meta, and l1c_outputs.pkl.
 
 Formal run (full epochs): do not set FAST_TRAIN.
-Smoke: FAST_TRAIN=1 PYTHONPATH=. python3 backtests/train_layer1c_only.py
+Smoke: FAST_TRAIN=1 PYTHONPATH=. python3 archive/train_layer1c_only.py
 """
 from __future__ import annotations
 
 import torch
 
 from backtests.train_pipeline import _prepare_or_load_lgbm_dataset, setup_logger
-from core.trainers.l1c import train_l1c_direction
+from archive.l1c import train_l1c_direction
 from core.trainers.lgbm_utils import configure_training_runtime
 
 

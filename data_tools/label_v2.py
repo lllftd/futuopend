@@ -462,6 +462,51 @@ def label_outcomes(
         optimal_exit_bar[i] = best_bar
         optimal_net_edge_atr[i] = 0.0 if best_net_edge == float("-inf") else best_net_edge
 
+    # Unconditional forward range (L2 straddle): next H bars max(high)-min(low), ATR-normalized at bar i.
+    # H matches decision_horizon_bars (same window as decision_mfe_atr lookahead cap).
+    H_rng = int(decision_horizon_bars)
+    decision_forward_range_atr = np.full(n, np.nan, dtype=float)
+    decision_forward_range_10_atr = np.full(n, np.nan, dtype=float)
+    decision_forward_range_15_atr = np.full(n, np.nan, dtype=float)
+    decision_forward_range_20_atr = np.full(n, np.nan, dtype=float)
+    decision_forward_range_30_atr = np.full(n, np.nan, dtype=float)
+    decision_range_ttp90_norm_30 = np.full(n, np.nan, dtype=float)
+    ttp_frac = float(np.clip(float(os.environ.get("LABEL_RANGE_TTP_FRAC", "0.9")), 0.5, 0.999))
+
+    for i in range(n):
+        atr_i = atr_arr[i]
+        if not np.isfinite(atr_i) or atr_i <= 0:
+            continue
+        if i + H_rng < n:
+            seg_h = high[i + 1 : i + 1 + H_rng]
+            seg_l = low[i + 1 : i + 1 + H_rng]
+            decision_forward_range_atr[i] = float(np.max(seg_h) - np.min(seg_l)) / atr_i
+        if i + 30 >= n:
+            continue
+        for hh in (10, 15, 20, 30):
+            seg_h = high[i + 1 : i + 1 + hh]
+            seg_l = low[i + 1 : i + 1 + hh]
+            val = float(np.max(seg_h) - np.min(seg_l)) / atr_i
+            if hh == 10:
+                decision_forward_range_10_atr[i] = val
+            elif hh == 15:
+                decision_forward_range_15_atr[i] = val
+            elif hh == 20:
+                decision_forward_range_20_atr[i] = val
+            else:
+                decision_forward_range_30_atr[i] = val
+        r30 = decision_forward_range_30_atr[i]
+        if not np.isfinite(r30) or r30 <= 1e-12:
+            continue
+        thr = ttp_frac * r30
+        for k in range(1, 31):
+            seg_h = high[i + 1 : i + 1 + k]
+            seg_l = low[i + 1 : i + 1 + k]
+            rk = float(np.max(seg_h) - np.min(seg_l)) / atr_i
+            if rk >= thr - 1e-12:
+                decision_range_ttp90_norm_30[i] = k / 30.0
+                break
+
     df["outcome"] = outcome
     df["max_favorable"] = max_favorable
     df["max_adverse"] = max_adverse
@@ -476,6 +521,12 @@ def label_outcomes(
     df["optimal_sl_atr"] = optimal_sl_atr
     df["optimal_exit_bar"] = optimal_exit_bar
     df["optimal_net_edge_atr"] = optimal_net_edge_atr
+    df["decision_forward_range_atr"] = decision_forward_range_atr
+    df["decision_forward_range_10_atr"] = decision_forward_range_10_atr
+    df["decision_forward_range_15_atr"] = decision_forward_range_15_atr
+    df["decision_forward_range_20_atr"] = decision_forward_range_20_atr
+    df["decision_forward_range_30_atr"] = decision_forward_range_30_atr
+    df["decision_range_ttp90_norm_30"] = decision_range_ttp90_norm_30
     return df
 
 def auto_label_pipeline(df: pd.DataFrame, config: LabelConfig) -> pd.DataFrame:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import time
@@ -31,26 +32,32 @@ from core.trainers.constants import (
     L1A_MODEL_FILE,
     L1A_REGIME_COLS,
     L1B_META_FILE,
-
-    L1C_MODEL_FILE,
-    L2_DIRECTION_CALIBRATOR_FILE,
     L2_ENTRY_REGIME_COLS,
     L2_GATE_FILE,
     L2_TRADE_GATE_CALIBRATOR_FILE,
     L2_MAE_FILE,
     L2_META_FILE,
     L2_MFE_FILE,
+    L2_RANGE10_FILE,
+    L2_RANGE20_FILE,
+    L2_RANGE_FILE,
+    L2_TTP90_FILE,
     L2_OUTPUT_CACHE_FILE,
     L2_SCHEMA_VERSION,
+    L2_USE_VIXY,
     MODEL_DIR,
     NUM_REGIME_CLASSES,
     PA_STATE_FEATURES,
+    RANGE_REGIME_INDICES,
     STATE_NAMES,
     TRAIN_END,
+    VIXY_DATA_PATH,
 )
 from core.trainers.lgbm_utils import (
     _tqdm_stream,
-    _decision_edge_atr_array,
+    _decision_forward_range_atr_array,
+    _decision_forward_range_h_atr_array,
+    _decision_range_ttp90_norm_30_array,
     _lgb_round_tqdm_enabled,
     _lgb_train_callbacks_with_round_tqdm,
     _lgbm_n_jobs,
@@ -97,6 +104,69 @@ def _l2_early_stopping_rounds_from_env(key: str, fallback: int) -> int:
     return max(1, int(raw))
 
 
+def _l2_multi_horizon_enabled(df: pd.DataFrame) -> bool:
+    mode = os.environ.get("L2_MULTI_HORIZON", "auto").strip().lower() or "auto"
+    need = (
+        "decision_forward_range_10_atr",
+        "decision_forward_range_20_atr",
+        "decision_forward_range_30_atr",
+        "decision_range_ttp90_norm_30",
+    )
+    has_all = all(c in df.columns for c in need)
+    if mode in {"0", "false", "no", "off"}:
+        return False
+    if mode in {"1", "true", "yes", "on"} and not has_all:
+        raise RuntimeError(
+            "L2_MULTI_HORIZON=1 but prepared data lacks multi-horizon label columns. "
+            "Re-run data_tools/label_v2.py and PREPARED_DATASET_CACHE_REBUILD=1."
+        )
+    return bool(has_all)
+
+
+def _l2_mh_horizon_costs() -> tuple[float, float, float]:
+    """Per-bar-window **hurdles** in ATR units for the trade_gate label (OR across horizons).
+
+    Interpreting straddle economics (schematic): shorter holds face lower cumulative theta drag,
+    so a smaller range can clear the bar; longer holds need a wider realized range to beat
+    higher *effective* cost — so a **late** gamma burst that only shows up in the 20–30m
+    envelope can still yield ``y_trade_gate=1`` without committing to a single fixed hold (e.g. 15m).
+    Tune via ``L2_MH_COST_10`` / ``_20`` / ``_30``.
+    """
+    return (
+        float(os.environ.get("L2_MH_COST_10", "2.0")),
+        float(os.environ.get("L2_MH_COST_20", "3.0")),
+        float(os.environ.get("L2_MH_COST_30", "3.8")),
+    )
+
+
+def _l2_mh_gate_sample_weights_full(
+    y_trade: np.ndarray,
+    r10: np.ndarray,
+    r20: np.ndarray,
+    r30: np.ndarray,
+    c10: float,
+    c20: float,
+    c30: float,
+) -> np.ndarray:
+    """Time-aware gate weights: early breakout vs late vs chop (neg). Length = len(y_trade)."""
+    n = len(y_trade)
+    w = np.ones(n, dtype=np.float64)
+    w_pos_early = float(os.environ.get("L2_MH_GATE_W_EARLY", "2.0"))
+    w_pos_late = float(os.environ.get("L2_MH_GATE_W_LATE", "0.8"))
+    w_neg = float(os.environ.get("L2_MH_GATE_W_NEG_CHOP", "3.0"))
+    yt = np.asarray(y_trade, dtype=np.int64).ravel()
+    r10v = np.asarray(r10, dtype=np.float64).ravel()
+    r20v = np.asarray(r20, dtype=np.float64).ravel()
+    r30v = np.asarray(r30, dtype=np.float64).ravel()
+    finite = np.isfinite(r10v) & np.isfinite(r20v) & np.isfinite(r30v)
+    early = (yt == 1) & finite & (r10v > c10)
+    late = (yt == 1) & finite & ~early
+    w[early] = w_pos_early
+    w[late] = w_pos_late
+    w[yt == 0] = w_neg
+    return w
+
+
 def _l2_apply_l1b_feature_dropout_train_only(
     X: np.ndarray,
     train_mask: np.ndarray,
@@ -122,34 +192,12 @@ def _l2_apply_l1b_feature_dropout_train_only(
     return out
 
 
-_L2_GATE_BLOCKED_SIGN_FEATURES = frozenset(
-    {
-        "l1c_pred_z",
-        "l1c_pred_sign",
-        "l1c_direction",
-        "l1c_pred_z_abs",
-        "l1c_weighted_dir",
-        "l1c_dir_x_vol",
-        "l1c_dir_x_state_persistence",
-        "l2_dir_x_edge_opportunity",
-        "l2_bull_mass_x_l1c_dir",
-        "l2_range_mass_x_l1c_dir",
-        "l2_signal_spread_var",
-        "l2_breakout_quality_x_l1c_dir",
-    }
-)
-
-
 def _l2_project_gate_features(
     X: np.ndarray,
     feature_cols: list[str],
 ) -> tuple[np.ndarray, list[str]]:
-    blocked_idx = [idx for idx, name in enumerate(feature_cols) if name in _L2_GATE_BLOCKED_SIGN_FEATURES]
-    if not blocked_idx:
-        return X, []
-    out = np.array(X, dtype=np.float32, copy=True)
-    out[:, blocked_idx] = 0.0
-    return out, [feature_cols[idx] for idx in blocked_idx]
+    _ = feature_cols
+    return X, []
 
 
 # Drop from L2 without retraining upstream layers: failed L1b heads / redundant pairs.
@@ -158,6 +206,123 @@ L2_FEATURE_HARD_DROP_DEFAULT = frozenset(
     {
     }
 )
+
+
+L2_RANGE_HEAD_HARD_DROP_DEFAULT = frozenset(
+    {
+        "l1b_edge_pred",
+        "l2_l1b_edge_over_tau",
+        "l2_vol_adjusted_l1b_edge",
+        "l2_edge_x_breakout",
+        "l2_breakout_x_abs_edge",
+        "l2_signal_strength_mean_abs",
+        "l2_signal_spread_var",
+    }
+)
+
+
+def _l2_range_head_hard_drop(feature_cols: list[str]) -> frozenset[str]:
+    keep_raw = os.environ.get("L2_RANGE_HEAD_KEEP_L1B_SUPERVISED", "").strip().lower()
+    if keep_raw in {"1", "true", "yes"}:
+        base: set[str] = set()
+    else:
+        base = set(L2_RANGE_HEAD_HARD_DROP_DEFAULT)
+    extra_raw = os.environ.get("L2_RANGE_HEAD_EXTRA_HARD_DROP", "").strip()
+    if extra_raw:
+        base |= {s.strip() for s in extra_raw.split(",") if s.strip()}
+    return frozenset([c for c in feature_cols if c in base])
+
+
+def _l2_feature_view_cols(feature_cols: list[str], *, hard_drop: frozenset[str]) -> list[str]:
+    return [c for c in feature_cols if c not in set(hard_drop)]
+
+
+def _l2_parse_protected_features() -> frozenset[str]:
+    raw = (os.environ.get("L2_PROTECTED_FEATURES", "") or "").strip()
+    if raw == "":
+        return frozenset(
+            {
+                "l1b_edge_pred",
+                "vixy_level_ma60_ratio",
+                "pa_ctx_structure_veto",
+            }
+        )
+    return frozenset({s.strip() for s in raw.split(",") if s.strip()})
+
+
+def _l2_stability_threshold_for_feature(name: str) -> float:
+    """Per-group stability gate for feature selection."""
+    global_raw = (os.environ.get("L2_FEATURE_STABILITY_THRESHOLD", "") or "").strip()
+    group_default_raw = (os.environ.get("L2_FEATURE_STABILITY_THRESHOLD_DEFAULT", "") or "").strip()
+    l1a_raw = (os.environ.get("L2_FEATURE_STABILITY_THRESHOLD_L1A", "") or "").strip()
+    vixy_raw = (os.environ.get("L2_FEATURE_STABILITY_THRESHOLD_VIXY", "") or "").strip()
+    global_thr = float(np.clip(float(global_raw), 0.0, 1.0)) if global_raw else 0.50
+    default_thr = float(np.clip(float(group_default_raw), 0.0, 1.0)) if group_default_raw else global_thr
+    l1a_thr = float(np.clip(float(l1a_raw), 0.0, 1.0)) if l1a_raw else 0.30
+    vixy_thr = float(np.clip(float(vixy_raw), 0.0, 1.0)) if vixy_raw else 0.25
+    if name.startswith("l1a_"):
+        return l1a_thr
+    if name.startswith("vixy_"):
+        return vixy_thr
+    return default_thr
+
+
+def _l2_parse_corr_prefix_thresholds() -> dict[str, float]:
+    """Prefix keys longest-match first; ``default`` fallback."""
+    raw = (os.environ.get("L2_CORR_PREFIX_THRESHOLDS", "") or "").strip()
+    if not raw:
+        return {
+            "l1b_": 0.95,
+            "vixy_": 0.90,
+            "l2_": 0.85,
+            "l1a_": 0.92,
+            "pa_": 0.88,
+            "default": 0.90,
+        }
+    out: dict[str, float] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k = k.strip()
+        try:
+            out[k] = float(v.strip())
+        except ValueError:
+            continue
+    if "default" not in out:
+        out["default"] = 0.90
+    return out
+
+
+def _l2_corr_threshold_for_feature_name(name: str, thr_map: dict[str, float]) -> float:
+    best_thr: float | None = None
+    best_len = -1
+    for prefix, thr in thr_map.items():
+        if prefix == "default":
+            continue
+        if name.startswith(prefix) and len(prefix) > best_len:
+            best_len = len(prefix)
+            best_thr = float(thr)
+    if best_thr is not None:
+        return float(np.clip(best_thr, 0.0, 0.999999))
+    return float(np.clip(float(thr_map.get("default", 0.90)), 0.0, 0.999999))
+
+
+def _l2_single_column_stability(col: np.ndarray) -> float:
+    """Score in [0, 1]: higher = more stable across contiguous segments of train rows."""
+    col = np.asarray(col, dtype=np.float64).ravel()
+    n = col.size
+    if n < 32:
+        return 1.0
+    n_w = max(4, min(16, n // 100))
+    parts = np.array_split(col, n_w)
+    seg_means = np.array([np.nanmean(p) for p in parts if len(p) > 0], dtype=np.float64)
+    if seg_means.size < 2:
+        return 1.0
+    am = float(np.nanmean(np.abs(seg_means)) + 1e-12)
+    cv = float(np.nanstd(seg_means) / am)
+    return float(np.clip(1.0 / (1.0 + 5.0 * cv), 0.0, 1.0))
 
 
 def _l2_select_features_for_training(
@@ -186,46 +351,98 @@ def _l2_select_features_for_training(
             continue
         keep_idx.append(j)
 
-    corr_thr = float(os.environ.get("L2_MAX_PAIRWISE_CORR", "0.995"))
-    if len(keep_idx) >= 2 and corr_thr < 0.999999:
-        kept_after_corr: list[int] = []
-        kept_cols: list[np.ndarray] = []
-        for j in keep_idx:
-            col = xt[:, j]
-            drop_name = None
-            for prev_j, prev_col in zip(kept_after_corr, kept_cols):
-                corr = np.corrcoef(col, prev_col)[0, 1]
-                if np.isfinite(corr) and abs(float(corr)) >= corr_thr:
-                    drop_name = feature_cols[prev_j]
-                    break
-            if drop_name is not None:
-                dropped.append(f"{feature_cols[j]}(corr~{drop_name})")
-                continue
+    improved = (os.environ.get("L2_IMPROVED_FEATURE_SELECT", "1") or "").strip().lower() not in {"0", "false", "no"}
+    if not improved:
+        corr_thr = float(os.environ.get("L2_MAX_PAIRWISE_CORR", "0.995"))
+        if len(keep_idx) >= 2 and corr_thr < 0.999999:
+            kept_after_corr: list[int] = []
+            kept_cols: list[np.ndarray] = []
+            for j in keep_idx:
+                col = xt[:, j]
+                drop_name = None
+                for prev_j, prev_col in zip(kept_after_corr, kept_cols):
+                    corr = np.corrcoef(col, prev_col)[0, 1]
+                    if np.isfinite(corr) and abs(float(corr)) >= corr_thr:
+                        drop_name = feature_cols[prev_j]
+                        break
+                if drop_name is not None:
+                    dropped.append(f"{feature_cols[j]}(corr~{drop_name})")
+                    continue
+                kept_after_corr.append(j)
+                kept_cols.append(col)
+            keep_idx = kept_after_corr
+        keep = [feature_cols[j] for j in keep_idx]
+        return keep, dropped
+
+    protected = _l2_parse_protected_features()
+    thr_map = _l2_parse_corr_prefix_thresholds()
+    stab_by_j = {j: _l2_single_column_stability(xt[:, j]) for j in keep_idx}
+
+    idx_after_stab: list[int] = []
+    for j in keep_idx:
+        name = feature_cols[j]
+        if name in protected:
+            idx_after_stab.append(j)
+            continue
+        stab_thr = _l2_stability_threshold_for_feature(name)
+        if stab_by_j[j] >= stab_thr:
+            idx_after_stab.append(j)
+        else:
+            dropped.append(f"{name}(unstable={stab_by_j[j]:.3f}<thr={stab_thr:.3f})")
+
+    prot_first = [j for j in idx_after_stab if feature_cols[j] in protected]
+    rest = [j for j in idx_after_stab if feature_cols[j] not in protected]
+    corr_order = prot_first + rest
+
+    if len(corr_order) < 2:
+        keep = [feature_cols[j] for j in corr_order]
+        return keep, dropped
+
+    kept_after_corr: list[int] = []
+    kept_cols: list[np.ndarray] = []
+    for j in corr_order:
+        name = feature_cols[j]
+        col = xt[:, j]
+        if name in protected:
             kept_after_corr.append(j)
             kept_cols.append(col)
-        keep_idx = kept_after_corr
+            continue
+        drop_name = None
+        for prev_j, prev_col in zip(kept_after_corr, kept_cols):
+            t = min(
+                _l2_corr_threshold_for_feature_name(name, thr_map),
+                _l2_corr_threshold_for_feature_name(feature_cols[prev_j], thr_map),
+            )
+            corr = np.corrcoef(col, prev_col)[0, 1]
+            if np.isfinite(corr) and abs(float(corr)) >= t:
+                drop_name = feature_cols[prev_j]
+                break
+        if drop_name is not None:
+            dropped.append(f"{name}(corr~{drop_name})")
+            continue
+        kept_after_corr.append(j)
+        kept_cols.append(col)
 
-    keep = [feature_cols[j] for j in keep_idx]
+    keep = [feature_cols[j] for j in kept_after_corr]
     return keep, dropped
 
 
 L2_OUTPUT_COLS = [
-    "l2_decision_class",
-    "l2_decision_long",
-    "l2_decision_neutral",
-    "l2_decision_short",
+    "l2_straddle_on",
+    "l2_gate_prob",
     "l2_decision_confidence",
-    "l2_bracket_buy_trigger",
-    "l2_bracket_sell_trigger",
-    "l2_bracket_offset_atr",
-    "l2_bracket_tp_atr",
-    "l2_bracket_sl_atr",
-    "l2_bracket_max_hold",
+    "l2_range_pred",
+    "l2_range_pred_10",
+    "l2_range_pred_20",
+    "l2_pred_ttp90_norm",
     "l2_size",
     "l2_pred_mfe",
     "l2_pred_mae",
     *L2_ENTRY_REGIME_COLS,
     "l2_entry_vol",
+    "l2_vol_regime",
+    "l2_regime_size_mult",
+    "l2_predicted_profit",
     "l2_expected_edge",
     "l2_rr_proxy",
 ]
@@ -270,6 +487,338 @@ def _l2_bracket_atr_array(df: pd.DataFrame) -> np.ndarray:
     return np.clip(atr, 1e-4, np.inf).astype(np.float32)
 
 
+def _l2_straddle_cost_atr() -> float:
+    # decision_forward_range_atr = (H-bar path range in $) / (1-bar ATR at i) — often O(2–8) for H≈20.
+    # Cost in the same units must be ~quantile of that range (~2.5–4), not a tiny spread like 0.3 ATR.
+    return float(np.clip(float(os.environ.get("L2_STRADDLE_COST_ATR", "3.0")), 1e-6, 5.0))
+
+
+def _l2_dynamic_straddle_cost_enabled() -> bool:
+    return os.environ.get("L2_DYNAMIC_STRADDLE_COST", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _l2_range_roll_cost_enabled() -> bool:
+    return os.environ.get("L2_STRADDLE_RANGE_ROLL_COST", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _l2_range_roll_cost_env_config() -> dict[str, float | int]:
+    return {
+        "lookback": max(100, int(os.environ.get("L2_RANGE_ROLL_LOOKBACK", "1950"))),
+        "percentile": float(np.clip(float(os.environ.get("L2_RANGE_ROLL_PERCENTILE", "50")), 1.0, 99.0)),
+        "floor": float(os.environ.get("L2_RANGE_ROLL_FLOOR", "2.0")),
+        "cap": float(os.environ.get("L2_RANGE_ROLL_CAP", "8.0")),
+    }
+
+
+def _l2_range_roll_cost_array(
+    df: pd.DataFrame,
+    realized_range_atr: np.ndarray,
+    cfg: dict[str, float | int] | None = None,
+) -> np.ndarray:
+    """
+    Causal dynamic cost in same units as decision_forward_range_atr:
+    cost[i] = quantile_p( R[i-L], ..., R[i-1] ) with R = past realized forward ranges (excludes R[i]).
+    """
+    cfg = cfg if cfg is not None else _l2_range_roll_cost_env_config()
+    L = int(cfg["lookback"])
+    p_pct = float(cfg["percentile"])
+    floor = float(cfg["floor"])
+    cap = float(cfg["cap"])
+    r = np.asarray(realized_range_atr, dtype=np.float64).ravel()
+    if r.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    minp = max(50, L // 4)
+    p = p_pct / 100.0
+    s = pd.Series(r)
+    if "symbol" in df.columns:
+        cost = s.groupby(df["symbol"].astype(str).values, sort=False).transform(
+            lambda x: x.shift(1).rolling(L, min_periods=minp).quantile(p)
+        )
+    else:
+        cost = s.shift(1).rolling(L, min_periods=minp).quantile(p)
+    cost = np.asarray(cost, dtype=np.float64)
+    finite_r = r[np.isfinite(r)]
+    med = float(np.nanmedian(finite_r)) if finite_r.size else 3.0
+    if not np.isfinite(med) or med <= 0:
+        med = 3.0
+    cost = np.where(np.isfinite(cost), cost, med)
+    return np.clip(cost, floor, cap).astype(np.float64, copy=False)
+
+
+def _l2_dynamic_straddle_cost_env_config() -> dict[str, float | int]:
+    return {
+        "lookback": max(20, int(os.environ.get("L2_DYNAMIC_COST_LOOKBACK", "390"))),
+        "ref_quantile": float(
+            np.clip(float(os.environ.get("L2_DYNAMIC_COST_REF_QUANTILE", "0.7")), 0.05, 0.95)
+        ),
+        "min_mult": float(np.clip(float(os.environ.get("L2_DYNAMIC_COST_MIN_MULT", "0.5")), 0.05, 2.0)),
+        "max_mult": float(np.clip(float(os.environ.get("L2_DYNAMIC_COST_MAX_MULT", "3.0")), 0.5, 10.0)),
+        "abs_min": float(np.clip(float(os.environ.get("L2_DYNAMIC_ABS_MIN", "0.05")), 1e-6, 5.0)),
+        "abs_max": float(np.clip(float(os.environ.get("L2_DYNAMIC_ABS_MAX", "5.0")), 0.01, 20.0)),
+    }
+
+
+def _l2_dynamic_straddle_cost_array(
+    df: pd.DataFrame,
+    base: float,
+    cfg: dict[str, float | int] | None = None,
+) -> np.ndarray:
+    """
+    Per-bar straddle cost in ATR units: base * clip(atr / ref, min_mult, max_mult).
+    ref = rolling ref_quantile of lbl_atr (causal), per symbol.
+    """
+    cfg = cfg if cfg is not None else _l2_dynamic_straddle_cost_env_config()
+    w = int(cfg["lookback"])
+    q = float(cfg["ref_quantile"])
+    min_mult = float(cfg["min_mult"])
+    max_mult = float(cfg["max_mult"])
+    abs_min = float(cfg["abs_min"])
+    abs_max = float(cfg["abs_max"])
+    base = float(np.clip(base, 1e-6, 50.0))
+
+    atr = _l2_bracket_atr_array(df).astype(np.float64, copy=False)
+    if atr.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    minp = max(10, w // 10)
+    if "symbol" in df.columns:
+        wdf = pd.DataFrame({"atr": atr, "sym": df["symbol"].astype(str).values})
+        ref = wdf.groupby("sym", sort=False)["atr"].transform(
+            lambda s: s.rolling(w, min_periods=minp).quantile(q)
+        )
+        ref = ref.to_numpy(dtype=np.float64, copy=False)
+    else:
+        ref = pd.Series(atr).rolling(w, min_periods=minp).quantile(q).to_numpy(dtype=np.float64, copy=False)
+
+    med = float(np.nanmedian(atr))
+    if not np.isfinite(med) or med <= 0:
+        med = 1.0
+    ref = np.where(np.isfinite(ref) & (ref > 1e-12), ref, np.nan)
+    if "symbol" in df.columns:
+        ref = (
+            pd.Series(ref)
+            .groupby(df["symbol"].astype(str).values)
+            .transform(lambda s: s.ffill().bfill())
+            .to_numpy(dtype=np.float64, copy=False)
+        )
+    else:
+        ref = pd.Series(ref).ffill().bfill().to_numpy(dtype=np.float64, copy=False)
+    ref = np.where(np.isfinite(ref) & (ref > 1e-12), ref, med)
+    mult = np.clip(atr / ref, min_mult, max_mult)
+    return np.clip(base * mult, abs_min, abs_max).astype(np.float64, copy=False)
+
+
+def _l2_range_horizon_bars() -> int:
+    return max(1, int(os.environ.get("L2_RANGE_HORIZON", "20")))
+
+
+def _l2_straddle_expected_edge(
+    gate_p: np.ndarray,
+    range_pred: np.ndarray,
+    *,
+    cost_atr: float | np.ndarray,
+) -> np.ndarray:
+    g = np.clip(np.asarray(gate_p, dtype=np.float64).ravel(), 0.0, 1.0)
+    r = np.maximum(np.asarray(range_pred, dtype=np.float64).ravel(), 0.0)
+    c = np.asarray(cost_atr, dtype=np.float64).ravel()
+    if c.size == 1:
+        c = np.full_like(g, float(c[0]), dtype=np.float64)
+    elif c.size != g.size:
+        raise ValueError("cost_atr length must match gate_p or be scalar.")
+    half_lost = float(np.clip(float(os.environ.get("L2_STRADDLE_INACTIVE_COST_FRAC", "0.5")), 0.0, 1.0))
+    return (g * (r - c) + (1.0 - g) * (-c * half_lost)).astype(np.float32)
+
+
+def _l2_straddle_predicted_profit(
+    range_pred: np.ndarray,
+    *,
+    cost_atr: float | np.ndarray,
+) -> np.ndarray:
+    """Realized-vol vs implied (cost) in ATR units: max(range_pred,0) - cost. Primary straddle economics."""
+    r = np.maximum(np.asarray(range_pred, dtype=np.float64).ravel(), 0.0)
+    c = np.asarray(cost_atr, dtype=np.float64).ravel()
+    if c.size == 1:
+        c = np.full_like(r, float(c[0]), dtype=np.float64)
+    elif c.size != r.size:
+        raise ValueError("cost_atr length must match range_pred or be scalar.")
+    return (r - c).astype(np.float32)
+
+
+L2_STRADDLE_VOL_REGIME_NAMES: tuple[str, ...] = (
+    "low_vol_stable",
+    "low_vol_rising",
+    "mid_vol",
+    "high_vol_stable",
+    "high_vol_falling",
+)
+
+_DEFAULT_L2_REGIME_STRADDLE_CONFIG: dict[str, dict[str, float]] = {
+    "low_vol_stable": {"min_profit": 2.5, "size_mult": 0.5},
+    "low_vol_rising": {"min_profit": 1.0, "size_mult": 1.5},
+    "mid_vol": {"min_profit": 1.5, "size_mult": 1.0},
+    "high_vol_stable": {"min_profit": 2.0, "size_mult": 0.8},
+    "high_vol_falling": {"min_profit": 3.0, "size_mult": 0.3},
+}
+
+
+def _l2_regime_straddle_config_merged() -> dict[str, dict[str, float]]:
+    cfg = {k: dict(v) for k, v in _DEFAULT_L2_REGIME_STRADDLE_CONFIG.items()}
+    raw = os.environ.get("L2_REGIME_STRADDLE_CONFIG_JSON", "").strip()
+    if raw:
+        try:
+            ovr = json.loads(raw)
+            if isinstance(ovr, dict):
+                for k, v in ovr.items():
+                    if isinstance(v, dict) and k in cfg:
+                        if "min_profit" in v:
+                            cfg[k]["min_profit"] = float(v["min_profit"])
+                        if "size_mult" in v:
+                            cfg[k]["size_mult"] = float(v["size_mult"])
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"L2_REGIME_STRADDLE_CONFIG_JSON invalid JSON: {e}") from e
+    return cfg
+
+
+def _l2_regime_straddle_arrays() -> tuple[np.ndarray, np.ndarray]:
+    cfg = _l2_regime_straddle_config_merged()
+    mp = np.array([float(cfg[k]["min_profit"]) for k in L2_STRADDLE_VOL_REGIME_NAMES], dtype=np.float64)
+    sm = np.array([float(cfg[k]["size_mult"]) for k in L2_STRADDLE_VOL_REGIME_NAMES], dtype=np.float64)
+    return mp, sm
+
+
+def _l2_fit_vol_quantiles_vol_forecast(vol: np.ndarray, mask: np.ndarray) -> tuple[float, float]:
+    v = np.asarray(vol, dtype=np.float64).ravel()
+    m = np.asarray(mask, dtype=bool).ravel()
+    if v.size != m.size or v.size == 0:
+        return 0.33, 0.66
+    vv = v[m & np.isfinite(v)]
+    if vv.size < 30:
+        return float(np.quantile(vv, 0.33)) if vv.size else 0.33, float(np.quantile(vv, 0.66)) if vv.size else 0.66
+    return float(np.quantile(vv, 0.33)), float(np.quantile(vv, 0.66))
+
+
+def _l2_vol_regime_ids(
+    vol: np.ndarray,
+    trend: np.ndarray,
+    q33: float,
+    q66: float,
+    trend_eps: float,
+) -> np.ndarray:
+    """5 buckets from L1a vol level × vol trend (straddle-oriented)."""
+    v = np.asarray(vol, dtype=np.float64).ravel()
+    t = np.asarray(trend, dtype=np.float64).ravel()
+    if t.size != v.size:
+        raise ValueError("vol and trend length mismatch for vol regime")
+    eps = float(max(float(trend_eps), 1e-12))
+    n = len(v)
+    ids = np.full(n, 2, dtype=np.int32)
+    low = v < q33
+    high = v > q66
+    mid = ~low & ~high
+    ids[low & (t > eps)] = 1
+    ids[low & (t <= eps)] = 0
+    ids[high & (t < -eps)] = 4
+    ids[high & (t >= -eps)] = 3
+    ids[mid] = 2
+    return ids
+
+
+def _l2_vol_regime_names_from_ids(ids: np.ndarray) -> np.ndarray:
+    names = np.asarray(L2_STRADDLE_VOL_REGIME_NAMES, dtype=object)
+    i = np.asarray(ids, dtype=np.int32).ravel().clip(0, len(L2_STRADDLE_VOL_REGIME_NAMES) - 1)
+    return names[i]
+
+
+def _l2_sortino_trade_search_score(
+    gate_p: np.ndarray,
+    pp: np.ndarray,
+    thr: float | np.ndarray,
+    min_edge: float,
+    *,
+    target_trade_rate: float,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Returns (score, straddle_on, size_pred) for one gate threshold candidate."""
+    gate_p = np.asarray(gate_p, dtype=np.float64).ravel()
+    pp = np.asarray(pp, dtype=np.float64).ravel()
+    thr_arr = np.asarray(thr, dtype=np.float64)
+    if thr_arr.ndim == 0:
+        thr_arr = np.full(gate_p.shape, float(np.clip(float(thr_arr), 0.0, 1.0)), dtype=np.float64)
+    else:
+        thr_arr = np.broadcast_to(np.clip(thr_arr.reshape(-1), 0.0, 1.0), gate_p.shape)
+    gate_on = gate_p >= thr_arr
+    straddle_on = gate_on & (pp > float(min_edge))
+    size_pred = _l2_straddle_size(gate_p, np.maximum(pp, 0.0).astype(np.float32), straddle_on)
+    profit_row = size_pred.astype(np.float64) * pp
+    lamb = float(np.clip(float(os.environ.get("L2_SORTINO_LAMBDA", "0.25")), 0.0, 10.0))
+    rate_pen = float(np.clip(float(os.environ.get("L2_SORTINO_TARGET_RATE_PENALTY", "0.35")), 0.0, 10.0))
+    dd_pen = float(np.clip(float(os.environ.get("L2_SORTINO_DRAWDOWN_PENALTY", "0.10")), 0.0, 10.0))
+    tail_pen = float(np.clip(float(os.environ.get("L2_SORTINO_TAIL_LOSS_PENALTY", "0.15")), 0.0, 10.0))
+    pf_bonus = float(np.clip(float(os.environ.get("L2_SORTINO_PROFIT_FACTOR_BONUS", "0.05")), 0.0, 10.0))
+    realized_trade_rate = float(np.mean(straddle_on))
+    if lamb <= 0.0:
+        score = float(np.mean(profit_row))
+    else:
+        if not np.any(straddle_on):
+            score = -1e18
+        else:
+            pr = profit_row[straddle_on]
+            mean_p = float(np.mean(pr))
+            dn = pr[pr < 0]
+            dstd = float(np.sqrt(np.mean(dn * dn))) if dn.size else 0.0
+            eq = np.cumsum(pr)
+            peak = np.maximum.accumulate(eq)
+            drawdowns = peak - eq
+            max_dd = float(np.max(drawdowns)) if drawdowns.size else 0.0
+            p05 = float(np.quantile(pr, 0.05)) if pr.size else 0.0
+            tail_loss = float(max(0.0, -p05))
+            gross_pos = float(np.sum(pr[pr > 0.0]))
+            gross_neg = float(np.sum(-pr[pr < 0.0]))
+            profit_factor = gross_pos / max(gross_neg, 1e-9)
+            pf_term = pf_bonus * np.clip(profit_factor, 0.0, 5.0)
+            score = mean_p - lamb * dstd - dd_pen * max_dd - tail_pen * tail_loss + pf_term
+    score -= rate_pen * abs(realized_trade_rate - float(target_trade_rate))
+    return score, straddle_on, size_pred
+
+
+def _l2_warn_trade_search_shape(records: list[dict[str, float]], *, chosen_trade_rate: float) -> None:
+    if not records:
+        return
+    trade_rate = np.asarray([float(r["realized_trade_rate"]) for r in records], dtype=np.float64)
+    score = np.asarray([float(r["score"]) for r in records], dtype=np.float64)
+    if trade_rate.size < 8 or not np.all(np.isfinite(trade_rate)) or not np.all(np.isfinite(score)):
+        return
+    if np.std(trade_rate) < 1e-9 or np.std(score) < 1e-9:
+        return
+    corr = float(np.corrcoef(trade_rate, score)[0, 1])
+    if np.isfinite(corr) and corr < -0.80 and chosen_trade_rate < 0.06:
+        print(
+            f"  [L2] WARNING: threshold objective appears over-conservative (corr(score,trade_rate)={corr:.3f}, "
+            f"chosen_trade_rate={chosen_trade_rate:.3f} < 0.06). Consider lowering drawdown/tail penalties.",
+            flush=True,
+        )
+
+
+def _l2_straddle_size(
+    gate_p: np.ndarray,
+    expected_edge: np.ndarray,
+    straddle_on: np.ndarray,
+) -> np.ndarray:
+    g = np.clip(np.asarray(gate_p, dtype=np.float64).ravel(), 0.0, 1.0)
+    ee = np.clip(np.asarray(expected_edge, dtype=np.float64).ravel(), 0.0, None)
+    on = np.asarray(straddle_on, dtype=bool).ravel()
+    raw = g * ee
+    if not np.any(on):
+        return np.zeros_like(raw, dtype=np.float32)
+    std = float(np.std(raw[on]))
+    den = std + 1e-6
+    z = raw / den
+    mx = float(np.max(z[on]))
+    out = np.zeros_like(z, dtype=np.float64)
+    if mx > 1e-12:
+        out[on] = np.clip(z[on] / mx, 0.0, 1.0)
+    return out.astype(np.float32)
+
+
 def _l2_build_bracket_plan(
     df: pd.DataFrame,
     *,
@@ -278,7 +827,7 @@ def _l2_build_bracket_plan(
     sl_atr: float,
     max_hold: int,
 ) -> dict[str, np.ndarray]:
-    close = pd.to_numeric(df.get("close", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+    close = _l2_series_numeric_or_zero(df, "close").to_numpy(dtype=np.float64, copy=False)
     atr = _l2_bracket_atr_array(df).astype(np.float64)
     off = np.full(len(df), float(np.clip(offset_atr, 0.0, 5.0)), dtype=np.float32)
     tp = np.full(len(df), float(np.clip(tp_atr, 0.01, 20.0)), dtype=np.float32)
@@ -327,47 +876,6 @@ def _l2_direction_sample_weights(y_dir: np.ndarray, fusion_frame: pd.DataFrame |
     return w
 
 
-def _safe_logit(p: np.ndarray) -> np.ndarray:
-    pp = np.clip(np.asarray(p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
-    return np.log(pp) - np.log1p(-pp)
-
-
-def _l2_extract_l1c_z(frame: pd.DataFrame) -> np.ndarray:
-    if "l1c_pred_z" in frame.columns:
-        s = pd.to_numeric(frame["l1c_pred_z"], errors="coerce").fillna(0.0)
-    elif "l1c_direction" in frame.columns:
-        s = pd.to_numeric(frame["l1c_direction"], errors="coerce").fillna(0.0)
-    else:
-        s = pd.Series(0.0, index=frame.index)
-    return s.to_numpy(dtype=np.float64, copy=False)
-
-
-def _l2_direction_prob_from_l1c_z(
-    l1c_z: np.ndarray,
-    *,
-    scale: float = 1.0,
-    center: float = 0.0,
-    bias: float = 0.0,
-) -> np.ndarray:
-    z = np.asarray(l1c_z, dtype=np.float64).ravel()
-    z = np.clip(scale * (z - float(center)) + bias, -12.0, 12.0)
-    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
-
-
-def _l2_direction_prior_corrected_prob(
-    dir_p: np.ndarray,
-    *,
-    train_long_prior: float,
-    target_long_prior: float,
-) -> np.ndarray:
-    p = np.clip(np.asarray(dir_p, dtype=np.float64).ravel(), 1e-7, 1.0 - 1e-7)
-    tr = float(np.clip(train_long_prior, 1e-4, 1.0 - 1e-4))
-    tgt = float(np.clip(target_long_prior, 1e-4, 1.0 - 1e-4))
-    shift = float(_safe_logit(np.asarray([tgt]))[0] - _safe_logit(np.asarray([tr]))[0])
-    z = _safe_logit(p) + shift
-    return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
-
-
 def _l2_formula_size_from_context(
     frame: pd.DataFrame,
     trade_p: np.ndarray,
@@ -390,18 +898,18 @@ def _l2_formula_size_from_context(
         thr = np.broadcast_to(thr.reshape(-1), trade.shape)
     direction_margin = np.abs(2.0 * direction - 1.0)
     active_strength = np.clip((trade - thr) / np.maximum(1.0 - thr, 1e-3), 0.0, 1.0)
-    l1c_strength = _frame_col_or_default("l1c_direction_strength", 0.0)
-    l1c_conf = _frame_col_or_default("l1c_confidence", 0.0)
+    l1b_edge = _frame_col_or_default("l1b_edge_pred", 0.0)
+    l1b_bo = _frame_col_or_default("l1b_breakout_quality", 0.0)
     vol = _frame_col_or_default("l1a_vol_forecast", 1.0)
     persistence = _frame_col_or_default("l1a_state_persistence", 0.0)
-    strength_norm = np.clip(l1c_strength / max(float(clip_max), 1e-3), 0.0, 1.0)
+    strength_norm = np.clip(np.abs(l1b_edge) / max(float(clip_max), 1e-3), 0.0, 1.0)
     vol_damp = 1.0 / (1.0 + np.clip(vol, 0.0, 5.0))
     stability_boost = 0.60 + 0.40 * np.clip(persistence, 0.0, 1.0)
     size = (
         active_strength
         * (0.35 + 0.65 * direction_margin)
         * (0.25 + 0.75 * strength_norm)
-        * (0.50 + 0.50 * np.clip(l1c_conf, 0.0, 1.0))
+        * (0.50 + 0.50 * np.clip(l1b_bo, 0.0, 1.0))
         * vol_damp
         * stability_boost
     )
@@ -423,12 +931,11 @@ def _l2_bucketized_size_from_signals(
     thr = float(np.clip(trade_threshold, 0.01, 0.99))
     active_strength = np.clip((trade - thr) / max(1.0 - thr, 1e-3), 0.0, 1.0)
     dir_conf = np.abs((2.0 * direction) - 1.0)
-    l1c_conf = pd.to_numeric(frame.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    l1c_strength = pd.to_numeric(frame.get("l1c_direction_strength", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    strength_norm = _quantile_rescale_01(np.abs(l1c_strength), fit_mask=fit_mask, q_low=0.05, q_high=0.95).astype(np.float64)
-    edge_proxy = pd.to_numeric(frame.get("l1b_edge_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    bo_proxy = _l2_series_numeric_or_zero(frame, "l1b_breakout_quality").to_numpy(dtype=np.float64, copy=False)
+    edge_proxy = _l2_series_numeric_or_zero(frame, "l1b_edge_pred").to_numpy(dtype=np.float64, copy=False)
     edge_norm = _quantile_rescale_01(np.abs(edge_proxy), fit_mask=fit_mask, q_low=0.05, q_high=0.95).astype(np.float64)
-    score = 0.45 * active_strength + 0.30 * dir_conf + 0.15 * np.clip(l1c_conf, 0.0, 1.0) + 0.10 * edge_norm
+    bo_norm = _quantile_rescale_01(np.abs(bo_proxy), fit_mask=fit_mask, q_low=0.05, q_high=0.95).astype(np.float64)
+    score = 0.45 * active_strength + 0.30 * dir_conf + 0.15 * np.clip(bo_norm, 0.0, 1.0) + 0.10 * edge_norm
     score = np.clip(score, 0.0, 1.0)
     if levels is None:
         levels = [0.20, 0.35, 0.50, 0.70, 0.90]
@@ -452,8 +959,8 @@ def _l2_bucketized_size_from_signals(
 
 
 def _l2_train_exclude_regime_ids_from_env() -> list[int]:
-    """Regimes (L1a argmax class id) withheld from LGBM fit. Default ``5`` (range_div). ``none`` disables."""
-    raw = os.environ.get("L2_TRAIN_EXCLUDE_REGIME_IDS", "5").strip()
+    """L1a vol-regime argmax ids (0..4) withheld from LGBM fit. Default ``none`` (fit on all). Comma-separated ids."""
+    raw = os.environ.get("L2_TRAIN_EXCLUDE_REGIME_IDS", "none").strip()
     if raw.lower() in ("none", "off", "-"):
         return []
     out: list[int] = []
@@ -646,69 +1153,241 @@ def _l2_hard_decision_from_gate_dir(
     return out
 
 
-def _search_l2_trade_threshold(
+def _search_l2_trade_threshold_economic(
     gate_p: np.ndarray,
+    predicted_profit: np.ndarray,
     *,
     target_trade_rate: float = 0.10,
     min_trade_rate: float | None = None,
     max_trade_rate: float | None = None,
-) -> float:
+    min_edge: float = 0.0,
+    state_keys: np.ndarray | None = None,
+) -> tuple[float, dict[str, float | int | str]]:
     gate_p = np.asarray(gate_p, dtype=np.float64).ravel()
+    pp = np.asarray(predicted_profit, dtype=np.float64).ravel()
+    if pp.size != gate_p.size:
+        raise ValueError("predicted_profit must align with gate_p")
     if gate_p.size == 0:
-        return 0.35
-    if min_trade_rate is None:
-        min_trade_rate = float(os.environ.get("L2_TRADE_THR_SEARCH_MIN", "0.05"))
-    if max_trade_rate is None:
-        max_trade_rate = float(os.environ.get("L2_TRADE_THR_SEARCH_MAX", "0.12"))
+        return 0.35, {
+            "objective": "l2_trade_search",
+            "best_score": float("nan"),
+            "target_trade_rate": float(target_trade_rate),
+            "min_trade_rate": float(target_trade_rate),
+            "max_trade_rate": float(target_trade_rate),
+            "realized_trade_rate": 0.0,
+            "realized_gate_rate": 0.0,
+            "candidate_count": 0,
+            "constraint_mode": "fallback_empty",
+        }
+    if min_trade_rate is None or max_trade_rate is None:
+        band_lo, band_hi = _l2_trade_rate_search_min_max()
+        if min_trade_rate is None:
+            min_trade_rate = band_lo
+        if max_trade_rate is None:
+            max_trade_rate = band_hi
     target = float(np.clip(target_trade_rate, min_trade_rate, max_trade_rate))
-    thr = float(np.quantile(gate_p, 1.0 - target))
-    realized = float(np.mean(gate_p >= thr))
-    print("\n  [L2] trade_threshold search on live active probability", flush=True)
-    for rate in sorted({min_trade_rate, target, max_trade_rate}):
-        cand = float(np.quantile(gate_p, 1.0 - rate))
-        cand_rate = float(np.mean(gate_p >= cand))
-        mark = "  *" if abs(rate - target) < 1e-9 else ""
-        print(f"    target_trade_rate={rate:.3f}  threshold={cand:.4f}  realized={cand_rate:.3f}{mark}", flush=True)
-    print(f"  [L2] selected trade_threshold={thr:.4f}  target_trade_rate={target:.3f}  realized={realized:.3f}", flush=True)
-    return thr
+    grid_n = int(np.clip(int(os.environ.get("L2_TRADE_THR_SEARCH_GRID", "101")), 21, 401))
+    q_grid = np.linspace(0.01, 0.99, grid_n)
+    cand_from_q = np.quantile(gate_p, q_grid)
+    cand_from_rates = [
+        float(np.quantile(gate_p, 1.0 - rate))
+        for rate in sorted({float(min_trade_rate), float(target), float(max_trade_rate)})
+    ]
+    candidates = np.unique(np.clip(np.concatenate([cand_from_q, np.asarray(cand_from_rates, dtype=np.float64)]), 0.0, 1.0))
 
-
-def _search_l2_direction_abstain_margin(
-    trade_p: np.ndarray,
-    direction_p: np.ndarray,
-    *,
-    trade_threshold: float,
-    target_abstain_rate: float = 0.10,
-) -> float:
-    trade = np.asarray(trade_p, dtype=np.float64).ravel()
-    direction = np.asarray(direction_p, dtype=np.float64).ravel()
-    live = trade >= float(trade_threshold)
-    if not np.any(live):
-        return 0.0
-    conf = np.abs((2.0 * np.clip(direction[live], 0.0, 1.0)) - 1.0)
-    target = float(np.clip(target_abstain_rate, 0.0, 0.5))
-    if target <= 1e-6:
-        return 0.0
-    margin = float(np.quantile(conf, target))
-    realized = float(np.mean(conf <= margin))
-    tie_ratio = 1.0 - (float(np.unique(conf).size) / float(max(conf.size, 1)))
-    at_margin_share = float(np.mean(conf == margin))
-    print("\n  [L2] direction abstain-margin search on active trades", flush=True)
-    for rate in [0.05, target, min(0.25, max(target, 0.05) + 0.10)]:
-        cand = float(np.quantile(conf, float(np.clip(rate, 0.0, 0.5))))
-        cand_rate = float(np.mean(conf <= cand))
-        mark = "  *" if abs(rate - target) < 1e-9 else ""
-        print(f"    target_abstain_rate={rate:.3f}  margin={cand:.4f}  realized={cand_rate:.3f}{mark}", flush=True)
+    best_any: dict[str, float] | None = None
+    best_in_band: dict[str, float] | None = None
+    all_records: list[dict[str, float]] = []
+    lamb_s = float(np.clip(float(os.environ.get("L2_SORTINO_LAMBDA", "0.25")), 0.0, 10.0))
+    rate_pen_s = float(np.clip(float(os.environ.get("L2_SORTINO_TARGET_RATE_PENALTY", "0.35")), 0.0, 10.0))
+    dd_pen_s = float(np.clip(float(os.environ.get("L2_SORTINO_DRAWDOWN_PENALTY", "0.10")), 0.0, 10.0))
+    tail_pen_s = float(np.clip(float(os.environ.get("L2_SORTINO_TAIL_LOSS_PENALTY", "0.15")), 0.0, 10.0))
+    pf_bonus_s = float(np.clip(float(os.environ.get("L2_SORTINO_PROFIT_FACTOR_BONUS", "0.05")), 0.0, 10.0))
+    obj_lbl = "mean(size*predicted_profit)" if lamb_s <= 0.0 else "mean(active profit) - λ*downside_rms(losses)"
+    if dd_pen_s > 0.0:
+        obj_lbl = f"{obj_lbl} - dd_pen*max_drawdown"
+    if tail_pen_s > 0.0:
+        obj_lbl = f"{obj_lbl} - tail_pen*P5(loss)"
+    if pf_bonus_s > 0.0:
+        obj_lbl = f"{obj_lbl} + pf_bonus*profit_factor"
+    if rate_pen_s > 0.0:
+        obj_lbl = f"{obj_lbl} - rate_pen*|trade_rate-target|"
     print(
-        f"    direction_conf stats: pcts={np.round(np.percentile(conf, [0, 5, 25, 50, 75, 95, 100]), 4).tolist()}  "
-        f"tie_ratio={tie_ratio:.4f}  at_margin_share={at_margin_share:.4f}",
+        f"\n  [L2] trade_threshold search (range-first gate + pp); objective={obj_lbl}  "
+        f"λ={lamb_s:.3f}  rate_pen={rate_pen_s:.3f}",
+        flush=True,
+    )
+    for thr in candidates:
+        score, straddle_on, _ = _l2_sortino_trade_search_score(
+            gate_p, pp, float(thr), min_edge, target_trade_rate=target
+        )
+        gate_on = gate_p >= float(thr)
+        realized_trade_rate = float(np.mean(straddle_on))
+        realized_gate_rate = float(np.mean(gate_on))
+        record = {
+            "threshold": float(thr),
+            "score": score,
+            "realized_trade_rate": realized_trade_rate,
+            "realized_gate_rate": realized_gate_rate,
+            "active_count": float(np.sum(straddle_on)),
+        }
+        all_records.append(record)
+        if best_any is None or score > float(best_any["score"]) + 1e-12 or (
+            abs(score - float(best_any["score"])) <= 1e-12
+            and abs(realized_trade_rate - target) < abs(float(best_any["realized_trade_rate"]) - target)
+        ):
+            best_any = record
+        if min_trade_rate <= realized_trade_rate <= max_trade_rate:
+            if best_in_band is None or score > float(best_in_band["score"]) + 1e-12 or (
+                abs(score - float(best_in_band["score"])) <= 1e-12
+                and abs(realized_trade_rate - target) < abs(float(best_in_band["realized_trade_rate"]) - target)
+            ):
+                best_in_band = record
+
+    dynamic_threshold_map: dict[str, float] = {}
+    use_dynamic = os.environ.get("L2_DYNAMIC_THRESHOLD_REGIME", "1").strip().lower() not in {"0", "false", "no"}
+    min_rows = int(np.clip(int(os.environ.get("L2_DYNAMIC_THRESHOLD_MIN_ROWS", "500")), 20, 5000))
+    max_offset = float(np.clip(float(os.environ.get("L2_DYNAMIC_THRESHOLD_MAX_OFFSET", "0.010")), 0.001, 0.050))
+    raw_steps = os.environ.get("L2_DYNAMIC_THRESHOLD_STEPS", "-0.010,-0.006,-0.003,0.0,0.003,0.006,0.010").strip()
+    if use_dynamic and state_keys is not None and len(state_keys) == len(gate_p):
+        parsed_steps: list[float] = []
+        for s in raw_steps.split(","):
+            ss = s.strip()
+            if not ss:
+                continue
+            try:
+                parsed_steps.append(float(ss))
+            except ValueError:
+                continue
+        steps = sorted({float(np.clip(s, -max_offset, max_offset)) for s in parsed_steps} | {0.0})
+        chosen_base = best_in_band if best_in_band is not None else best_any
+        assert chosen_base is not None
+        thr_row = np.full(len(gate_p), float(chosen_base["threshold"]), dtype=np.float64)
+        keys = np.asarray(state_keys, dtype=object)
+        for key in np.unique(keys):
+            m = keys == key
+            if int(np.sum(m)) < min_rows:
+                continue
+            local_best_step = 0.0
+            local_best_score = -1e18
+            for step in steps:
+                trial_thr = np.clip(thr_row[m] + step, 0.0, 1.0)
+                trial_full = thr_row.copy()
+                trial_full[m] = trial_thr
+                trial_score, _, _ = _l2_sortino_trade_search_score(
+                    gate_p,
+                    pp,
+                    trial_full,
+                    min_edge,
+                    target_trade_rate=target,
+                )
+                if trial_score > local_best_score:
+                    local_best_score = float(trial_score)
+                    local_best_step = float(step)
+            if abs(local_best_step) > 1e-9:
+                thr_row[m] = np.clip(thr_row[m] + local_best_step, 0.0, 1.0)
+            dynamic_threshold_map[str(key)] = float(local_best_step)
+        score_dyn, on_dyn, _ = _l2_sortino_trade_search_score(
+            gate_p,
+            pp,
+            thr_row,
+            min_edge,
+            target_trade_rate=target,
+        )
+        rec_dyn = {
+            "threshold": float(chosen_base["threshold"]),
+            "score": float(score_dyn),
+            "realized_trade_rate": float(np.mean(on_dyn)),
+            "realized_gate_rate": float(np.mean(gate_p >= thr_row)),
+            "active_count": float(np.sum(on_dyn)),
+        }
+        in_band_dyn = min_trade_rate <= rec_dyn["realized_trade_rate"] <= max_trade_rate
+        if in_band_dyn and (best_in_band is None or rec_dyn["score"] > float(best_in_band["score"]) + 1e-12):
+            best_in_band = rec_dyn
+        elif best_in_band is None and best_any is not None and rec_dyn["score"] > float(best_any["score"]) + 1e-12:
+            best_any = rec_dyn
+
+    chosen = best_in_band if best_in_band is not None else best_any
+    assert chosen is not None
+    hard_floor = float(np.clip(float(os.environ.get("L2_TRADE_RATE_HARD_FLOOR", "0.06")), 0.01, 0.50))
+    if float(chosen["realized_trade_rate"]) < hard_floor:
+        eligible = [r for r in all_records if float(r["realized_trade_rate"]) >= hard_floor]
+        if eligible:
+            chosen = max(
+                eligible,
+                key=lambda r: (float(r["score"]), -abs(float(r["realized_trade_rate"]) - target)),
+            )
+            print(
+                f"  [L2] trade-rate hard floor applied: floor={hard_floor:.3f} "
+                f"selected_threshold={float(chosen['threshold']):.4f}",
+                flush=True,
+            )
+    _l2_warn_trade_search_shape(all_records, chosen_trade_rate=float(chosen["realized_trade_rate"]))
+    print(
+        f"    target_trade_rate={target:.3f}  band=[{float(min_trade_rate):.3f}, {float(max_trade_rate):.3f}]  "
+        f"candidates={len(candidates)}",
         flush=True,
     )
     print(
-        f"  [L2] selected direction_abstain_margin={margin:.4f}  target_abstain_rate={target:.3f}  realized={realized:.3f}",
+        f"  [L2] selected trade_threshold={float(chosen['threshold']):.4f}  "
+        f"score={float(chosen['score']):.6f}  realized_trade_rate={float(chosen['realized_trade_rate']):.3f}  "
+        f"gate_rate={float(chosen['realized_gate_rate']):.3f}  active_n={int(chosen['active_count'])}",
         flush=True,
     )
-    return float(np.clip(margin, 0.0, 0.45))
+    info: dict[str, float | int | str] = {
+        "objective": obj_lbl,
+        "sortino_lambda": float(lamb_s),
+        "sortino_target_rate_penalty": float(rate_pen_s),
+        "sortino_drawdown_penalty": float(dd_pen_s),
+        "sortino_tail_penalty": float(tail_pen_s),
+        "sortino_profit_factor_bonus": float(pf_bonus_s),
+        "best_score": float(chosen["score"]),
+        "target_trade_rate": float(target),
+        "min_trade_rate": float(min_trade_rate),
+        "max_trade_rate": float(max_trade_rate),
+        "realized_trade_rate": float(chosen["realized_trade_rate"]),
+        "realized_gate_rate": float(chosen["realized_gate_rate"]),
+        "candidate_count": int(len(candidates)),
+        "trade_rate_hard_floor": float(hard_floor),
+        "dynamic_threshold_states": int(len(dynamic_threshold_map)),
+        "dynamic_threshold_steps": raw_steps,
+        "dynamic_threshold_max_offset": float(max_offset),
+        "dynamic_threshold_map": json.dumps(dynamic_threshold_map, sort_keys=True),
+        "constraint_mode": "in_band" if best_in_band is not None else "fallback_best_score",
+        "l2_trade_rate_band_env": (os.environ.get("L2_TRADE_RATE_BAND", "") or "").strip(),
+    }
+    return float(chosen["threshold"]), info
+
+
+def _l2_threshold_row_from_state_map(
+    base_threshold: float,
+    state_keys: np.ndarray | None,
+    dynamic_threshold_map_json: str | None,
+) -> np.ndarray | None:
+    if state_keys is None:
+        return None
+    keys = np.asarray(state_keys, dtype=object).ravel()
+    if keys.size == 0:
+        return None
+    out = np.full(keys.shape, float(np.clip(base_threshold, 0.0, 1.0)), dtype=np.float64)
+    raw = (dynamic_threshold_map_json or "").strip()
+    if not raw:
+        return out
+    try:
+        mp = json.loads(raw)
+    except json.JSONDecodeError:
+        return out
+    if not isinstance(mp, dict):
+        return out
+    for k, step in mp.items():
+        try:
+            s = float(step)
+        except (TypeError, ValueError):
+            continue
+        m = keys == str(k)
+        if np.any(m):
+            out[m] = np.clip(out[m] + s, 0.0, 1.0)
+    return out
 
 
 def _l2_edge_diagnosis_branch(
@@ -1631,8 +2310,8 @@ def _l2_l1b_importance_bucket(name: str) -> str:
     if name in {
         "l1b_edge_pred",
         "l2_vol_adjusted_l1b_edge",
-        "l2_dir_x_edge_opportunity",
-        "l2_dir_conf_x_edge_mag",
+        "l2_edge_x_breakout",
+        "l2_breakout_x_abs_edge",
         "l2_signal_strength_mean_abs",
         "l2_signal_spread_var",
     }:
@@ -1651,11 +2330,15 @@ def _l2_l1b_importance_bucket(name: str) -> str:
         return "l1b_context"
     if name.startswith("l1b_atom_"):
         return "l1b_atom_internal"
-    if name == "l2_breakout_quality_x_l1c_dir":
+    if name in {"l2_bull_mass_x_abs_edge", "l2_range_mass_x_abs_edge"}:
         return "l1b_deterministic_semantic"
     if name.startswith("l1b_"):
         return "l1b_deterministic_semantic"
     return "non_l1b"
+
+
+def _l2_unsup_descriptor_feature_names(feature_cols: list[str]) -> list[str]:
+    return [c for c in feature_cols if _l2_l1b_importance_bucket(c) == "l1b_unsup_descriptor"]
 
 
 def _log_l2_l1b_gain_importance_by_group(model: lgb.Booster, feature_cols: list[str], label: str) -> None:
@@ -1808,7 +2491,27 @@ def _session_context(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _l2_target_trade_rate() -> float:
-    return float(np.clip(float(os.environ.get("L2_TARGET_TRADE_RATE", "0.08")), 0.05, 0.15))
+    return float(np.clip(float(os.environ.get("L2_TARGET_TRADE_RATE", "0.10")), 0.05, 0.15))
+
+
+def _l2_trade_rate_search_min_max() -> tuple[float, float]:
+    """Realized straddle trade-rate band for gate threshold search.
+
+    ``L2_TRADE_RATE_BAND=lo,hi`` overrides ``L2_TRADE_THR_SEARCH_MIN`` / ``MAX`` when set.
+    Defaults widen the feasible band (higher signal frequency vs legacy 5–12%).
+    """
+    raw = (os.environ.get("L2_TRADE_RATE_BAND", "") or "").strip()
+    if raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) >= 2:
+            lo = float(parts[0])
+            hi = float(parts[1])
+            if lo > hi:
+                lo, hi = hi, lo
+            return float(np.clip(lo, 0.01, 0.50)), float(np.clip(hi, 0.01, 0.50))
+    lo = float(os.environ.get("L2_TRADE_THR_SEARCH_MIN", "0.07"))
+    hi = float(os.environ.get("L2_TRADE_THR_SEARCH_MAX", "0.15"))
+    return float(np.clip(lo, 0.01, 0.50)), float(np.clip(hi, 0.01, 0.50))
 
 
 def _l2_decision_edge_tau() -> float:
@@ -1883,12 +2586,12 @@ def _l2_model_lgb_params(kind: str) -> dict[str, Any]:
         "reg": {
             "learning_rate": 0.03,
             "num_leaves": 63,
-            "max_depth": 7,
-            "feature_fraction": 0.85,
+            "max_depth": 6,
+            "feature_fraction": 0.70,
             "bagging_fraction": 0.8,
             "bagging_freq": 5,
-            "min_child_samples": 60,
-            "lambda_l1": 0.05,
+            "min_child_samples": 50,
+            "lambda_l1": 0.10,
             "lambda_l2": 1.0,
             "seed": 43,
         },
@@ -2043,31 +2746,6 @@ def _conditional_tau_from_state(
     return global_tau, vol_quantiles, state_map, tau_row
 
 
-def _l2_hard_decode_prob_aligned_outputs(
-    gate_p: np.ndarray,
-    dir_p: np.ndarray,
-    decision_probs: np.ndarray,
-    *,
-    trade_threshold: float,
-    direction_abstain_margin: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    hard_cls = _l2_hard_decision_from_gate_dir(
-        gate_p,
-        dir_p,
-        trade_threshold,
-        direction_abstain_margin=direction_abstain_margin,
-    )
-    prob_mat = np.asarray(decision_probs, dtype=np.float32)
-    confidence = prob_mat[np.arange(len(prob_mat)), hard_cls].astype(np.float32)
-    if float(direction_abstain_margin) > 0.0:
-        direction = np.asarray(dir_p, dtype=np.float64).ravel()
-        dir_conf = np.abs((2.0 * np.clip(direction, 0.0, 1.0)) - 1.0).astype(np.float32)
-        abstain = hard_cls == 1
-        if np.any(abstain):
-            confidence[abstain] = np.maximum(confidence[abstain], (1.0 - dir_conf[abstain]).astype(np.float32))
-    return hard_cls.astype(np.int64), confidence
-
-
 def _quantile_rescale_01(
     x: np.ndarray,
     *,
@@ -2160,6 +2838,75 @@ def _l2_positive_head_predict(model: lgb.Booster, X: np.ndarray, prep: dict[str,
     return pred.astype(np.float32)
 
 
+def _l2_mfe_sample_weights(y_mfe_fit: np.ndarray, fit_mask: np.ndarray) -> np.ndarray:
+    y = np.asarray(y_mfe_fit, dtype=np.float64).ravel()
+    mask = np.asarray(fit_mask, dtype=bool).ravel()
+    w = np.ones_like(y, dtype=np.float64)
+    if y.size == 0 or not np.any(mask):
+        return w.astype(np.float32)
+    fit_vals = y[mask & np.isfinite(y)]
+    if fit_vals.size == 0:
+        return w.astype(np.float32)
+    hard_thr_raw = os.environ.get("L2_MFE_UNDEREST_PENALTY_THRESHOLD", "").strip()
+    hard_thr = float(hard_thr_raw) if hard_thr_raw else None
+    pos_eps = float(np.clip(float(os.environ.get("L2_MFE_POS_EPS", "1e-8")), 0.0, 0.5))
+    q = float(np.clip(float(os.environ.get("L2_MFE_UNDEREST_PENALTY_Q", "0.50")), 0.0, 0.98))
+    conditional = os.environ.get("L2_MFE_QUANTILE_CONDITIONAL", "1").strip().lower() in {"1", "true", "yes"}
+    pos_mask = mask & np.isfinite(y) & (y > pos_eps)
+    pos_vals = y[pos_mask]
+    if conditional and pos_vals.size >= 16:
+        src = pos_vals
+    else:
+        src = fit_vals
+    if hard_thr is not None:
+        high = float(max(hard_thr, pos_eps))
+    else:
+        high = float(np.quantile(src, q))
+    extra = float(np.clip(float(os.environ.get("L2_MFE_UNDEREST_PENALTY_MULT", "2.0")), 1.0, 5.0))
+    positive_only = os.environ.get("L2_MFE_BOOST_ON_POSITIVE_ONLY", "1").strip().lower() in {"1", "true", "yes"}
+    base_mask = pos_mask if positive_only else (mask & np.isfinite(y))
+    boosted_mask = base_mask & (y > max(high, pos_eps))
+    w[boosted_mask] = extra
+    return w.astype(np.float32)
+
+
+def _l2_log_mfe_weighting_diagnostics(y_mfe_fit: np.ndarray, weights: np.ndarray, *, active_mask: np.ndarray) -> None:
+    y = np.asarray(y_mfe_fit, dtype=np.float64).ravel()
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    m = np.asarray(active_mask, dtype=bool).ravel() & np.isfinite(y) & np.isfinite(w)
+    if not np.any(m):
+        return
+    yv = y[m]
+    wv = w[m]
+    boosted = wv > 1.000001
+    boosted_share = float(np.mean(boosted))
+    q = float(np.clip(float(os.environ.get("L2_MFE_UNDEREST_PENALTY_Q", "0.50")), 0.0, 0.98))
+    pos_eps = float(np.clip(float(os.environ.get("L2_MFE_POS_EPS", "1e-8")), 0.0, 0.5))
+    pos_share = float(np.mean(yv > pos_eps))
+    boosted_pos_share = float(np.mean(boosted[yv > pos_eps])) if np.any(yv > pos_eps) else 0.0
+    print(
+        f"  [L2] MFE asymmetric weighting: boosted_share={boosted_share:.3f} "
+        f"boosted_share_pos={boosted_pos_share:.3f}  q={q:.2f}  pos_share={pos_share:.3f} "
+        f"mult={float(np.clip(float(os.environ.get('L2_MFE_UNDEREST_PENALTY_MULT', '2.0')), 1.0, 5.0)):.2f}",
+        flush=True,
+    )
+    if boosted_pos_share < 0.20 or boosted_pos_share > 0.80:
+        print(
+            "  [L2] WARNING: MFE boosted_share_pos outside preferred [0.20, 0.80]. "
+            "Tune L2_MFE_UNDEREST_PENALTY_Q.",
+            flush=True,
+        )
+    p = np.quantile(yv, [0.25, 0.75])
+    low = yv <= float(p[0])
+    high = yv >= float(p[1])
+    if np.any(low) and np.any(high):
+        print(
+            f"  [L2] MFE weight buckets: low_q25_mean_w={float(np.mean(wv[low])):.3f}  "
+            f"high_q75_mean_w={float(np.mean(wv[high])):.3f}",
+            flush=True,
+        )
+
+
 def _residual_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     df = ensure_pa_state_features(df)
     out = pd.DataFrame(index=df.index)
@@ -2198,21 +2945,68 @@ def _l2_condition_input_cols(merged: pd.DataFrame) -> list[str]:
         "l1b_novelty_score",
         "l1b_regime_change_score",
         "l1b_breakout_quality",
+        "l1b_edge_confidence",
+        "l1b_edge_trend",
+        "l1b_breakout_strength",
+        "l1b_cluster_diversity",
     ]
     allow.extend([c for c in merged.columns if c.startswith("l1b_cluster_prob_")])
     return [c for c in allow if c in merged.columns]
 
 
+def _l2_l1b_condition_extras(merged: pd.DataFrame) -> pd.DataFrame:
+    """L1b-side scalars built in L2 (not from L1b cache): confidence, trend, breakout z, cluster diversity."""
+    out = pd.DataFrame(index=merged.index)
+    n = len(merged)
+    edge_ser = pd.to_numeric(merged.get("l1b_edge_pred", pd.Series(0.0, index=merged.index)), errors="coerce").fillna(0.0)
+    edge = edge_ser.to_numpy(dtype=np.float64)
+    out["l1b_edge_confidence"] = np.abs(np.tanh(edge)).astype(np.float32)
+
+    if "symbol" in merged.columns:
+        out["l1b_edge_trend"] = (
+            merged.groupby("symbol", sort=False)["l1b_edge_pred"]
+            .transform(lambda s: pd.to_numeric(s, errors="coerce").fillna(0.0).diff(5))
+            .fillna(0.0)
+            .astype(np.float32)
+        )
+    else:
+        out["l1b_edge_trend"] = edge_ser.diff(5).fillna(0.0).astype(np.float32)
+
+    def _bq_z(s: pd.Series) -> pd.Series:
+        s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+        m = s.rolling(390, min_periods=20).mean()
+        sd = s.rolling(390, min_periods=20).std() + 1e-6
+        return ((s - m) / sd).fillna(0.0)
+
+    if "symbol" in merged.columns and "l1b_breakout_quality" in merged.columns:
+        out["l1b_breakout_strength"] = (
+            merged.groupby("symbol", sort=False)["l1b_breakout_quality"].transform(_bq_z).astype(np.float32)
+        )
+    else:
+        out["l1b_breakout_strength"] = np.zeros(n, dtype=np.float32)
+
+    cluster_cols = [c for c in merged.columns if c.startswith("l1b_cluster_prob_")]
+    if cluster_cols:
+        cp = merged[cluster_cols].to_numpy(dtype=np.float64, copy=False)
+        cp = np.nan_to_num(cp, nan=0.0)
+        cp = cp / np.maximum(cp.sum(axis=1, keepdims=True), 1e-12)
+        k = cp.shape[1]
+        h = -np.sum(np.clip(cp, 1e-12, 1.0) * np.log(np.clip(cp, 1e-12, 1.0)), axis=1)
+        div = h / max(float(np.log(max(k, 2))), 1e-12)
+        out["l1b_cluster_diversity"] = np.clip(div, 0.0, 1.0).astype(np.float32)
+    else:
+        out["l1b_cluster_diversity"] = np.zeros(n, dtype=np.float32)
+    return out
+
+
 def _l2_direction_input_cols(merged: pd.DataFrame) -> list[str]:
+    """Direction-pressure proxies for straddle asymmetry (magnitude only, no directional label leak)."""
     allow = [
-        "l1c_pred_z",
-        "l1c_pred_z_abs",
-        "l1c_pred_sign",
-        "l1c_direction",
-        "l1c_confidence",
-        "l1c_direction_strength",
-        "l1c_conf_zone",
-        "l1c_is_warm",
+        "l2_directional_pressure",
+        "l2_skew_imbalance",
+        "l2_order_flow_asymmetry",
+        "l2_recent_momentum_abs",
+        "l2_direction_vol_pressure",
     ]
     return [c for c in allow if c in merged.columns]
 
@@ -2226,7 +3020,65 @@ def _legacy_l1a_direction_cols(merged: pd.DataFrame) -> list[str]:
     return [c for c in merged.columns if c.startswith("l1a_dir_") or c in legacy_named]
 
 
-def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
+def _l2_np_float32_col(merged: pd.DataFrame, name: str) -> np.ndarray:
+    """Numeric column as float32 vector; zeros if missing (``DataFrame.get`` default would be a scalar)."""
+    if name not in merged.columns:
+        return np.zeros(len(merged), dtype=np.float32)
+    return pd.to_numeric(merged[name], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+
+
+def _l2_series_numeric_or_zero(frame: pd.DataFrame, name: str) -> pd.Series:
+    """Like ``frame[name]`` numeric coerced; all zeros if column absent (avoids ``.get(..., 0.0)`` scalar bug)."""
+    if name not in frame.columns:
+        return pd.Series(0.0, index=frame.index, dtype=np.float64)
+    return pd.to_numeric(frame[name], errors="coerce").fillna(0.0)
+
+
+def _merge_l2_upstream_outputs(
+    df: pd.DataFrame,
+    l1a_outputs: pd.DataFrame,
+    l1b_outputs: pd.DataFrame,
+) -> pd.DataFrame:
+    merged = (
+        df[["symbol", "time_key"]]
+        .merge(l1a_outputs, on=["symbol", "time_key"], how="left")
+        .merge(l1b_outputs, on=["symbol", "time_key"], how="left")
+    )
+    legacy_l1a_dir_cols = _legacy_l1a_direction_cols(merged)
+    if legacy_l1a_dir_cols:
+        merged = merged.drop(columns=legacy_l1a_dir_cols)
+        print(
+            f"  [L2] ignoring {len(legacy_l1a_dir_cols)} legacy L1a direction cols: {legacy_l1a_dir_cols}",
+            flush=True,
+        )
+    return merged
+
+
+def _l2_fit_derived_feature_stats(
+    merged: pd.DataFrame,
+    fit_mask: np.ndarray | None,
+) -> dict[str, float]:
+    fit = np.asarray(fit_mask, dtype=bool).ravel() if fit_mask is not None else np.ones(len(merged), dtype=bool)
+    l1b_edge_f = _l2_np_float32_col(merged, "l1b_edge_pred").astype(np.float64)
+    fit_vals = np.abs(l1b_edge_f[fit & np.isfinite(l1b_edge_f)])
+    if fit_vals.size == 0:
+        fit_vals = np.abs(l1b_edge_f[np.isfinite(l1b_edge_f)])
+    tau_q = float(np.clip(float(os.environ.get("L2_L1B_TAU_PROXY_Q", "0.70")), 0.50, 0.95))
+    tau_proxy = float(np.quantile(fit_vals, tau_q)) if fit_vals.size else 0.05
+    tau_proxy = float(max(tau_proxy, 1e-3))
+    return {
+        "l1b_edge_abs_tau_proxy": tau_proxy,
+        "l1b_edge_abs_tau_proxy_q": tau_q,
+        "fit_row_count": int(np.sum(fit)),
+    }
+
+
+def _derived_l2_feature_frame(
+    merged: pd.DataFrame,
+    *,
+    derived_feature_stats: dict[str, Any] | None = None,
+    price_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     out = pd.DataFrame(index=merged.index)
     n_m = len(merged)
     regime_cols = [c for c in L1A_REGIME_COLS if c in merged.columns]
@@ -2258,102 +3110,194 @@ def _derived_l2_feature_frame(merged: pd.DataFrame) -> pd.DataFrame:
         out["l1b_cluster_top1"] = np.zeros(len(merged), dtype=np.float32)
         out["l1b_cluster_top2_gap"] = np.zeros(len(merged), dtype=np.float32)
 
-    novelty = pd.to_numeric(merged.get("l1b_novelty_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    regime_change = pd.to_numeric(merged.get("l1b_regime_change_score", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    vol = pd.to_numeric(merged.get("l1a_vol_forecast", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    novelty = _l2_np_float32_col(merged, "l1b_novelty_score")
+    regime_change = _l2_np_float32_col(merged, "l1b_regime_change_score")
+    vol = _l2_np_float32_col(merged, "l1a_vol_forecast")
     out["l1b_novelty_x_vol"] = (novelty * vol).astype(np.float32)
     out["l1b_regime_change_x_entropy"] = (regime_change * out["l1a_regime_entropy"].to_numpy(dtype=np.float32, copy=False)).astype(np.float32)
     out["l1b_unsup_pressure"] = (out["l1b_cluster_top2_gap"].to_numpy(dtype=np.float32, copy=False) - novelty).astype(np.float32)
-    if "l1c_direction" in merged.columns or "l1c_pred_z" in merged.columns:
-        if "l1c_direction" in merged.columns:
-            l1c_d = pd.to_numeric(merged["l1c_direction"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-        else:
-            l1c_d = pd.to_numeric(merged.get("l1c_pred_z", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-        d_margin = np.abs(l1c_d.astype(np.float64))
-        l1c_c = pd.to_numeric(merged.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-        l1c_s = pd.to_numeric(merged.get("l1c_direction_strength", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-        abst_margin = float(np.clip(float(os.environ.get("L1C_ABSTAIN_MARGIN", "0.10")), 0.02, 0.30))
-        low_margin = float(np.clip(abst_margin * 2.0, abst_margin + 0.01, 0.45))
-        d_zone = d_margin
-        conf_zone = np.where(d_zone < abst_margin, 0.0, np.where(d_zone < low_margin, 1.0, 2.0)).astype(np.float32)
-        out["l1c_conf_zone"] = conf_zone
-        clarity_w = d_margin.astype(np.float32)
-        out["l1c_weighted_dir"] = (l1c_d.astype(np.float64) * clarity_w.astype(np.float64)).astype(np.float32)
-        out["l1c_dir_x_vol"] = (l1c_d * vol).astype(np.float32)
-        out["l1c_strength_x_conf"] = (l1c_s * l1c_c).astype(np.float32)
-    else:
-        out["l1c_conf_zone"] = np.zeros(n_m, dtype=np.float32)
-        out["l1c_weighted_dir"] = np.zeros(n_m, dtype=np.float32)
-        out["l1c_dir_x_vol"] = np.zeros(n_m, dtype=np.float32)
-        out["l1c_strength_x_conf"] = np.zeros(n_m, dtype=np.float32)
-
-    l1b_edge_f = pd.to_numeric(merged.get("l1b_edge_pred", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    l1b_breakout_f = pd.to_numeric(merged.get("l1b_breakout_quality", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    tau_q = float(np.clip(float(os.environ.get("L2_L1B_TAU_PROXY_Q", "0.70")), 0.50, 0.95))
-    tau_proxy = float(np.quantile(np.abs(l1b_edge_f).astype(np.float64), tau_q)) if len(l1b_edge_f) else 0.05
+    l1b_edge_f = _l2_np_float32_col(merged, "l1b_edge_pred")
+    l1b_breakout_f = _l2_np_float32_col(merged, "l1b_breakout_quality")
+    stats = dict(derived_feature_stats or {})
+    tau_proxy = float(stats.get("l1b_edge_abs_tau_proxy", 0.05))
     tau_eff = np.full(len(l1b_edge_f), max(tau_proxy, 1e-3), dtype=np.float64)
     out["l2_l1b_edge_over_tau"] = (l1b_edge_f.astype(np.float64) / np.maximum(tau_eff, 1e-3)).astype(np.float32)
-    vol_f = pd.to_numeric(merged.get("l1a_vol_forecast", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    vol_f = _l2_np_float32_col(merged, "l1a_vol_forecast")
     out["l2_vol_adjusted_l1b_edge"] = (l1b_edge_f / np.maximum(vol_f, 1e-4)).astype(np.float32)
-    l1c_dir_series = merged["l1c_direction"] if "l1c_direction" in merged.columns else merged.get("l1c_pred_z", pd.Series(0.0, index=merged.index))
-    l1c_dir_f = pd.to_numeric(l1c_dir_series, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    l1c_conf_f = pd.to_numeric(merged.get("l1c_confidence", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
-    out["l2_dir_x_edge_opportunity"] = (l1c_dir_f * l1b_edge_f).astype(np.float32)
-    out["l2_dir_conf_x_edge_mag"] = (l1c_conf_f * np.abs(l1b_edge_f)).astype(np.float32)
-    out["l2_breakout_quality_x_l1c_dir"] = (l1b_breakout_f * l1c_dir_f).astype(np.float32)
-
-    out["l2_signal_strength_mean_abs"] = ((np.abs(l1c_dir_f) + np.abs(l1b_edge_f)) / 2.0).astype(np.float32)
-    sig_stack = np.column_stack([l1c_dir_f.astype(np.float64), l1b_edge_f.astype(np.float64)])
+    abs_edge = np.abs(l1b_edge_f.astype(np.float64))
+    out["l2_edge_x_breakout"] = (l1b_edge_f * l1b_breakout_f).astype(np.float32)
+    out["l2_breakout_x_abs_edge"] = (l1b_breakout_f.astype(np.float64) * abs_edge).astype(np.float32)
+    out["l2_signal_strength_mean_abs"] = abs_edge.astype(np.float32)
+    sig_stack = np.column_stack([l1b_edge_f.astype(np.float64), l1b_breakout_f.astype(np.float64)])
     out["l2_signal_spread_var"] = np.var(sig_stack, axis=1).astype(np.float32)
 
     if len(regime_cols) >= NUM_REGIME_CLASSES:
         rp = merged[regime_cols].to_numpy(dtype=np.float64, copy=False)
         rp = np.nan_to_num(rp, nan=0.0)
         rp = rp / np.maximum(rp.sum(axis=1, keepdims=True), 1e-12)
-        bull_mass = (rp[:, 0] + rp[:, 1]).astype(np.float32)
-        range_mass = (rp[:, 4] + rp[:, 5]).astype(np.float32)
-        out["l2_bull_mass_x_l1c_dir"] = (bull_mass * l1c_dir_f).astype(np.float32)
-        out["l2_range_mass_x_l1c_dir"] = (range_mass * l1c_dir_f).astype(np.float32)
+        # Vol lifecycle (5): range-like mass = compress + mean-revert; remainder = breakout/trending/exhaust.
+        range_mass = rp[:, RANGE_REGIME_INDICES].sum(axis=1).astype(np.float32)
+        mask = np.ones(rp.shape[1], dtype=bool)
+        mask[np.asarray(RANGE_REGIME_INDICES, dtype=int)] = False
+        bull_mass = rp[:, mask].sum(axis=1).astype(np.float32)
+        out["l2_bull_mass_x_abs_edge"] = (bull_mass.astype(np.float64) * abs_edge).astype(np.float32)
+        out["l2_range_mass_x_abs_edge"] = (range_mass.astype(np.float64) * abs_edge).astype(np.float32)
     else:
-        out["l2_bull_mass_x_l1c_dir"] = np.full(n_m, np.nan, dtype=np.float64)
-        out["l2_range_mass_x_l1c_dir"] = np.full(n_m, np.nan, dtype=np.float64)
+        out["l2_bull_mass_x_abs_edge"] = np.zeros(n_m, dtype=np.float32)
+        out["l2_range_mass_x_abs_edge"] = np.zeros(n_m, dtype=np.float32)
+
+    vol_rf = _l2_np_float32_col(merged, "l1a_vol_forecast")
+    vol_tr = _l2_np_float32_col(merged, "l1a_vol_trend")
+    edge_rf = _l2_np_float32_col(merged, "l1b_edge_pred")
+    den_v = np.maximum(vol_rf.astype(np.float64), 1e-4) * (1.0 + np.abs(vol_tr.astype(np.float64)))
+    out["volatility_regime_adjusted"] = (edge_rf.astype(np.float64) / den_v).astype(np.float32)
+    out["l2_directional_pressure"] = np.abs(edge_rf.astype(np.float64)).astype(np.float32)
+    skew_signed = os.environ.get("L2_DIRECTION_SKEW_SIGNED", "0").strip().lower() in {"1", "true", "yes"}
+    out["l2_skew_imbalance"] = (
+        vol_tr.astype(np.float64) if skew_signed else np.abs(vol_tr.astype(np.float64))
+    ).astype(np.float32)
+    if price_df is not None and len(price_df) == len(merged) and "pa_state_always_in_bias" in price_df.columns:
+        of_raw = pd.to_numeric(price_df["pa_state_always_in_bias"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    else:
+        # Fallback for offline/ad-hoc callers that already carry PA state on merged.
+        of_raw = _l2_np_float32_col(merged, "pa_state_always_in_bias").astype(np.float64)
+    out["l2_order_flow_asymmetry"] = np.abs(of_raw).astype(np.float32)
+    out["l2_direction_vol_pressure"] = (
+        np.abs(edge_rf.astype(np.float64)) * (1.0 + np.clip(np.abs(vol_tr.astype(np.float64)), 0.0, 3.0))
+    ).astype(np.float32)
+    if price_df is not None and len(price_df) == len(merged) and "close" in price_df.columns:
+        close = pd.to_numeric(price_df["close"], errors="coerce").fillna(0.0)
+        if "symbol" in price_df.columns:
+            mom = close.groupby(price_df["symbol"].astype(str), sort=False).transform(lambda s: s.pct_change(5))
+        else:
+            mom = close.pct_change(5)
+        out["l2_recent_momentum_abs"] = np.abs(mom).fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    else:
+        out["l2_recent_momentum_abs"] = np.zeros(n_m, dtype=np.float32)
+
+    if price_df is not None and len(price_df) == len(merged):
+        pa_stack: list[np.ndarray] = []
+        for c in PA_STATE_FEATURES:
+            if c in price_df.columns:
+                pa_stack.append(pd.to_numeric(price_df[c], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+        if pa_stack:
+            pa_mean = np.mean(np.stack(pa_stack, axis=0), axis=0)
+            ent = out["l1a_regime_entropy"].to_numpy(dtype=np.float64)
+            out["pa_l1a_regime_interaction"] = (pa_mean * ent).astype(np.float32)
+        else:
+            out["pa_l1a_regime_interaction"] = np.zeros(n_m, dtype=np.float32)
+    else:
+        out["pa_l1a_regime_interaction"] = np.zeros(n_m, dtype=np.float32)
     return out
 
 
-_L2_REGIME_INTERACTION_NAN_COLS = frozenset({"l2_bull_mass_x_l1c_dir", "l2_range_mass_x_l1c_dir"})
+def _l2_attach_vixy_l1b_interaction(merged: pd.DataFrame, *, vixy_enabled: bool) -> None:
+    """VIXY level × L1b edge (after VIXY columns are on merged). Zeros when VIXY off or missing."""
+    n = len(merged)
+    edge = pd.to_numeric(merged.get("l1b_edge_pred"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+    if vixy_enabled and "vixy_zscore_390" in merged.columns:
+        vz = pd.to_numeric(merged["vixy_zscore_390"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+        merged["vixy_l1b_interaction"] = (vz * edge).astype(np.float32)
+    else:
+        merged["vixy_l1b_interaction"] = np.zeros(n, dtype=np.float32)
+
+
+def _l2_derived_group_column_names(derived: pd.DataFrame, merged: pd.DataFrame) -> list[str]:
+    dir_like = {"l2_skew_imbalance", "l2_order_flow_asymmetry", "l2_recent_momentum_abs"}
+    names = [
+        c
+        for c in derived.columns
+        if c in merged.columns and not c.startswith("l2_direction") and c not in dir_like
+    ]
+    if "vixy_l1b_interaction" in merged.columns:
+        names.append("vixy_l1b_interaction")
+    return list(dict.fromkeys(names))
+
+
+_L2_REGIME_INTERACTION_NAN_COLS: frozenset[str] = frozenset()
+
+_L2_PRE_FILTER_PROTECT: frozenset[str] = frozenset({"symbol", "time_key"})
+
+
+def _l2_pre_filter_features(merged: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    """After feature merge: drop constant/degenerate columns and optional business hard-drops (before fillna).
+
+    Disable with ``L2_PRE_FILTER_FEATURES=0``. Extra hard drops: ``L2_PRE_FILTER_HARD_DROP=col1,col2`` (replaces
+    default ``l1a_is_warm,bo_or_dist`` when set non-empty — use empty string for constant-only).
+    """
+    if (os.environ.get("L2_PRE_FILTER_FEATURES", "1") or "").strip().lower() in {"0", "false", "no"}:
+        return merged, feature_cols
+    raw_hd = (os.environ.get("L2_PRE_FILTER_HARD_DROP", "l1a_is_warm,bo_or_dist") or "").strip()
+    if raw_hd:
+        hard_drop = {x.strip() for x in raw_hd.split(",") if x.strip()}
+    else:
+        hard_drop = set()
+    drop: set[str] = set(hard_drop) & set(merged.columns)
+    for c in merged.columns:
+        if c in _L2_PRE_FILTER_PROTECT:
+            continue
+        try:
+            nu = int(merged[c].nunique(dropna=False))
+        except (TypeError, ValueError):
+            continue
+        if nu <= 1:
+            drop.add(c)
+    drop = {c for c in drop if c in merged.columns}
+    if not drop:
+        return merged, feature_cols
+    merged = merged.drop(columns=list(drop), errors="ignore")
+    feature_cols = [c for c in feature_cols if c not in drop]
+    preview = sorted(drop)
+    tail = f" ... +{len(preview) - 24}" if len(preview) > 24 else ""
+    print(
+        f"  [L2] pre_filter: dropped {len(drop)} cols (nunique<=1 or hard) — {preview[:24]}{tail}",
+        flush=True,
+    )
+    print(f"  [L2] feature_cols after pre_filter: {len(feature_cols)}", flush=True)
+    return merged, feature_cols
 
 
 def _build_l2_frame(
     df: pd.DataFrame,
     l1a_outputs: pd.DataFrame,
     l1b_outputs: pd.DataFrame,
-    l1c_outputs: pd.DataFrame | None = None,
-) -> tuple[pd.DataFrame, list[str]]:
-    merged = (
-        df[["symbol", "time_key"]]
-        .merge(l1a_outputs, on=["symbol", "time_key"], how="left")
-        .merge(l1b_outputs, on=["symbol", "time_key"], how="left")
+    *,
+    fit_mask: np.ndarray | None = None,
+    derived_feature_stats: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, list[str], dict[str, Any]]:
+    merged = _merge_l2_upstream_outputs(df, l1a_outputs, l1b_outputs)
+    merged = pd.concat(
+        [merged.reset_index(drop=True), _l2_l1b_condition_extras(merged).reset_index(drop=True)],
+        axis=1,
     )
-    if l1c_outputs is not None:
-        merged = merged.merge(l1c_outputs, on=["symbol", "time_key"], how="left")
-    legacy_l1a_dir_cols = _legacy_l1a_direction_cols(merged)
-    if legacy_l1a_dir_cols:
-        merged = merged.drop(columns=legacy_l1a_dir_cols)
-        print(
-            f"  [L2] ignoring {len(legacy_l1a_dir_cols)} legacy L1a direction cols: {legacy_l1a_dir_cols}",
-            flush=True,
-        )
+    stats = (
+        dict(derived_feature_stats)
+        if derived_feature_stats is not None
+        else _l2_fit_derived_feature_stats(merged, fit_mask)
+    )
     residual = _residual_feature_frame(df)
-    derived = _derived_l2_feature_frame(merged)
+    derived = _derived_l2_feature_frame(merged, derived_feature_stats=stats, price_df=df)
     merged = pd.concat([merged.reset_index(drop=True), residual.reset_index(drop=True), derived.reset_index(drop=True)], axis=1)
+    vixy_cols: list[str] = []
+    if L2_USE_VIXY:
+        from core.features.vixy_features import attach_vixy_features_to_l2_merged
+
+        vixy_cols = attach_vixy_features_to_l2_merged(merged, path=VIXY_DATA_PATH)
+        if vixy_cols:
+            cov = float(pd.to_numeric(merged[vixy_cols[0]], errors="coerce").notna().mean())
+            print(f"[L2] VIXY: {len(vixy_cols)} features, coverage={cov:.1%}", flush=True)
+    _l2_attach_vixy_l1b_interaction(merged, vixy_enabled=L2_USE_VIXY)
     group_map = {
         "state": _l2_state_input_cols(merged),
         "condition": _l2_condition_input_cols(merged),
         "direction": _l2_direction_input_cols(merged),
         "residual": _l2_residual_input_cols(residual),
-        "derived": [c for c in derived.columns if c in merged.columns],
+        "derived": _l2_derived_group_column_names(derived, merged),
     }
+    if vixy_cols:
+        group_map["vixy"] = vixy_cols
     feature_cols = list(dict.fromkeys([c for cols in group_map.values() for c in cols if c not in {"symbol", "time_key"}]))
+    merged, feature_cols = _l2_pre_filter_features(merged, feature_cols)
     for c in feature_cols:
         s = pd.to_numeric(merged[c], errors="coerce")
         if c in _L2_REGIME_INTERACTION_NAN_COLS:
@@ -2362,26 +3306,19 @@ def _build_l2_frame(
             merged[c] = s.fillna(0.0).astype(np.float32)
     for group_name, cols in group_map.items():
         print(f"  [L2] input group {group_name}: {len(cols)} cols", flush=True)
-    return merged, feature_cols
-
-
-def _l2_require_l1c_regression_if_used(frame: pd.DataFrame) -> None:
-    """Direction no longer depends on L1c; keep compatibility no-op."""
-    _ = frame
-    return
+    return merged, feature_cols, stats
 
 
 def train_l2_trade_decision(
     df: pd.DataFrame,
     l1a_outputs: pd.DataFrame,
     l1b_outputs: pd.DataFrame,
-    l1c_outputs: pd.DataFrame | None = None,
 ) -> L2TrainingBundle:
     train_started_at = datetime.now().astimezone()
     train_started_perf = time.perf_counter()
     print(f"  [L2] training started at {train_started_at.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
     prep_bar = tqdm(
-        total=7,
+        total=8,
         desc="[L2] prep",
         unit="step",
         leave=True,
@@ -2397,10 +3334,6 @@ def train_l2_trade_decision(
             prep_step += 1
         prep_bar.set_postfix_str(label, refresh=False)
 
-    frame, feature_cols = _build_l2_frame(df, l1a_outputs, l1b_outputs, l1c_outputs)
-    _prep_tick("build_l2_frame")
-    _l2_require_l1c_regression_if_used(frame)
-    X = frame[feature_cols].to_numpy(dtype=np.float32, copy=False)
     splits = build_stack_time_splits(df["time_key"])
     l2_val_start = l2_val_start_time()
     n_oof = l2_oof_folds_from_env()
@@ -2434,7 +3367,10 @@ def train_l2_trade_decision(
         raise RuntimeError("L2: failed to create non-empty tuning/report masks inside l2_val.")
     _prep_tick("time_splits")
 
-    rid_l2 = np.argmax(frame[L1A_REGIME_COLS].to_numpy(dtype=np.float64), axis=1)
+    base_merged = _merge_l2_upstream_outputs(df, l1a_outputs, l1b_outputs)
+    _prep_tick("merge_upstream")
+
+    rid_l2 = np.argmax(base_merged[L1A_REGIME_COLS].to_numpy(dtype=np.float64), axis=1)
     train_excl_ids = _l2_train_exclude_regime_ids_from_env()
     fit_train_mask = np.asarray(train_mask, dtype=bool).copy()
     if train_excl_ids:
@@ -2444,7 +3380,7 @@ def train_l2_trade_decision(
         print(
             f"  [L2] LGBM fit excludes L1a argmax regime id(s) {sorted(set(train_excl_ids))}: "
             f"withheld {n_drop} / {int(train_mask.sum())} l2_train rows "
-            f"(L2_TRAIN_EXCLUDE_REGIME_IDS; default=5; set none to train on all regimes)",
+            f"(L2_TRAIN_EXCLUDE_REGIME_IDS; default=none)",
             flush=True,
         )
     if not fit_train_mask.any():
@@ -2452,6 +3388,15 @@ def train_l2_trade_decision(
             "L2: fit_train_mask empty after L2_TRAIN_EXCLUDE_REGIME_IDS; disable or narrow exclusion."
         )
     _prep_tick("fit_mask")
+
+    frame, feature_cols, derived_feature_stats = _build_l2_frame(
+        df,
+        l1a_outputs,
+        l1b_outputs,
+        fit_mask=fit_train_mask,
+    )
+    _prep_tick("build_l2_frame")
+    X = frame[feature_cols].to_numpy(dtype=np.float32, copy=False)
 
     ts_all = pd.to_datetime(df["time_key"])
     for split_name, sm in (
@@ -2478,6 +3423,9 @@ def train_l2_trade_decision(
         _extra = os.environ.get("L2_EXTRA_HARD_DROP", "").strip()
         if _extra:
             hard_drop |= {s.strip() for s in _extra.split(",") if s.strip()}
+        drop_unsup = os.environ.get("L2_DROP_L1B_UNSUP_DESCRIPTOR", "1").strip().lower() not in {"0", "false", "no"}
+        if drop_unsup:
+            hard_drop |= set(_l2_unsup_descriptor_feature_names(feature_cols))
         hard_drop |= _l2_dynamic_hard_drop_from_prev_model(feature_cols)
     hard_drop = frozenset(hard_drop)
     feature_cols, l2_dropped_features = _l2_select_features_for_training(
@@ -2513,10 +3461,26 @@ def train_l2_trade_decision(
                 flush=True,
             )
 
-    l1b_train_dropout_p = float(os.environ.get("L2_L1B_TRAIN_FEATURE_DROPOUT", "0.3"))
+    range_head_drop = _l2_range_head_hard_drop(feature_cols)
+    range_feature_cols = _l2_feature_view_cols(feature_cols, hard_drop=range_head_drop)
+    if not range_feature_cols:
+        raise RuntimeError("L2 range head feature contract removed all columns; adjust L2_RANGE_HEAD_* settings.")
+    if range_head_drop:
+        print(
+            f"  [L2] range head feature contract: dropped {len(range_head_drop)} cols from range heads",
+            flush=True,
+        )
+        for name in sorted(range_head_drop):
+            print(f"       {name}", flush=True)
+    X_range = frame[range_feature_cols].to_numpy(dtype=np.float32, copy=False)
+
+    l1b_train_dropout_p = float(os.environ.get("L2_L1B_TRAIN_FEATURE_DROPOUT", "0.1"))
     l1b_do_seed = int(os.environ.get("L2_L1B_DROPOUT_SEED", "42"))
     X_train_fit = _l2_apply_l1b_feature_dropout_train_only(
         X, fit_train_mask, feature_cols, l1b_train_dropout_p, rng=np.random.default_rng(l1b_do_seed)
+    )
+    X_range_train_fit = _l2_apply_l1b_feature_dropout_train_only(
+        X_range, fit_train_mask, range_feature_cols, l1b_train_dropout_p, rng=np.random.default_rng(l1b_do_seed)
     )
     if l1b_train_dropout_p > 0.0:
         n_l1b = sum(1 for c in feature_cols if c.startswith("l1b_"))
@@ -2526,26 +3490,96 @@ def train_l2_trade_decision(
             flush=True,
         )
 
-    edge = _decision_edge_atr_array(df)
+    mh_on = _l2_multi_horizon_enabled(df)
+    if mh_on:
+        r10a = _decision_forward_range_h_atr_array(df, bars=10)
+        r20a = _decision_forward_range_h_atr_array(df, bars=20)
+        r30a = _decision_forward_range_h_atr_array(df, bars=30)
+        rr_for_cost = r30a
+    else:
+        r10a = r20a = r30a = None
+        rr_for_cost = _decision_forward_range_atr_array(df)
+
+    cost_atr_base = _l2_straddle_cost_atr()
+    range_roll_cfg = _l2_range_roll_cost_env_config() if _l2_range_roll_cost_enabled() else None
+    if range_roll_cfg is not None and _l2_dynamic_straddle_cost_enabled():
+        print(
+            "  [L2] L2_STRADDLE_RANGE_ROLL_COST=1 overrides L2_DYNAMIC_STRADDLE_COST for labels/policy cost.",
+            flush=True,
+        )
+    if range_roll_cfg is not None:
+        cost_atr_row = _l2_range_roll_cost_array(df, rr_for_cost, cfg=range_roll_cfg)
+        dyn_cfg = None
+        straddle_cost_mode = "range_roll_quantile"
+    elif _l2_dynamic_straddle_cost_enabled():
+        dyn_cfg = _l2_dynamic_straddle_cost_env_config()
+        cost_atr_row = _l2_dynamic_straddle_cost_array(df, cost_atr_base, cfg=dyn_cfg)
+        straddle_cost_mode = "dynamic_atr_quantile"
+    else:
+        dyn_cfg = None
+        cost_atr_row = np.full(len(df), float(cost_atr_base), dtype=np.float64)
+        straddle_cost_mode = "fixed"
+
+    range_horizon_meta = _l2_range_horizon_bars()
+    c10 = c20 = c30 = float("nan")
+    if mh_on:
+        c10, c20, c30 = _l2_mh_horizon_costs()
+        rng_nan = ~(np.isfinite(r10a) & np.isfinite(r20a) & np.isfinite(r30a))
+        rr10 = np.where(rng_nan, 0.0, r10a)
+        rr20 = np.where(rng_nan, 0.0, r20a)
+        rr30 = np.where(rng_nan, 0.0, r30a)
+        y_trade = ((rr10 > c10) | (rr20 > c20) | (rr30 > c30)).astype(np.int64)
+        rr_raw = r30a
+        realized_range_atr = np.where(rng_nan, 0.0, r30a)
+        y_range = realized_range_atr.astype(np.float32)
+        y_r10 = np.clip(rr10, 0.0, 15.0).astype(np.float32)
+        y_r20 = np.clip(rr20, 0.0, 15.0).astype(np.float32)
+        y_ttp = np.clip(_decision_range_ttp90_norm_30_array(df), 0.0, 1.0).astype(np.float32)
+        print(
+            f"  [L2] L2_MULTI_HORIZON=1: trade_gate = OR_k( forward_range_k > cost_k ) with rising cost_k "
+            f"(theta proxy): 10m={c10:.3f}, 20m={c20:.3f}, 30m={c30:.3f} ATR — late-window gamma can still win; "
+            f"range head = 30m; ttp90_norm = timing of range build-up.",
+            flush=True,
+        )
+    else:
+        rr_raw = rr_for_cost
+        rng_nan = ~np.isfinite(rr_raw)
+        realized_range_atr = np.where(rng_nan, 0.0, rr_raw)
+        y_trade = (realized_range_atr > cost_atr_row).astype(np.int64)
+        y_range = realized_range_atr.astype(np.float32)
+        y_r10 = y_r20 = y_ttp = None
+
     mfe, mae = _mfe_mae_atr_arrays(df)
-    tau_global, policy_vol_quantiles, decision_tau_by_state, tau_row = _conditional_tau_from_state(
-        frame, edge, fit_train_mask
-    )
-    y_decision = np.full(len(df), 1, dtype=np.int64)
-    y_decision[edge > tau_row] = 0
-    y_decision[edge < -tau_row] = 2
-    y_trade, y_dir_stage = _l2_build_two_stage_labels(y_decision)
-    dir_weights = _l2_direction_sample_weights(y_dir_stage, fusion_frame=frame)
-    active_train = fit_train_mask & (y_dir_stage >= 0)
-    active_val = val_mask & (y_dir_stage >= 0)
+    active_train = fit_train_mask & (y_trade == 1)
+    active_val = val_mask & (y_trade == 1)
     y_mfe = np.clip(mfe, 0.0, 5.0).astype(np.float32)
     y_mae = np.clip(mae, 0.0, 4.0).astype(np.float32)
     y_mfe_fit, mfe_head_prep = _l2_positive_head_target_prep(y_mfe, head_name="mfe", clip_max=5.0)
     y_mae_fit, mae_head_prep = _l2_positive_head_target_prep(y_mae, head_name="mae", clip_max=4.0)
-    two_stage_label_stats = {
+    y_range_fit, range_head_prep = _l2_positive_head_target_prep(y_range, head_name="range", clip_max=10.0)
+    mfe_w_all = _l2_mfe_sample_weights(y_mfe_fit, y_trade == 1).astype(np.float64, copy=False)
+    _l2_log_mfe_weighting_diagnostics(y_mfe_fit, mfe_w_all, active_mask=(y_trade == 1))
+    y_r10_fit = y_r20_fit = y_ttp_fit = None
+    r10_head_prep = r20_head_prep = ttp_head_prep = None
+    if mh_on and y_r10 is not None and y_r20 is not None and y_ttp is not None:
+        y_r10_fit, r10_head_prep = _l2_positive_head_target_prep(y_r10, head_name="range10", clip_max=15.0)
+        y_r20_fit, r20_head_prep = _l2_positive_head_target_prep(y_r20, head_name="range20", clip_max=15.0)
+        y_ttp_fit, ttp_head_prep = _l2_positive_head_target_prep(y_ttp, head_name="ttp90", clip_max=1.0)
+    straddle_label_stats = {
         "train_trade_rate": float(np.mean(y_trade[fit_train_mask])) if np.any(fit_train_mask) else 0.0,
-        "train_direction_long_rate": float(np.mean(y_dir_stage[active_train] == 1)) if np.any(active_train) else 0.0,
-        "train_direction_short_rate": float(np.mean(y_dir_stage[active_train] == 0)) if np.any(active_train) else 0.0,
+        "train_mean_range_atr": float(np.mean(realized_range_atr[fit_train_mask])) if np.any(fit_train_mask) else 0.0,
+        "straddle_cost_atr": float(cost_atr_base),
+        "straddle_cost_mode": straddle_cost_mode,
+        "train_mean_cost_atr": float(np.mean(cost_atr_row[fit_train_mask])) if np.any(fit_train_mask) else float(cost_atr_base),
+        "range_horizon_bars": int(range_horizon_meta),
+        "multi_horizon": bool(mh_on),
+        "multi_horizon_label_rule": (
+            "trade_gate = OR[(range_10>cost_10),(range_20>cost_20),(range_30>cost_30)]; "
+            "primary range target uses 30m range; auxiliary heads predict range_10/range_20/ttp90"
+            if mh_on
+            else "trade_gate = (forward_range_horizon > cost_row); primary range target uses configured horizon"
+        ),
+        "mh_costs_atr": {"10": c10, "20": c20, "30": c30} if mh_on else None,
     }
     _prep_tick("labels_targets")
 
@@ -2585,17 +3619,17 @@ def train_l2_trade_decision(
     log_numpy_x_stats("L2", X[fit_train_mask], label="X[l2_train_fit]")
     l1a_cols = [c for c in feature_cols if c.startswith("l1a_")]
     l1b_cols = [c for c in feature_cols if c.startswith("l1b_")]
-    l1c_cols = [c for c in feature_cols if c.startswith("l1c_")]
-    res_cols = [c for c in feature_cols if c not in l1a_cols and c not in l1b_cols and c not in l1c_cols]
+    dir_cols = [c for c in feature_cols if c.startswith("l2_direction") or c in {"l2_skew_imbalance", "l2_recent_momentum_abs", "l2_order_flow_asymmetry"}]
+    res_cols = [c for c in feature_cols if c not in l1a_cols and c not in l1b_cols and c not in dir_cols]
     print(
         f"  [L2] feature_cols total={len(feature_cols)} (expect ~51+)  "
-        f"l1a_*={len(l1a_cols)}  l1b_*={len(l1b_cols)}  l1c_*={len(l1c_cols)}  residual/other={len(res_cols)}",
+        f"l1a_*={len(l1a_cols)}  l1b_*={len(l1b_cols)}  residual/other={len(res_cols)}",
         flush=True,
     )
     print(f"  [L2] residual columns (n={len(res_cols)}): {res_cols}", flush=True)
     print(
         f"  [L2] upstream artifact refs: L1a={artifact_path(L1A_MODEL_FILE)}  "
-        f"L1b meta={artifact_path(L1B_META_FILE)}  L1c={artifact_path(L1C_MODEL_FILE)}",
+        f"L1b meta={artifact_path(L1B_META_FILE)}",
         flush=True,
     )
     print(
@@ -2603,22 +3637,26 @@ def train_l2_trade_decision(
         flush=True,
     )
     print(
-        "  [L2] legacy-note: current live/train path is retained two-stage trade_gate + binary direction; "
-        "old triple-gate findings are archived context only. Focus diagnostics on short-bias, holdout stability, and L1b contribution.",
+        "  [L2] mode=straddle: trade_gate on forward_range>cost, range head, mfe/mae on y_trade-active rows.",
         flush=True,
     )
     print(f"  [L2] will write: {artifact_path(L2_META_FILE)} | {artifact_path(L2_OUTPUT_CACHE_FILE)}", flush=True)
     log_label_baseline("l2_mfe", y_mfe[active_train], task="reg")
     log_label_baseline("l2_mae", y_mae[active_train], task="reg")
+    log_label_baseline("l2_range", y_range[fit_train_mask], task="reg")
     print(
         f"  [L2] aux target prep: mfe(transform={mfe_head_prep['target_transform']}, objective={mfe_head_prep['objective']}, metric={mfe_head_prep['metric']})  "
-        f"mae(transform={mae_head_prep['target_transform']}, objective={mae_head_prep['objective']}, metric={mae_head_prep['metric']})",
+        f"mae(transform={mae_head_prep['target_transform']}, objective={mae_head_prep['objective']}, metric={mae_head_prep['metric']})  "
+        f"range(transform={range_head_prep['target_transform']}, objective={range_head_prep['objective']}, metric={range_head_prep['metric']})",
         flush=True,
     )
     print(
-        f"  [L2] two-stage labels: train_trade_rate={two_stage_label_stats['train_trade_rate']:.3f}  "
-        f"train_long_rate={two_stage_label_stats['train_direction_long_rate']:.3f}  "
-        f"train_short_rate={two_stage_label_stats['train_direction_short_rate']:.3f}",
+        f"  [L2] straddle labels: train_trade_rate={straddle_label_stats['train_trade_rate']:.3f}  "
+        f"train_mean_range_atr={straddle_label_stats['train_mean_range_atr']:.4f}  "
+        f"cost_base={straddle_label_stats['straddle_cost_atr']:.4f}  "
+        f"mode={straddle_label_stats['straddle_cost_mode']}  "
+        f"train_mean_cost={straddle_label_stats['train_mean_cost_atr']:.4f}  "
+        f"horizon_bars={straddle_label_stats['range_horizon_bars']}",
         flush=True,
     )
     _prep_tick("pretrain_logs")
@@ -2628,15 +3666,19 @@ def train_l2_trade_decision(
     gate_es_rounds = _l2_early_stopping_rounds_from_env("L2_GATE_EARLY_STOPPING_ROUNDS", 120)
     aux_es_fallback = 40 if FAST_TRAIN_MODE else 120
     aux_es_base = _l2_early_stopping_rounds_from_env("L2_EARLY_STOPPING_ROUNDS", aux_es_fallback)
-    direction_es_rounds = _l2_early_stopping_rounds_from_env("L2_DIRECTION_EARLY_STOPPING_ROUNDS", aux_es_base)
-    side_es_rounds = _l2_early_stopping_rounds_from_env("L2_SIDE_EARLY_STOPPING_ROUNDS", direction_es_rounds)
+    range_es_rounds = _l2_early_stopping_rounds_from_env("L2_RANGE_EARLY_STOPPING_ROUNDS", aux_es_base)
     mfe_es_rounds = _l2_early_stopping_rounds_from_env("L2_MFE_EARLY_STOPPING_ROUNDS", aux_es_base)
     mae_es_rounds = _l2_early_stopping_rounds_from_env("L2_MAE_EARLY_STOPPING_ROUNDS", aux_es_base)
     log_label_baseline("l2_trade_gate", y_trade[fit_train_mask], task="cls")
-    log_label_baseline("l2_direction", y_dir_stage[active_train], task="cls")
     pr_trade = float(np.mean(y_trade[fit_train_mask]))
+    if pr_trade >= 0.98 or pr_trade <= 0.02:
+        print(
+            f"  [L2] WARNING: gate label almost single-class (pos_rate={pr_trade:.3f}). "
+            f"Raise/lower L2_STRADDLE_COST_ATR (same units as decision_forward_range_atr) or enable "
+            f"L2_DYNAMIC_STRADDLE_COST=1 so y_trade mixes.",
+            flush=True,
+        )
     gate_cfg = _l2_model_lgb_params("gate")
-    direction_cfg = _l2_model_lgb_params("direction")
     reg_cfg = _l2_model_lgb_params("reg")
     trade_gate_params = {
         "objective": "binary",
@@ -2655,9 +3697,6 @@ def train_l2_trade_decision(
         "n_jobs": _lgbm_n_jobs(),
         "is_unbalance": True,
     }
-    direction_params = {
-        "mode": "bracket_no_model_direction",
-    }
     print(
         f"  [L2] gate: pos_rate={pr_trade:.3f}  is_unbalance=True  lr={gate_cfg['learning_rate']}  "
         f"num_leaves={gate_cfg['num_leaves']}  max_depth={gate_cfg['max_depth']}  min_child_samples={gate_cfg['min_child_samples']}  "
@@ -2665,11 +3704,9 @@ def train_l2_trade_decision(
         f"early_stop_metric=auc (first)",
         flush=True,
     )
-    print("  [L2] direction: disabled model-side direction (Bracket execution owns side selection)", flush=True)
     print(
-        f"  [L2] early_stopping_rounds: direction(skipped)={side_es_rounds}  "
-        f"mfe={mfe_es_rounds}  mae={mae_es_rounds}  (aux base={aux_es_base}; "
-        f"override via L2_EARLY_STOPPING_ROUNDS / L2_*_EARLY_STOPPING_ROUNDS)",
+        f"  [L2] early_stopping_rounds: range={range_es_rounds}  mfe={mfe_es_rounds}  mae={mae_es_rounds}  "
+        f"(aux base={aux_es_base}; override via L2_EARLY_STOPPING_ROUNDS / L2_*_EARLY_STOPPING_ROUNDS)",
         flush=True,
     )
     reg_params = {
@@ -2688,48 +3725,55 @@ def train_l2_trade_decision(
         "seed": reg_cfg["seed"],
         "n_jobs": _lgbm_n_jobs(),
     }
+    range_params = _l2_positive_head_lgb_params(reg_params, range_head_prep)
     mfe_params = _l2_positive_head_lgb_params(reg_params, mfe_head_prep)
     mae_params = _l2_positive_head_lgb_params(reg_params, mae_head_prep)
     gate_nt_w = float(os.environ.get("L2_GATE_NO_TRADE_WEIGHT", "1.5"))
-    gate_w_train = np.ones(int(np.sum(fit_train_mask)), dtype=np.float64)
-    gate_w_val = np.ones(int(np.sum(val_mask)), dtype=np.float64)
-    if gate_nt_w != 1.0:
-        tr_idx = np.flatnonzero(fit_train_mask)
-        va_idx = np.flatnonzero(val_mask)
-        gate_w_train[y_trade[tr_idx] == 0] = gate_nt_w
-        gate_w_val[y_trade[va_idx] == 0] = gate_nt_w
-        print(f"  [L2] gate sample_weight: no_trade rows ×{gate_nt_w:.3f} (L2_GATE_NO_TRADE_WEIGHT)", flush=True)
+    tr_idx = np.flatnonzero(fit_train_mask)
+    va_idx = np.flatnonzero(val_mask)
+    if mh_on and r10a is not None:
+        mh_full = _l2_mh_gate_sample_weights_full(y_trade, r10a, r20a, r30a, c10, c20, c30)
+        gate_w_train = mh_full[tr_idx].astype(np.float64, copy=False)
+        gate_w_train[y_trade[tr_idx] == 0] *= gate_nt_w
+        gate_w_val = mh_full[va_idx].astype(np.float64, copy=False)
+        gate_w_val[y_trade[va_idx] == 0] *= gate_nt_w
+        print(
+            f"  [L2] gate sample_weight: MH time-weights (early/late/chop) × L2_GATE_NO_TRADE_WEIGHT={gate_nt_w:.3f} on negatives",
+            flush=True,
+        )
+    else:
+        gate_w_train = np.ones(int(np.sum(fit_train_mask)), dtype=np.float64)
+        gate_w_val = np.ones(int(np.sum(val_mask)), dtype=np.float64)
+        if gate_nt_w != 1.0:
+            gate_w_train[y_trade[tr_idx] == 0] = gate_nt_w
+            gate_w_val[y_trade[va_idx] == 0] = gate_nt_w
+            print(f"  [L2] gate sample_weight: no_trade rows ×{gate_nt_w:.3f} (L2_GATE_NO_TRADE_WEIGHT)", flush=True)
     X_gate_train_fit, gate_blocked_cols = _l2_project_gate_features(X_train_fit, feature_cols)
     X_gate_all, _ = _l2_project_gate_features(X, feature_cols)
     if gate_blocked_cols:
         print(
-            f"  [L2] trade_gate blocks {len(gate_blocked_cols)} sign-bearing L1c/derived cols: {gate_blocked_cols}",
+            f"  [L2] trade_gate projection dropped {len(gate_blocked_cols)} cols: {gate_blocked_cols}",
             flush=True,
         )
-    dir_center_active = 0.0
-    dir_std_active = 1.0
-    use_active_center = False
-    dir_center = 0.0
-    dir_scale = 1.0
-    dir_bias = 0.0
     _prep_tick("init_heads")
     prep_bar.close()
     gate_model: lgb.Booster
+    range_model: lgb.Booster
     mfe_model: lgb.Booster
     mae_model: lgb.Booster
     n_samples = len(df)
     gate_oof = np.full(n_samples, np.nan, dtype=np.float64)
-    dir_oof = np.full(n_samples, np.nan, dtype=np.float64)
     mfe_oof = np.full(n_samples, np.nan, dtype=np.float64)
     mae_oof = np.full(n_samples, np.nan, dtype=np.float64)
 
     if n_oof >= 2:
         fold_masks = time_blocked_fold_masks(df["time_key"], fit_train_mask, n_oof, context="L2 OOF")
         best_gate: list[int] = []
+        best_range: list[int] = []
         best_mfe: list[int] = []
         best_mae: list[int] = []
         l2_outer = tqdm(
-            total=n_oof * 3,
+            total=n_oof * 4,
             desc="[L2] OOF models",
             unit="fit",
             leave=True,
@@ -2740,8 +3784,8 @@ def train_l2_trade_decision(
             for fk, (tr_m, va_m) in enumerate(fold_masks):
                 fit_tr = fit_train_mask & tr_m
                 fit_va = fit_train_mask & va_m
-                active_tr = fit_tr & (y_dir_stage >= 0)
-                active_va = fit_va & (y_dir_stage >= 0)
+                active_tr = fit_tr & (y_trade == 1)
+                active_va = fit_va & (y_trade == 1)
                 if (
                     int(fit_tr.sum()) < 200
                     or int(fit_va.sum()) < 30
@@ -2749,16 +3793,26 @@ def train_l2_trade_decision(
                     or int(active_va.sum()) < 25
                 ):
                     raise RuntimeError(
-                        "L2 OOF: fold too small for direction/MFE/MAE. "
+                        "L2 OOF: fold too small for range/MFE/MAE. "
                         f"fold={fk} fit_tr={int(fit_tr.sum())} fit_va={int(fit_va.sum())} "
                         f"active_tr={int(active_tr.sum())} active_va={int(active_va.sum())}"
                     )
-                w_tr = np.ones(int(fit_tr.sum()), dtype=np.float64)
                 tr_ix = np.flatnonzero(fit_tr)
-                w_tr[y_trade[tr_ix] == 0] = gate_nt_w
-                w_va = np.ones(int(fit_va.sum()), dtype=np.float64)
                 va_ix = np.flatnonzero(fit_va)
-                w_va[y_trade[va_ix] == 0] = gate_nt_w
+                if mh_on and r10a is not None:
+                    w_tr = _l2_mh_gate_sample_weights_full(y_trade, r10a, r20a, r30a, c10, c20, c30)[tr_ix].astype(
+                        np.float64, copy=True
+                    )
+                    w_tr[y_trade[tr_ix] == 0] *= gate_nt_w
+                    w_va = _l2_mh_gate_sample_weights_full(y_trade, r10a, r20a, r30a, c10, c20, c30)[va_ix].astype(
+                        np.float64, copy=True
+                    )
+                    w_va[y_trade[va_ix] == 0] *= gate_nt_w
+                else:
+                    w_tr = np.ones(int(fit_tr.sum()), dtype=np.float64)
+                    w_tr[y_trade[tr_ix] == 0] = gate_nt_w
+                    w_va = np.ones(int(fit_va.sum()), dtype=np.float64)
+                    w_va[y_trade[va_ix] == 0] = gate_nt_w
                 dtr_g = lgb.Dataset(
                     X_gate_train_fit[fit_tr],
                     label=y_trade[fit_tr],
@@ -2788,7 +3842,29 @@ def train_l2_trade_decision(
                 gate_oof[fit_va] = gm_fold.predict(X_gate_all[fit_va]).astype(np.float64)
                 l2_outer.update(1)
 
-                dir_oof[fit_va] = np.full(int(np.sum(fit_va)), 0.5, dtype=np.float64)
+                cbs, cl = _lgb_train_callbacks_with_round_tqdm(range_es_rounds, rounds, f"[L2] range oof {fk + 1}/{n_oof}")
+                try:
+                    rm_fold = lgb.train(
+                        range_params,
+                        lgb.Dataset(
+                            X_range_train_fit[fit_tr],
+                            label=y_range_fit[fit_tr],
+                            feature_name=range_feature_cols,
+                            free_raw_data=False,
+                        ),
+                        num_boost_round=rounds,
+                        valid_sets=[
+                            lgb.Dataset(
+                                X_range[fit_va], label=y_range_fit[fit_va], feature_name=range_feature_cols, free_raw_data=False
+                            )
+                        ],
+                        callbacks=cbs,
+                    )
+                finally:
+                    for fn in cl:
+                        fn()
+                best_range.append(max(1, int(rm_fold.best_iteration) if rm_fold.best_iteration is not None else rounds))
+                l2_outer.update(1)
 
                 cbs, cl = _lgb_train_callbacks_with_round_tqdm(mfe_es_rounds, rounds, f"[L2] mfe oof {fk + 1}/{n_oof}")
                 try:
@@ -2797,13 +3873,18 @@ def train_l2_trade_decision(
                         lgb.Dataset(
                             X_train_fit[active_tr],
                             label=y_mfe_fit[active_tr],
+                            weight=mfe_w_all[active_tr],
                             feature_name=feature_cols,
                             free_raw_data=False,
                         ),
                         num_boost_round=rounds,
                         valid_sets=[
                             lgb.Dataset(
-                                X[active_va], label=y_mfe_fit[active_va], feature_name=feature_cols, free_raw_data=False
+                                X[active_va],
+                                label=y_mfe_fit[active_va],
+                                weight=mfe_w_all[active_va],
+                                feature_name=feature_cols,
+                                free_raw_data=False,
                             )
                         ],
                         callbacks=cbs,
@@ -2843,10 +3924,11 @@ def train_l2_trade_decision(
             l2_outer.close()
 
         nr_gate = int(np.clip(np.median(best_gate), 10, rounds))
+        nr_range = int(np.clip(np.median(best_range), 10, rounds))
         nr_mfe = int(np.clip(np.median(best_mfe), 10, rounds))
         nr_mae = int(np.clip(np.median(best_mae), 10, rounds))
         print(
-            f"  [L2] OOF median best_iteration → gate={nr_gate} direction=direct_l1c mfe={nr_mfe} mae={nr_mae} (cap={rounds})",
+            f"  [L2] OOF median best_iteration → gate={nr_gate} range={nr_range} mfe={nr_mfe} mae={nr_mae} (cap={rounds})",
             flush=True,
         )
         gate_model = lgb.train(
@@ -2860,11 +3942,22 @@ def train_l2_trade_decision(
             ),
             num_boost_round=nr_gate,
         )
+        range_model = lgb.train(
+            range_params,
+            lgb.Dataset(
+                X_range_train_fit[fit_train_mask],
+                label=y_range_fit[fit_train_mask],
+                feature_name=range_feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nr_range,
+        )
         mfe_model = lgb.train(
             mfe_params,
             lgb.Dataset(
                 X_train_fit[active_train],
                 label=y_mfe_fit[active_train],
+                weight=mfe_w_all[active_train],
                 feature_name=feature_cols,
                 free_raw_data=False,
             ),
@@ -2896,7 +3989,7 @@ def train_l2_trade_decision(
             free_raw_data=False,
         )
         l2_outer = tqdm(
-            total=3,
+            total=4,
             desc="[L2] models",
             unit="model",
             leave=True,
@@ -2915,9 +4008,33 @@ def train_l2_trade_decision(
             l2_outer.set_postfix_str("gate", refresh=False)
             l2_outer.update(1)
 
+            cbs, cl = _lgb_train_callbacks_with_round_tqdm(range_es_rounds, rounds, "[L2] range")
+            try:
+                range_model = lgb.train(
+                    range_params,
+                    lgb.Dataset(
+                        X_range_train_fit[fit_train_mask],
+                        label=y_range_fit[fit_train_mask],
+                        feature_name=range_feature_cols,
+                        free_raw_data=False,
+                    ),
+                    num_boost_round=rounds,
+                    valid_sets=[
+                        lgb.Dataset(
+                            X_range[val_mask], label=y_range_fit[val_mask], feature_name=range_feature_cols, free_raw_data=False
+                        )
+                    ],
+                    callbacks=cbs,
+                )
+            finally:
+                for fn in cl:
+                    fn()
+            l2_outer.set_postfix_str("range", refresh=False)
+            l2_outer.update(1)
+
             if int(active_train.sum()) < 100 or int(active_val.sum()) < 25:
                 raise RuntimeError(
-                    "L2: too few active rows for direction/MFE/MAE heads after strict time split. "
+                    "L2: too few active rows for MFE/MAE heads after strict time split. "
                     f"active_train={int(active_train.sum())}, active_val={int(active_val.sum())}"
                 )
             cbs, cl = _lgb_train_callbacks_with_round_tqdm(mfe_es_rounds, rounds, "[L2] mfe")
@@ -2925,11 +4042,21 @@ def train_l2_trade_decision(
                 mfe_model = lgb.train(
                     mfe_params,
                     lgb.Dataset(
-                        X_train_fit[active_train], label=y_mfe_fit[active_train], feature_name=feature_cols, free_raw_data=False
+                        X_train_fit[active_train],
+                        label=y_mfe_fit[active_train],
+                        weight=mfe_w_all[active_train],
+                        feature_name=feature_cols,
+                        free_raw_data=False,
                     ),
                     num_boost_round=rounds,
                     valid_sets=[
-                        lgb.Dataset(X[active_val], label=y_mfe_fit[active_val], feature_name=feature_cols, free_raw_data=False)
+                        lgb.Dataset(
+                            X[active_val],
+                            label=y_mfe_fit[active_val],
+                            weight=mfe_w_all[active_val],
+                            feature_name=feature_cols,
+                            free_raw_data=False,
+                        )
                     ],
                     callbacks=cbs,
                 )
@@ -2960,187 +4087,187 @@ def train_l2_trade_decision(
         finally:
             l2_outer.close()
 
+    range10_model = None
+    range20_model = None
+    ttp_model = None
+    range10_pred = np.zeros(n_samples, dtype=np.float32)
+    range20_pred = np.zeros(n_samples, dtype=np.float32)
+    ttp90_pred = np.zeros(n_samples, dtype=np.float32)
+    if mh_on and y_r10_fit is not None and r10_head_prep is not None:
+        if n_oof >= 2:
+            nrt = nr_range
+        else:
+            bi = range_model.best_iteration
+            nrt = max(10, int(bi) if bi is not None else rounds)
+        r10_params = _l2_positive_head_lgb_params(reg_params, r10_head_prep)
+        r20_params = _l2_positive_head_lgb_params(reg_params, r20_head_prep)
+        ttp_params = _l2_positive_head_lgb_params(reg_params, ttp_head_prep)
+        print(f"  [L2] multi-horizon aux regressors: range_10 / range_20 / ttp90 (rounds={nrt})", flush=True)
+        range10_model = lgb.train(
+            r10_params,
+            lgb.Dataset(
+                X_range_train_fit[fit_train_mask],
+                label=y_r10_fit[fit_train_mask],
+                feature_name=range_feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nrt,
+        )
+        range20_model = lgb.train(
+            r20_params,
+            lgb.Dataset(
+                X_range_train_fit[fit_train_mask],
+                label=y_r20_fit[fit_train_mask],
+                feature_name=range_feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nrt,
+        )
+        ttp_model = lgb.train(
+            ttp_params,
+            lgb.Dataset(
+                X_range_train_fit[fit_train_mask],
+                label=y_ttp_fit[fit_train_mask],
+                feature_name=range_feature_cols,
+                free_raw_data=False,
+            ),
+            num_boost_round=nrt,
+        )
+        range10_pred = _l2_positive_head_predict(range10_model, X_range, r10_head_prep, clip_max=15.0)
+        range20_pred = _l2_positive_head_predict(range20_model, X_range, r20_head_prep, clip_max=15.0)
+        ttp90_pred = _l2_positive_head_predict(ttp_model, X_range, ttp_head_prep, clip_max=1.0)
+
     gate_raw_all = gate_model.predict(X_gate_all).astype(np.float64)
-    direction_raw_all = np.full(len(df), 0.5, dtype=np.float64)
-    direction_tune_mask = val_tune_mask & (y_dir_stage >= 0)
     if n_oof >= 2:
         if not bool(np.all(np.isfinite(gate_oof[fit_train_mask]))):
             raise RuntimeError("L2 OOF: incomplete gate OOF predictions on fit_train_mask.")
         gate_calibrator = _fit_binary_calibrator(y_trade[fit_train_mask], gate_oof[fit_train_mask])
-        direction_calibrator = None
     else:
         gate_calibrator = _fit_binary_calibrator(y_trade[val_tune_mask], gate_raw_all[val_tune_mask])
-        direction_calibrator = None
     trade_p_all = _apply_binary_calibrator(gate_raw_all, gate_calibrator).astype(np.float32)
-    direction_p_cal = direction_raw_all.astype(np.float32, copy=False)
-    train_long_prior = float(np.mean(y_dir_stage[active_train] == 1)) if np.any(active_train) else 0.5
-    target_long_prior = float(np.clip(float(os.environ.get("L2_DIRECTION_TARGET_LONG_PRIOR", "0.5")), 1e-4, 1.0 - 1e-4))
-    direction_p_all = direction_p_cal
-    print(
-        f"  [L2] direction direct passthrough: train_long_prior={train_long_prior:.4f}  "
-        f"target_long_prior(ref only)={target_long_prior:.4f}  mean_p={float(np.mean(direction_p_all[active_val])):.4f}",
-        flush=True,
-    )
+    range_pred = _l2_positive_head_predict(range_model, X_range, range_head_prep, clip_max=10.0)
     mfe_pred = _l2_positive_head_predict(mfe_model, X, mfe_head_prep, clip_max=5.0)
     mae_pred = _l2_positive_head_predict(mae_model, X, mae_head_prep, clip_max=4.0)
-    trade_threshold = _search_l2_trade_threshold(
+    min_edge = float(np.clip(float(os.environ.get("L2_MIN_STRADDLE_EDGE", "0.0")), -2.0, 2.0))
+    predicted_profit_all = _l2_straddle_predicted_profit(range_pred, cost_atr=cost_atr_row)
+    predicted_profit_all = _l2_apply_expected_edge_regime_blacklist(
+        np.asarray(predicted_profit_all, dtype=np.float32), frame
+    ).astype(np.float32)
+    trend_eps = float(np.clip(float(os.environ.get("L2_REGIME_TREND_EPS", "0.02")), 1e-6, 1.0))
+    vol_all = frame["l1a_vol_forecast"].to_numpy(dtype=np.float64)
+    trend_all = (
+        frame["l1a_vol_trend"].to_numpy(dtype=np.float64)
+        if "l1a_vol_trend" in frame.columns
+        else np.zeros(len(frame), dtype=np.float64)
+    )
+    dyn_q33, dyn_q66 = _l2_fit_vol_quantiles_vol_forecast(vol_all, val_tune_mask)
+    dyn_reg_ids = _l2_vol_regime_ids(vol_all, trend_all, dyn_q33, dyn_q66, trend_eps)
+    dyn_state_keys_all = _l2_vol_regime_names_from_ids(dyn_reg_ids)
+    trade_threshold, policy_search_meta = _search_l2_trade_threshold_economic(
         trade_p_all[val_tune_mask],
+        predicted_profit_all[val_tune_mask],
         target_trade_rate=_l2_target_trade_rate(),
+        min_edge=min_edge,
+        state_keys=dyn_state_keys_all[val_tune_mask],
     )
-    direction_abstain_target = 0.0
-    direction_abstain_margin = 0.0
-    print(
-        "  [L2] bracket mode: direction abstain disabled (margin=0.0); side selection deferred to execution bracket triggers.",
-        flush=True,
+    trade_threshold_row = _l2_threshold_row_from_state_map(
+        trade_threshold,
+        dyn_state_keys_all,
+        str(policy_search_meta.get("dynamic_threshold_map", "")),
     )
-    _log_l2_two_stage_val_diagnostics(
-        trade_p_all[val_report_mask],
-        direction_p_all[val_report_mask],
-        y_trade[val_report_mask],
-        y_dir_stage[val_report_mask],
-        y_decision[val_report_mask],
-        trade_threshold=float(trade_threshold),
-        direction_abstain_margin=float(direction_abstain_margin),
-        split_label="val_report",
+    threshold_for_decision: float | np.ndarray = (
+        trade_threshold_row.astype(np.float64, copy=False) if trade_threshold_row is not None else float(trade_threshold)
     )
-    if test_mask.any():
-        _log_l2_two_stage_val_diagnostics(
-            trade_p_all[test_mask],
-            direction_p_all[test_mask],
-            y_trade[test_mask],
-            y_dir_stage[test_mask],
-            y_decision[test_mask],
-            trade_threshold=float(trade_threshold),
-            direction_abstain_margin=float(direction_abstain_margin),
-            split_label="holdout",
+    expected_edge_all = _l2_straddle_expected_edge(trade_p_all, range_pred, cost_atr=cost_atr_row)
+    expected_edge_all = _l2_apply_expected_edge_regime_blacklist(
+        np.asarray(expected_edge_all, dtype=np.float32), frame
+    ).astype(np.float32)
+    regime_adjust = os.environ.get("L2_REGIME_STRADDLE_ADJUST", "").strip().lower() in {"1", "true", "yes"}
+    vol_q33: float | None = None
+    vol_q66: float | None = None
+    reg_ids_all: np.ndarray | None = None
+    regime_cfg_merged: dict[str, dict[str, float]] | None = None
+    size_mult_row = np.ones(len(frame), dtype=np.float32)
+    vol_regime_names = np.full(len(frame), "", dtype=object)
+    if regime_adjust:
+        regime_cfg_merged = _l2_regime_straddle_config_merged()
+        vol_q33, vol_q66 = _l2_fit_vol_quantiles_vol_forecast(vol_all, val_tune_mask)
+        reg_ids_all = _l2_vol_regime_ids(vol_all, trend_all, vol_q33, vol_q66, trend_eps)
+        min_mp, mult_sm = _l2_regime_straddle_arrays()
+        min_edge_row = np.maximum(float(min_edge), min_mp[reg_ids_all])
+        straddle_on_mask = (trade_p_all >= threshold_for_decision) & (
+            np.asarray(predicted_profit_all, dtype=np.float64) > min_edge_row
         )
-    decision_probs = _l2_compose_probs_from_gate_dir(trade_p_all, direction_p_all)
-    size_raw = _l2_formula_size_from_context(
-        frame,
-        trade_p_all,
-        direction_p_all,
-        trade_threshold=float(trade_threshold),
-    )
-    size_min_std = float(np.clip(float(os.environ.get("L2_SIZE_MIN_ACTIVE_STD", "0.02")), 1e-4, 0.5))
-    fit_active = val_tune_mask & (trade_p_all >= float(trade_threshold))
-    std_raw = float(np.std(size_raw[fit_active])) if np.any(fit_active) else float(np.std(size_raw))
-    size_mode = "formula"
-    size_bins: list[float] = []
-    size_levels: list[float] = []
-    if std_raw < size_min_std:
-        size_pred, size_bins, size_levels = _l2_bucketized_size_from_signals(
-            frame,
+        base_size = _l2_straddle_size(
             trade_p_all,
-            direction_p_all,
-            trade_threshold=float(trade_threshold),
-            fit_mask=val_tune_mask,
+            np.maximum(np.asarray(predicted_profit_all, dtype=np.float32), 0.0),
+            straddle_on_mask,
         )
-        size_mode = "bucketized_fallback"
+        size_mult_row = mult_sm[reg_ids_all].astype(np.float32)
+        size_pred = (base_size * size_mult_row).astype(np.float32)
+        vol_regime_names = _l2_vol_regime_names_from_ids(reg_ids_all)
     else:
-        size_pred = size_raw
-    print(
-        f"  [L2] size rebuild: mode={size_mode}  active_std_raw={std_raw:.5f}  "
-        f"min_active_std={size_min_std:.5f}  active_rows={int(np.sum(fit_active))}",
-        flush=True,
-    )
-    expected_edge_all = _l2_expected_edge_from_gate_dir(
-        trade_p_all,
-        direction_p_all,
-        size_pred,
-        trade_threshold=float(trade_threshold),
-        direction_strength=frame.get("l1c_direction_strength"),
-        l1b_edge_proxy=frame.get("l1b_edge_pred"),
-        range_mass=(
-            pd.to_numeric(frame.get("l1a_regime_prob_range_conv", 0.0), errors="coerce").fillna(0.0)
-            + pd.to_numeric(frame.get("l1a_regime_prob_range_div", 0.0), errors="coerce").fillna(0.0)
-        ),
-        regime_entropy=frame.get("l1a_regime_entropy"),
-        direction_abstain_margin=float(direction_abstain_margin),
-    )
-    expected_edge_all = _l2_apply_expected_edge_regime_blacklist(expected_edge_all, frame)
-    hard_decision_class = np.full(len(df), 1, dtype=np.int64)
-    decision_confidence = decision_probs[:, 1].astype(np.float32)
-    bracket_offset_atr = float(np.clip(float(os.environ.get("L2_BRACKET_OFFSET_ATR", "0.15")), 0.0, 5.0))
-    bracket_tp_atr = float(np.clip(float(os.environ.get("L2_BRACKET_TP_ATR", "1.19")), 0.01, 20.0))
-    bracket_sl_atr = float(np.clip(float(os.environ.get("L2_BRACKET_SL_ATR", "0.22")), 0.01, 20.0))
-    bracket_max_hold = int(np.clip(int(os.environ.get("L2_BRACKET_MAX_HOLD_BARS", "20")), 1, 512))
-    bracket_plan = _l2_build_bracket_plan(
-        df, offset_atr=bracket_offset_atr, tp_atr=bracket_tp_atr, sl_atr=bracket_sl_atr, max_hold=bracket_max_hold
-    )
-    _log_l2_extended_val_metrics(
-        frame,
-        val_report_mask,
-        y_decision,
-        decision_probs,
-        hard_decision_class,
-        y_trade == 1,
-        None,
-        size_pred,
-        y_mfe,
-        mfe_pred,
-        y_mae,
-        mae_pred,
-        expected_edge_pred=expected_edge_all,
-        true_edge=edge,
-        test_mask=test_mask,
-    )
-    _log_l2_gate_bar_edge_audit(
-        val_report_mask=val_report_mask,
-        y_decision=y_decision,
-        y_trade=y_trade,
-        hard_decision=hard_decision_class,
-        trade_p=trade_p_all,
-        trade_threshold=float(trade_threshold),
-        direction_p=direction_p_all,
-        true_edge=edge,
-    )
-    l2_direction_diag = _log_l2_direction_diagnostics(
-        frame,
-        val_report_mask,
-        dir_p=direction_p_all,
-        trade_p=trade_p_all,
-        y_trade=y_trade,
-        y_decision=y_decision,
-        hard_decision=hard_decision_class,
-        expected_edge=expected_edge_all,
-        true_edge=edge,
-        direction_abstain_margin=float(direction_abstain_margin),
-        train_mask=fit_train_mask,
-    )
-    diag_branch = _l2_edge_diagnosis_branch(expected_edge_all, edge, y_decision, val_report_mask, y_trade=y_trade)
-    fail_fast_a3 = os.environ.get("L2_FAIL_FAST_ON_A3", "0").strip().lower() in {"1", "true", "yes"}
-    if diag_branch == "A3" and fail_fast_a3:
-        raise RuntimeError(
-            "L2 P0-A fail-fast triggered: diagnosis_branch=A3 (direction sign and edge formula look consistent, "
-            "but expected_edge remains anti-informative). Continue P0-B/P1-A in parallel and open L1c quality investigation."
+        straddle_on_mask = (trade_p_all >= threshold_for_decision) & (predicted_profit_all > min_edge)
+        size_pred = _l2_straddle_size(
+            trade_p_all,
+            np.maximum(np.asarray(predicted_profit_all, dtype=np.float32), 0.0),
+            straddle_on_mask,
         )
-    _log_l2_l1b_masking_audit(
-        X,
-        feature_cols,
-        val_mask=val_report_mask,
-        y_trade=y_trade,
-        y_dir_stage=y_dir_stage,
-        y_decision=y_decision,
-        trade_model=gate_model,
-        direction_raw_source=direction_raw_all,
-        gate_calibrator=gate_calibrator,
-        direction_calibrator=direction_calibrator,
-        trade_threshold=float(trade_threshold),
-        direction_abstain_margin=float(direction_abstain_margin),
-    )
+    decision_confidence = trade_p_all.astype(np.float32)
+    if regime_adjust:
+        print(
+            f"  [L2] L2_REGIME_STRADDLE_ADJUST=1  val_tune vol q33={float(vol_q33):.6f} q66={float(vol_q66):.6f}  "
+            f"trend_eps={trend_eps:.4f}",
+            flush=True,
+        )
+
+    def _print_straddle_split(split_name: str, sm: np.ndarray) -> None:
+        sm = np.asarray(sm, dtype=bool)
+        if not sm.any():
+            return
+        try:
+            auc_t = float(roc_auc_score(y_trade[sm], trade_p_all[sm]))
+        except ValueError:
+            auc_t = float("nan")
+        b_t = brier_binary(y_trade[sm].astype(np.float64), trade_p_all[sm].astype(np.float64))
+        e_t = ece_binary(y_trade[sm].astype(np.float64), trade_p_all[sm].astype(np.float64))
+        yt = y_range[sm].astype(np.float64)
+        yp = np.asarray(range_pred[sm], dtype=np.float64)
+        mae_r = float(np.mean(np.abs(yt - yp))) if yt.size else float("nan")
+        print(
+            f"\n  [L2] {split_name} — straddle  gate AUC={auc_t:.4f}  Brier={b_t:.4f}  ECE={e_t:.4f}  range_MAE={mae_r:.4f}",
+            flush=True,
+        )
+
+    _print_straddle_split("val_report", val_report_mask)
+    if test_mask.any():
+        _print_straddle_split("holdout", test_mask)
+
+    av = np.asarray(val_report_mask, dtype=bool) & (y_trade == 1)
+    if av.sum() >= 5:
+        for name, yt_a, yp_a in (("mfe", y_mfe, mfe_pred), ("mae", y_mae, mae_pred)):
+            yt = yt_a[av].astype(np.float64)
+            yp = yp_a[av].astype(np.float64)
+            mae_h = float(mean_absolute_error(yt, yp))
+            print(f"  [L2] val_report — {name} head (y_trade active): MAE={mae_h:.4f}", flush=True)
+
     _log_l2_l1b_gain_importance_by_group(gate_model, feature_cols, "trade_gate")
+    _log_l2_l1b_gain_importance_by_group(range_model, feature_cols, "range")
+    if range10_model is not None:
+        _log_l2_l1b_gain_importance_by_group(range10_model, feature_cols, "range_10")
+    if range20_model is not None:
+        _log_l2_l1b_gain_importance_by_group(range20_model, feature_cols, "range_20")
+    if ttp_model is not None:
+        _log_l2_l1b_gain_importance_by_group(ttp_model, feature_cols, "ttp90")
     outputs = df[["symbol", "time_key"]].copy()
-    outputs["l2_decision_class"] = hard_decision_class
-    outputs["l2_decision_long"] = decision_probs[:, 0]
-    outputs["l2_decision_neutral"] = decision_probs[:, 1]
-    outputs["l2_decision_short"] = decision_probs[:, 2]
+    outputs["l2_straddle_on"] = straddle_on_mask.astype(np.int32)
+    outputs["l2_gate_prob"] = trade_p_all.astype(np.float32)
     outputs["l2_decision_confidence"] = decision_confidence
-    outputs["l2_bracket_buy_trigger"] = bracket_plan["l2_bracket_buy_trigger"]
-    outputs["l2_bracket_sell_trigger"] = bracket_plan["l2_bracket_sell_trigger"]
-    outputs["l2_bracket_offset_atr"] = bracket_plan["l2_bracket_offset_atr"]
-    outputs["l2_bracket_tp_atr"] = bracket_plan["l2_bracket_tp_atr"]
-    outputs["l2_bracket_sl_atr"] = bracket_plan["l2_bracket_sl_atr"]
-    outputs["l2_bracket_max_hold"] = bracket_plan["l2_bracket_max_hold"]
+    outputs["l2_range_pred"] = np.asarray(range_pred, dtype=np.float32)
+    outputs["l2_range_pred_10"] = range10_pred.astype(np.float32)
+    outputs["l2_range_pred_20"] = range20_pred.astype(np.float32)
+    outputs["l2_pred_ttp90_norm"] = ttp90_pred.astype(np.float32)
+    outputs["l2_predicted_profit"] = np.asarray(predicted_profit_all, dtype=np.float32)
     outputs["l2_size"] = size_pred
     outputs["l2_pred_mfe"] = mfe_pred
     outputs["l2_pred_mae"] = mae_pred
@@ -3148,30 +4275,39 @@ def train_l2_trade_decision(
     for idx in range(NUM_REGIME_CLASSES):
         outputs[f"l2_entry_regime_{idx}"] = entry_regime[:, idx]
     outputs["l2_entry_vol"] = frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
+    outputs["l2_vol_regime"] = vol_regime_names.astype(str)
+    outputs["l2_regime_size_mult"] = size_mult_row.astype(np.float32)
     outputs["l2_expected_edge"] = expected_edge_all
     outputs["l2_rr_proxy"] = outputs["l2_pred_mfe"] / np.maximum(outputs["l2_pred_mae"], 0.05)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     gate_model.save_model(os.path.join(MODEL_DIR, L2_GATE_FILE))
+    range_model.save_model(os.path.join(MODEL_DIR, L2_RANGE_FILE))
     mfe_model.save_model(os.path.join(MODEL_DIR, L2_MFE_FILE))
     mae_model.save_model(os.path.join(MODEL_DIR, L2_MAE_FILE))
     model_files: dict[str, str] = {
         "trade_gate": L2_GATE_FILE,
+        "range": L2_RANGE_FILE,
         "mfe": L2_MFE_FILE,
         "mae": L2_MAE_FILE,
     }
+    if range10_model is not None:
+        range10_model.save_model(os.path.join(MODEL_DIR, L2_RANGE10_FILE))
+        model_files["range_10"] = L2_RANGE10_FILE
+    if range20_model is not None:
+        range20_model.save_model(os.path.join(MODEL_DIR, L2_RANGE20_FILE))
+        model_files["range_20"] = L2_RANGE20_FILE
+    if ttp_model is not None:
+        ttp_model.save_model(os.path.join(MODEL_DIR, L2_TTP90_FILE))
+        model_files["ttp90"] = L2_TTP90_FILE
     if gate_calibrator is not None:
         gate_calib_file = L2_TRADE_GATE_CALIBRATOR_FILE
         with open(os.path.join(MODEL_DIR, gate_calib_file), "wb") as f:
             pickle.dump(gate_calibrator, f)
         model_files["trade_gate_calibrator"] = gate_calib_file
-    if direction_calibrator is not None:
-        direction_calib_file = L2_DIRECTION_CALIBRATOR_FILE
-        with open(os.path.join(MODEL_DIR, direction_calib_file), "wb") as f:
-            pickle.dump(direction_calibrator, f)
-        model_files["direction_calibrator"] = direction_calib_file
     meta = {
         "schema_version": L2_SCHEMA_VERSION,
+        "mode": "straddle",
         "l2_oof_folds": int(n_oof) if n_oof >= 2 else 0,
         "l2_policy_state_granularity": os.environ.get("L2_POLICY_STATE_GRANULARITY", "coarse"),
         "l2_gate_no_trade_weight": float(gate_nt_w),
@@ -3179,96 +4315,68 @@ def train_l2_trade_decision(
         "l2_l1b_dropout_seed": int(l1b_do_seed),
         "l2_use_l1b_latent_features": bool(use_l1b_latent_feats),
         "feature_cols": feature_cols,
+        "range_feature_cols": list(range_feature_cols),
+        "range_feature_hard_drop": sorted(range_head_drop),
+        "l2_derived_feature_stats": derived_feature_stats,
         "feature_group_counts": {
             "state": len(l1a_cols),
             "condition": len(l1b_cols),
-            "direction": len(l1c_cols),
+            "direction": len(dir_cols),
             "residual_other": len(res_cols),
         },
         "output_cols": L2_OUTPUT_COLS,
-        "decision_mode": "trade_gate_plus_bracket_order",
-        "decision_tau": tau_global,
-        "decision_tau_global": tau_global,
-        "decision_tau_by_state": decision_tau_by_state,
+        "decision_mode": "straddle",
+        "straddle_cost_atr": float(cost_atr_base),
+        "straddle_cost_mode": straddle_label_stats["straddle_cost_mode"],
+        "straddle_dynamic_cost": (dyn_cfg if dyn_cfg is not None else None),
+        "straddle_range_roll_cost": (range_roll_cfg if range_roll_cfg is not None else None),
+        "min_straddle_edge": float(min_edge),
+        "range_horizon_bars": int(range_horizon_meta),
         "trade_threshold": float(trade_threshold),
-        "direction_threshold": 0.5,
-        "direction_abstain_margin": float(direction_abstain_margin),
-        "direction_train_long_prior": float(train_long_prior),
-        "direction_target_long_prior": float(target_long_prior),
-        "direction_available": False,
-        "direction_head_type": "none_bracket_execution",
-        "confidence_semantics": "probability-aligned; confidence tracks neutral probability because side is chosen by bracket trigger execution",
-        "decision_class_semantics": "L2 predicts calibrated trade probability only; side is not predicted and is delegated to bracket trigger execution",
-        "decision_abstain_semantics": "no model-side direction abstain in bracket mode",
-        "size_semantics": "formula_from_trade_probability_direction_strength_and_state_context",
-               "expected_edge_semantics": (
-            "two-stage expected edge from trade probability, binary direction margin, formula size, L1c strength, "
-            "and regime-aware shrinkage (range mass + entropy + L1b edge proxy); "
-            "when direction_abstain_margin>0 and L2_EXPECTED_EDGE_APPLY_DIRECTION_ABSTAIN is enabled, "
-            "rows with trade>=threshold and |2p-1|<=margin are zeroed to match hard-decision abstain; "
-            "optional L2_EXPECTED_EDGE_ZERO_REGIME_IDS zeros expected_edge after assembly when set."
+        "trade_threshold_is_dynamic": bool(trade_threshold_row is not None),
+        "l2_regime_straddle_adjust": bool(regime_adjust),
+        "l2_vol_regime_quantiles": (
+            {"q33": float(vol_q33), "q66": float(vol_q66)} if regime_adjust and vol_q33 is not None and vol_q66 is not None else None
+        ),
+        "l2_regime_straddle_config": (regime_cfg_merged if regime_adjust else None),
+        "l2_regime_trend_eps": float(trend_eps),
+        "confidence_semantics": "l2_decision_confidence and l2_gate_prob are calibrated P(trade); straddle_on uses them as a low bar with range-first economics",
+        "straddle_decision_semantics": (
+            "range-first: gate>=trade_threshold(row-adaptive when dynamic map exists) AND predicted_profit > max(L2_MIN_STRADDLE_EDGE, regime min_profit) when L2_REGIME_STRADDLE_ADJUST=1; else global min edge"
+            if regime_adjust
+            else "range-first: (predicted_range - cost) > min_edge AND gate_prob >= trade_threshold(row-adaptive when enabled); see l2_predicted_profit"
+        ),
+        "expected_edge_semantics": "diagnostic mixture g*(r-c)+(1-g)*(-c*frac); not used for straddle_on (see straddle_decision_semantics)",
+        "size_semantics": (
+            "base straddle size (gate * norm max(predicted_profit,0)) times l2_regime_size_mult when L2_REGIME_STRADDLE_ADJUST=1"
+            if regime_adjust
+            else "normalized gate * positive max(predicted_profit,0) on straddle_on rows"
         ),
         "expected_edge_zero_regime_ids_env": os.environ.get("L2_EXPECTED_EDGE_ZERO_REGIME_IDS", ""),
         "l2_train_exclude_regime_ids": _l2_train_exclude_regime_ids_from_env(),
-        "l2_train_exclude_regime_ids_env": os.environ.get("L2_TRAIN_EXCLUDE_REGIME_IDS", "5"),
-        "feature_contract_semantics": {
-            "state": "L1a contributes regime, volatility, persistence, and embedding context only",
-            "condition": (
-                "L1b contributes tradeability, quality, novelty, and cluster context only; "
-                "no fixed L1B tau constant is assumed (edge features are scale-robust and can consume dynamic tau)"
-            ),
-            "direction": "no model-side direction owner; side selection is deferred to bracket execution",
-            "residual_other": "PA state and session context features remain as local execution context",
-        },
+        "l2_train_exclude_regime_ids_env": os.environ.get("L2_TRAIN_EXCLUDE_REGIME_IDS", "none"),
         "pa_state_features": list(PA_STATE_FEATURES),
-        "pa_policy_semantics": "PA state buckets expand conditional policy keys, active label geometry, and direction weighting inside the fixed live Layer2 path",
-        "pa_internal_semantics": {
-            "baked_into_live_path": True,
-            "tau": "PA states tighten or relax active decision tau before class labels are built",
-            "trade_gate": "PA-conditioned row floors define which edge examples count as active",
-            "direction": "direction is delegated to bracket triggers around current price after gate activation",
-        },
-        "live_policy_surface": {
-            "active_signal": "calibrated_trade_gate_probability",
-            "active_probability": "isotonic-calibrated trade_gate output",
-            "direction_signal": "none (execution-side bracket trigger decides long/short)",
-            "decode_threshold": float(trade_threshold),
-            "direction_abstain_margin": float(direction_abstain_margin),
-        },
-        "live_trade_calibration": {"type": "isotonic_trade_gate_only"},
-        "direction_calibration": {
-            "type": "none_bracket_execution",
-            "prior_correction": False,
-            "train_long_prior": float(train_long_prior),
-            "target_long_prior": float(target_long_prior),
-            "abstain_rate_target": float(direction_abstain_target),
-            "abstain_margin": float(direction_abstain_margin),
-        },
-        "l2_aux_head_target_prep": {
-            "mfe": mfe_head_prep,
-            "mae": mae_head_prep,
-        },
-        "l2_two_stage_label_stats": two_stage_label_stats,
-        "l2_direction_diag_val_report": l2_direction_diag,
+        "l2_aux_head_target_prep": (
+            {
+                "range": range_head_prep,
+                "mfe": mfe_head_prep,
+                "mae": mae_head_prep,
+                **(
+                    {
+                        "range_10": r10_head_prep,
+                        "range_20": r20_head_prep,
+                        "ttp90": ttp_head_prep,
+                    }
+                    if mh_on and r10_head_prep is not None
+                    else {}
+                ),
+            }
+        ),
+        "straddle_label_stats": straddle_label_stats,
         "policy_search": {
             "trade_threshold": float(trade_threshold),
-            "target_trade_rate": float(_l2_target_trade_rate()),
-            "direction_abstain_target": float(direction_abstain_target),
-            "direction_abstain_margin": float(direction_abstain_margin),
+            **policy_search_meta,
         },
-        "two_stage_policy": {
-            "decision_mode": "trade_gate_plus_bracket_order",
-            "trade_threshold": float(trade_threshold),
-            "direction_threshold": 0.5,
-            "direction_abstain_margin": float(direction_abstain_margin),
-            "policy_search": {
-                "trade_threshold": float(trade_threshold),
-                "target_trade_rate": float(_l2_target_trade_rate()),
-                "direction_abstain_target": float(direction_abstain_target),
-                "direction_abstain_margin": float(direction_abstain_margin),
-            },
-        },
-        "auxiliary_feature_semantics": "frozen L1 features and derived context feed retained trade gate only; execution side uses bracket orders for direction while mfe/mae remain risk auxiliaries",
         "model_files": model_files,
         "output_cache_file": L2_OUTPUT_CACHE_FILE,
         "target_trade_rate": _l2_target_trade_rate(),
@@ -3279,7 +4387,7 @@ def train_l2_trade_decision(
         "l2_train_boost_rounds": int(rounds),
         "l2_early_stopping_rounds": {
             "gate": int(gate_es_rounds),
-            "direction": int(side_es_rounds),
+            "range": int(range_es_rounds),
             "mfe": int(mfe_es_rounds),
             "mae": int(mae_es_rounds),
         },
@@ -3295,31 +4403,10 @@ def train_l2_trade_decision(
             "early_stopping_on": "first_metric (auc)",
             "early_stopping_rounds": int(gate_es_rounds),
         },
-        "l2_direction_config": {
-            "mode": "none_bracket_execution",
-        },
-        "l2_bracket_config": {
-            "enabled": True,
-            "offset_atr": float(bracket_offset_atr),
-            "tp_atr": float(bracket_tp_atr),
-            "sl_atr": float(bracket_sl_atr),
-            "max_hold_bars": int(bracket_max_hold),
-        },
         "l2_regression_config": reg_params,
-        "l2_size_formula_config": {
-            "trade_threshold": float(trade_threshold),
-            "clip_max": 5.0,
-            "inputs": ["trade_probability", "direction_margin", "l1c_direction_strength", "l1c_confidence", "l1a_vol_forecast", "l1a_state_persistence"],
-            "mode": size_mode,
-            "active_std_raw": float(std_raw),
-            "min_active_std": float(size_min_std),
-            "bucket_bins": [float(x) for x in size_bins],
-            "bucket_levels": [float(x) for x in size_levels],
-        },
         "rollback_criteria": {
             "p1a_abstain": {"rollback_if_gate_auc_drop_gt": 0.01},
             "p1c_l3_data_expansion": {"rollback_if_exit_auc_drop_gt": 0.02},
-            "p2a_l1b_prune": {"rollback_if_sign_acc_drop_gt": 0.02},
         },
     }
     meta = attach_threshold_registry(
@@ -3330,27 +4417,20 @@ def train_l2_trade_decision(
                 "trade_threshold",
                 float(trade_threshold),
                 category="adaptive_candidate",
-                role="active trade gate cutoff",
-                adaptive_hint="quantile by target trade rate",
+                role="low gate bar (calibrated P) alongside range profit",
+                adaptive_hint="economic search on val_tune with trade-rate constraints (range-first objective)",
             ),
             threshold_entry(
-                "direction_abstain_margin",
-                float(direction_abstain_margin),
+                "L2_MIN_STRADDLE_EDGE",
+                float(min_edge),
                 category="adaptive_candidate",
-                role="direction abstain band",
-                adaptive_hint="quantile over active direction confidence",
+                role="minimum predicted_profit (range - cost) to set straddle_on",
             ),
             threshold_entry(
                 "L2_TARGET_TRADE_RATE",
                 float(_l2_target_trade_rate()),
                 category="adaptive_candidate",
-                role="target active coverage",
-            ),
-            threshold_entry(
-                "L2_SIZE_MIN_ACTIVE_STD",
-                float(size_min_std),
-                category="data_guardrail",
-                role="size collapse detector",
+                role="target straddle trade-rate constraint",
             ),
         ],
     )
@@ -3358,20 +4438,32 @@ def train_l2_trade_decision(
         pickle.dump(meta, f)
     cache_path = save_output_cache(outputs, L2_OUTPUT_CACHE_FILE)
     if test_mask.any():
+        te_rng = y_range[test_mask].astype(np.float64)
+        test_pp = outputs.loc[test_mask, "l2_predicted_profit"].to_numpy(dtype=np.float32)
+        corr_pp = np.corrcoef(test_pp.astype(np.float64), te_rng)[0, 1] if int(test_mask.sum()) > 2 else float("nan")
         test_edge = outputs.loc[test_mask, "l2_expected_edge"].to_numpy(dtype=np.float32)
-        corr = np.corrcoef(test_edge, edge[test_mask])[0, 1] if int(test_mask.sum()) > 2 else float("nan")
-        print(f"  [L2] test corr(expected_edge, decision_edge_atr)={corr:.4f}", flush=True)
+        corr_ee = np.corrcoef(test_edge.astype(np.float64), te_rng)[0, 1] if int(test_mask.sum()) > 2 else float("nan")
+        print(
+            f"  [L2] test corr(l2_predicted_profit, y_range_truth)={corr_pp:.4f}  "
+            f"(mixture l2_expected_edge diag)={corr_ee:.4f}",
+            flush=True,
+        )
     print(f"  [L2] meta saved  -> {os.path.join(MODEL_DIR, L2_META_FILE)}", flush=True)
     print(f"  [L2] cache saved -> {cache_path}", flush=True)
     bundle_models: dict[str, Any] = {
         "trade_gate": gate_model,
+        "range": range_model,
         "mfe": mfe_model,
         "mae": mae_model,
     }
+    if range10_model is not None:
+        bundle_models["range_10"] = range10_model
+    if range20_model is not None:
+        bundle_models["range_20"] = range20_model
+    if ttp_model is not None:
+        bundle_models["ttp90"] = ttp_model
     if gate_calibrator is not None:
         bundle_models["trade_gate_calibrator"] = gate_calibrator
-    if direction_calibrator is not None:
-        bundle_models["direction_calibrator"] = direction_calibrator
     train_finished_at = datetime.now().astimezone()
     elapsed_sec = max(0.0, time.perf_counter() - train_started_perf)
     print(
@@ -3422,91 +4514,135 @@ def infer_l2_trade_decision(
     df: pd.DataFrame,
     l1a_outputs: pd.DataFrame,
     l1b_outputs: pd.DataFrame,
-    l1c_outputs: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    frame, _feature_cols = _build_l2_frame(df, l1a_outputs, l1b_outputs, l1c_outputs)
-    _l2_require_l1c_regression_if_used(frame)
+    frame, _feature_cols, _derived_stats = _build_l2_frame(
+        df,
+        l1a_outputs,
+        l1b_outputs,
+        derived_feature_stats=dict(meta.get("l2_derived_feature_stats") or {}),
+    )
     target_cols = list(meta["feature_cols"])
+    range_target_cols = list(meta.get("range_feature_cols") or target_cols)
     X = _l2_require_inference_features(frame, target_cols)
-    mode = meta.get("decision_mode", "trade_gate_plus_bracket_order")
+    X_range = _l2_require_inference_features(frame, range_target_cols)
+    mode = meta.get("decision_mode", "straddle")
     aux_prep = meta.get("l2_aux_head_target_prep", {})
-    if mode != "trade_gate_plus_bracket_order":
+    if mode not in {"straddle"}:
         raise RuntimeError(
-            f"L2 live inference only supports decision_mode='trade_gate_plus_bracket_order', got {mode!r}. "
-            "Retrain L2 with bracket execution mode."
+            f"L2 live inference only supports decision_mode='straddle', got {mode!r}. Retrain L2."
         )
-    two_stage_cfg = meta.get("two_stage_policy") or meta
     trade_m = models["trade_gate"]
+    range_m = models["range"]
     X_gate, _ = _l2_project_gate_features(X, target_cols)
     trade_p = _apply_binary_calibrator(
         trade_m.predict(X_gate).astype(np.float64),
         models.get("trade_gate_calibrator"),
     ).astype(np.float32)
-    direction_p = np.full(len(df), 0.5, dtype=np.float32)
-    trade_thr = float((two_stage_cfg or {}).get("trade_threshold", meta.get("trade_threshold", 0.5)))
-    direction_abstain_margin = float(
-        (two_stage_cfg or {}).get("direction_abstain_margin", meta.get("direction_abstain_margin", 0.0))
-    )
-    decision_probs = _l2_compose_probs_from_gate_dir(trade_p, direction_p)
+    range_pred = _l2_positive_head_predict(range_m, X_range, aux_prep.get("range"), clip_max=10.0)
     mfe_pred = _l2_positive_head_predict(models["mfe"], X, aux_prep.get("mfe"), clip_max=5.0)
     mae_pred = _l2_positive_head_predict(models["mae"], X, aux_prep.get("mae"), clip_max=4.0)
-    size_cfg = meta.get("l2_size_formula_config") or {}
-    size_raw = _l2_formula_size_from_context(
-        frame,
-        trade_p,
-        direction_p,
-        trade_threshold=trade_thr,
-        clip_max=float(size_cfg.get("clip_max", 5.0)),
-    )
-    if str(size_cfg.get("mode", "formula")) == "bucketized_fallback":
-        size_pred, _bins, _levels = _l2_bucketized_size_from_signals(
-            frame,
-            trade_p,
-            direction_p,
-            trade_threshold=trade_thr,
-            fit_mask=None,
-            bins=[float(x) for x in (size_cfg.get("bucket_bins") or [])],
-            levels=[float(x) for x in (size_cfg.get("bucket_levels") or [])] or None,
-        )
+    n_inf = len(df)
+    z0 = np.zeros(n_inf, dtype=np.float32)
+    if models.get("range_10") is not None and aux_prep.get("range_10") is not None:
+        range10_pred = _l2_positive_head_predict(models["range_10"], X_range, aux_prep["range_10"], clip_max=15.0)
     else:
-        size_pred = size_raw
-    expected_edge = _l2_expected_edge_from_gate_dir(
-        trade_p,
-        direction_p,
-        size_pred,
-        trade_threshold=trade_thr,
-        direction_strength=frame.get("l1c_direction_strength"),
-        l1b_edge_proxy=frame.get("l1b_edge_pred"),
-        range_mass=(
-            pd.to_numeric(frame.get("l1a_regime_prob_range_conv", 0.0), errors="coerce").fillna(0.0)
-            + pd.to_numeric(frame.get("l1a_regime_prob_range_div", 0.0), errors="coerce").fillna(0.0)
-        ),
-        regime_entropy=frame.get("l1a_regime_entropy"),
-        direction_abstain_margin=direction_abstain_margin,
+        range10_pred = z0
+    if models.get("range_20") is not None and aux_prep.get("range_20") is not None:
+        range20_pred = _l2_positive_head_predict(models["range_20"], X_range, aux_prep["range_20"], clip_max=15.0)
+    else:
+        range20_pred = z0
+    if models.get("ttp90") is not None and aux_prep.get("ttp90") is not None:
+        ttp90_pred = _l2_positive_head_predict(models["ttp90"], X_range, aux_prep["ttp90"], clip_max=1.0)
+    else:
+        ttp90_pred = z0
+    trade_thr = float(meta.get("trade_threshold", 0.5))
+    cost_base = float(meta.get("straddle_cost_atr", _l2_straddle_cost_atr()))
+    scm = str(meta.get("straddle_cost_mode", "fixed")).strip().lower()
+    if scm == "range_roll_quantile":
+        rrc = meta.get("straddle_range_roll_cost")
+        if not isinstance(rrc, dict):
+            rrc = _l2_range_roll_cost_env_config()
+        rr = _decision_forward_range_atr_array(df)
+        cost_row = _l2_range_roll_cost_array(df, rr, cfg=rrc)
+    elif scm == "dynamic_atr_quantile":
+        dcfg = meta.get("straddle_dynamic_cost")
+        if not isinstance(dcfg, dict):
+            dcfg = _l2_dynamic_straddle_cost_env_config()
+        cost_row = _l2_dynamic_straddle_cost_array(df, cost_base, cfg=dcfg)
+    else:
+        cost_row = np.full(len(df), cost_base, dtype=np.float64)
+    min_edge = float(meta.get("min_straddle_edge", float(os.environ.get("L2_MIN_STRADDLE_EDGE", "0.0"))))
+    predicted_profit = _l2_straddle_predicted_profit(range_pred, cost_atr=cost_row)
+    predicted_profit = _l2_apply_expected_edge_regime_blacklist(
+        np.asarray(predicted_profit, dtype=np.float32), frame
+    ).astype(np.float32)
+    expected_edge = _l2_straddle_expected_edge(trade_p, range_pred, cost_atr=cost_row)
+    expected_edge = _l2_apply_expected_edge_regime_blacklist(
+        np.asarray(expected_edge, dtype=np.float32), frame
+    ).astype(np.float32)
+    trend_eps_m = float(
+        np.clip(float(meta.get("l2_regime_trend_eps", os.environ.get("L2_REGIME_TREND_EPS", "0.02"))), 1e-6, 1.0)
     )
-    expected_edge = _l2_apply_expected_edge_regime_blacklist(expected_edge, frame)
-    hard_decision_class = np.full(len(df), 1, dtype=np.int64)
-    decision_confidence = decision_probs[:, 1].astype(np.float32)
-    bc = meta.get("l2_bracket_config") or {}
-    bracket_plan = _l2_build_bracket_plan(
-        df,
-        offset_atr=float(bc.get("offset_atr", 0.15)),
-        tp_atr=float(bc.get("tp_atr", 1.19)),
-        sl_atr=float(bc.get("sl_atr", 0.22)),
-        max_hold=int(bc.get("max_hold_bars", 20)),
+    regime_adjust_m = bool(meta.get("l2_regime_straddle_adjust", False))
+    vol_q = meta.get("l2_vol_regime_quantiles") or {}
+    q33_m = float(vol_q.get("q33", 0.33)) if isinstance(vol_q, dict) else 0.33
+    q66_m = float(vol_q.get("q66", 0.66)) if isinstance(vol_q, dict) else 0.66
+    vol_all_i = frame["l1a_vol_forecast"].to_numpy(dtype=np.float64)
+    trend_all_i = (
+        frame["l1a_vol_trend"].to_numpy(dtype=np.float64)
+        if "l1a_vol_trend" in frame.columns
+        else np.zeros(len(df), dtype=np.float64)
     )
+    reg_ids_i = _l2_vol_regime_ids(vol_all_i, trend_all_i, q33_m, q66_m, trend_eps_m)
+    dyn_state_keys = _l2_vol_regime_names_from_ids(reg_ids_i)
+    policy_search = meta.get("policy_search") if isinstance(meta.get("policy_search"), dict) else {}
+    trade_thr_row = _l2_threshold_row_from_state_map(
+        trade_thr,
+        dyn_state_keys,
+        str(policy_search.get("dynamic_threshold_map", "")) if isinstance(policy_search, dict) else "",
+    )
+    trade_thr_eval: float | np.ndarray = trade_thr_row if trade_thr_row is not None else trade_thr
+    size_mult_i = np.ones(len(df), dtype=np.float32)
+    vol_regime_i = np.full(len(df), "", dtype=object)
+    if regime_adjust_m:
+        cfg_inf = meta.get("l2_regime_straddle_config")
+        if not isinstance(cfg_inf, dict):
+            cfg_inf = _l2_regime_straddle_config_merged()
+        min_mp_i = np.array(
+            [float(cfg_inf[k]["min_profit"]) for k in L2_STRADDLE_VOL_REGIME_NAMES],
+            dtype=np.float64,
+        )
+        mult_sm_i = np.array(
+            [float(cfg_inf[k]["size_mult"]) for k in L2_STRADDLE_VOL_REGIME_NAMES],
+            dtype=np.float64,
+        )
+        min_edge_row = np.maximum(float(min_edge), min_mp_i[reg_ids_i])
+        straddle_on = (trade_p >= trade_thr_eval) & (np.asarray(predicted_profit, dtype=np.float64) > min_edge_row)
+        base_sz = _l2_straddle_size(
+            trade_p,
+            np.maximum(np.asarray(predicted_profit, dtype=np.float32), 0.0),
+            straddle_on,
+        )
+        size_mult_i = mult_sm_i[reg_ids_i].astype(np.float32)
+        size_pred = (base_sz * size_mult_i).astype(np.float32)
+        vol_regime_i = _l2_vol_regime_names_from_ids(reg_ids_i)
+    else:
+        straddle_on = (trade_p >= trade_thr_eval) & (predicted_profit > min_edge)
+        size_pred = _l2_straddle_size(
+            trade_p,
+            np.maximum(np.asarray(predicted_profit, dtype=np.float32), 0.0),
+            straddle_on,
+        )
+    decision_confidence = trade_p.astype(np.float32)
     outputs = df[["symbol", "time_key"]].copy()
-    outputs["l2_decision_class"] = hard_decision_class
-    outputs["l2_decision_long"] = decision_probs[:, 0]
-    outputs["l2_decision_neutral"] = decision_probs[:, 1]
-    outputs["l2_decision_short"] = decision_probs[:, 2]
+    outputs["l2_straddle_on"] = straddle_on.astype(np.int32)
+    outputs["l2_gate_prob"] = trade_p.astype(np.float32)
     outputs["l2_decision_confidence"] = decision_confidence
-    outputs["l2_bracket_buy_trigger"] = bracket_plan["l2_bracket_buy_trigger"]
-    outputs["l2_bracket_sell_trigger"] = bracket_plan["l2_bracket_sell_trigger"]
-    outputs["l2_bracket_offset_atr"] = bracket_plan["l2_bracket_offset_atr"]
-    outputs["l2_bracket_tp_atr"] = bracket_plan["l2_bracket_tp_atr"]
-    outputs["l2_bracket_sl_atr"] = bracket_plan["l2_bracket_sl_atr"]
-    outputs["l2_bracket_max_hold"] = bracket_plan["l2_bracket_max_hold"]
+    outputs["l2_range_pred"] = np.asarray(range_pred, dtype=np.float32)
+    outputs["l2_range_pred_10"] = np.asarray(range10_pred, dtype=np.float32)
+    outputs["l2_range_pred_20"] = np.asarray(range20_pred, dtype=np.float32)
+    outputs["l2_pred_ttp90_norm"] = np.asarray(ttp90_pred, dtype=np.float32)
+    outputs["l2_predicted_profit"] = np.asarray(predicted_profit, dtype=np.float32)
     outputs["l2_size"] = size_pred
     outputs["l2_pred_mfe"] = mfe_pred
     outputs["l2_pred_mae"] = mae_pred
@@ -3514,6 +4650,8 @@ def infer_l2_trade_decision(
     for idx in range(NUM_REGIME_CLASSES):
         outputs[f"l2_entry_regime_{idx}"] = entry_regime[:, idx]
     outputs["l2_entry_vol"] = frame["l1a_vol_forecast"].to_numpy(dtype=np.float32, copy=False)
+    outputs["l2_vol_regime"] = vol_regime_i.astype(str)
+    outputs["l2_regime_size_mult"] = size_mult_i
     outputs["l2_expected_edge"] = expected_edge.astype(np.float32)
     outputs["l2_rr_proxy"] = outputs["l2_pred_mfe"] / np.maximum(outputs["l2_pred_mae"], 0.05)
     return outputs

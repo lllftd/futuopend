@@ -52,7 +52,6 @@ if [[ "${KEEP_STACK_MODELS:-}" != "1" ]]; then
   for f in \
     l1a_market_tcn.pt l1a_market_tcn_meta.pkl l1a_outputs.pkl \
     l1b_descriptor_meta.pkl l1b_outputs.pkl l1b_edge_pred.txt l1b_dq_pred.txt \
-    l1c_direction.pt l1c_direction_meta.pkl l1c_outputs.pkl \
     l2_trade_gate.txt l2_direction.txt l2_trade_gate_calibrator.pkl l2_direction_calibrator.pkl \
     l2_mfe.txt l2_mae.txt l2_decision_meta.pkl l2_outputs.pkl \
     l3_exit.txt l3_value.txt l3_exit_meta.pkl l3_trajectory_encoder.pt \

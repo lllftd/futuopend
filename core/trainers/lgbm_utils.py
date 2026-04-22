@@ -590,6 +590,34 @@ def _mfe_mae_atr_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _decision_forward_range_atr_array(df: pd.DataFrame) -> np.ndarray:
+    """Straddle gate/range label: unconditional forward high-low range in ATR units (label_v2 `decision_forward_range_atr`)."""
+    if "decision_forward_range_atr" not in df.columns:
+        raise RuntimeError(
+            "Missing `decision_forward_range_atr` required for L2 straddle training. "
+            "Regenerate labels with `data_tools/label_v2.py`."
+        )
+    return pd.to_numeric(df["decision_forward_range_atr"], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+
+def _decision_forward_range_h_atr_array(df: pd.DataFrame, *, bars: int) -> np.ndarray:
+    col = f"decision_forward_range_{bars}_atr"
+    if col not in df.columns:
+        raise RuntimeError(
+            f"Missing `{col}` — re-run data_tools/label_v2.py (multi-horizon columns) or disable L2_MULTI_HORIZON."
+        )
+    return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+
+def _decision_range_ttp90_norm_30_array(df: pd.DataFrame) -> np.ndarray:
+    col = "decision_range_ttp90_norm_30"
+    if col not in df.columns:
+        raise RuntimeError(
+            f"Missing `{col}` — re-run data_tools/label_v2.py or disable L2_MULTI_HORIZON."
+        )
+    return pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+
 def _opp_regression_sample_weights(mfe_tgt: np.ndarray, regime_name: str) -> np.ndarray:
     """
     Differentiated percentile weighting to force the model to focus on high-MFE (breakout) samples.
@@ -650,6 +678,7 @@ __all__ = [
     "configure_training_runtime",
     "_compute_sample_weights",
     "_decision_edge_atr_array",
+    "_decision_forward_range_atr_array",
     "_is_lgbm_string_tag_col",
     "_l2b_reg_objective_params",
     "_layer3_chunk_rows",

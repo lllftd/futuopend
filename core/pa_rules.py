@@ -38,11 +38,6 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return ohlcv.reset_index()
 
 
-def _resample_5min(df: pd.DataFrame) -> pd.DataFrame:
-    """Resample 1-min OHLCV to 5-min bars, keyed by each 5-min period start."""
-    return _resample_ohlcv(df, "5min")
-
-
 def _resample_ohlcv_htf_closed(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     """
     Resample 1-min OHLCV to HTF bars with timestamp = **right edge** of each bucket
@@ -139,21 +134,6 @@ def _append_htf_regime_from_1m(result: pd.DataFrame, times_1m: pd.DatetimeIndex)
         score_60m = result["pa_htf_60min_trend_score"].fillna(0).to_numpy(dtype=float)
         # +2 if both bullish, -2 if both bearish, 0 if mixed/neutral
         result["pa_htf_trend_alignment"] = np.sign(score_15m) + np.sign(score_60m)
-
-
-def _map_5min_to_1min(
-    features_5m: pd.DataFrame,
-    original_index: pd.DatetimeIndex,
-    columns: list[str],
-) -> pd.DataFrame:
-    """
-    Legacy forward-fill of left-labeled 5m rows onto 1m timestamps.
-
-    Prefer :func:`_map_htf_closed_to_1min` with :func:`_resample_ohlcv_htf_closed` for causal HTF→1m.
-    """
-    features_5m = features_5m.set_index("time_key")[columns]
-    mapped = features_5m.reindex(original_index, method="ffill")
-    return mapped.reset_index(drop=True)
 
 
 def _prefix_pa_mtf_columns(df: pd.DataFrame, tf_tag: str) -> pd.DataFrame:
@@ -767,86 +747,6 @@ def _pressure_score_5m(bars: pd.DataFrame, window: int = 10) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 1i. Measured Move (MM) Targets — on 5-min pivots
-# ---------------------------------------------------------------------------
-
-def _measured_move_5m(bars: pd.DataFrame, pivot_len: int = 5) -> pd.DataFrame:
-    n = len(bars)
-    highs = bars["high"].to_numpy(dtype=float)
-    lows = bars["low"].to_numpy(dtype=float)
-
-    mm_up = np.full(n, np.nan)
-    mm_down = np.full(n, np.nan)
-
-    swing_highs: list[tuple[int, float]] = []
-    swing_lows: list[tuple[int, float]] = []
-
-    win = 2 * pivot_len + 1
-    if n >= win:
-        hv = sliding_window_view(highs, win)
-        lv = sliding_window_view(lows, win)
-        j_idx = np.arange(pivot_len, n - pivot_len, dtype=np.int64)
-        centers_h = highs[j_idx]
-        centers_l = lows[j_idx]
-        row_off = j_idx - pivot_len
-        is_sh = centers_h == hv[row_off].max(axis=1)
-        is_sl = centers_l == lv[row_off].min(axis=1)
-        if np.any(is_sh):
-            jj = j_idx[is_sh]
-            swing_highs = list(zip(jj.tolist(), centers_h[is_sh].tolist()))
-        if np.any(is_sl):
-            jj = j_idx[is_sl]
-            swing_lows = list(zip(jj.tolist(), centers_l[is_sl].tolist()))
-
-    swing_lows_arr = np.array(swing_lows) if swing_lows else np.empty((0, 2))
-    swing_highs_arr = np.array(swing_highs) if swing_highs else np.empty((0, 2))
-
-    for i in range(n):
-        if len(swing_lows_arr) < 2 or len(swing_highs_arr) < 1:
-            continue
-
-        idx_l = np.searchsorted(swing_lows_arr[:, 0], i, side='right')
-        idx_h = np.searchsorted(swing_highs_arr[:, 0], i, side='right')
-        
-        relevant_lows = swing_lows_arr[:idx_l]
-        relevant_highs = swing_highs_arr[:idx_h]
-
-        # upward MM target
-        if len(relevant_lows) >= 2 and len(relevant_highs) >= 1:
-            sl1 = relevant_lows[-2]
-            sh = None
-            for j in range(len(relevant_highs)-1, -1, -1):
-                if relevant_highs[j, 0] > sl1[0]:
-                    sh = relevant_highs[j]
-                    break
-            sl2 = relevant_lows[-1]
-            if sh is not None and sl2[0] > sh[0]:
-                leg1 = sh[1] - sl1[1]
-                if leg1 > 0:
-                    mm_up[i] = sl2[1] + leg1
-
-        # downward MM target
-        if len(relevant_highs) >= 2 and len(relevant_lows) >= 1:
-            sh1 = relevant_highs[-2]
-            sl = None
-            for j in range(len(relevant_lows)-1, -1, -1):
-                if relevant_lows[j, 0] > sh1[0]:
-                    sl = relevant_lows[j]
-                    break
-            sh2 = relevant_highs[-1]
-            if sl is not None and sh2[0] > sl[0]:
-                leg1 = sh1[1] - sl[1]
-                if leg1 > 0:
-                    mm_down[i] = sh2[1] - leg1
-
-    out = pd.DataFrame(index=bars.index)
-    out["time_key"] = bars["time_key"].values
-    out["pa_mm_target_up"] = mm_up
-    out["pa_mm_target_down"] = mm_down
-    return out
-
-
-# ---------------------------------------------------------------------------
 # 1j. Gap Quantification (5-min)
 # ---------------------------------------------------------------------------
 
@@ -907,57 +807,6 @@ def _derive_direction_5m(bars_5m: pd.DataFrame) -> np.ndarray:
     direction[valid & (close > ema20)] = 1
     direction[valid & (close < ema20)] = -1
     return direction.astype(int, copy=False)
-
-
-# ---------------------------------------------------------------------------
-# PA stop helpers — recent swing HL / LH
-# ---------------------------------------------------------------------------
-
-def _pa_stops(bars_5m: pd.DataFrame, pivot_len: int = 5) -> pd.DataFrame:
-    n = len(bars_5m)
-    highs = bars_5m["high"].to_numpy(dtype=float)
-    lows = bars_5m["low"].to_numpy(dtype=float)
-
-    recent_hl = np.full(n, np.nan)
-    recent_lh = np.full(n, np.nan)
-
-    w = 2 * pivot_len + 1
-    if n >= w:
-        hv = sliding_window_view(highs, w)
-        lv = sliding_window_view(lows, w)
-        centers_h = highs[pivot_len : n - pivot_len]
-        centers_l = lows[pivot_len : n - pivot_len]
-        j_idx = np.arange(pivot_len, n - pivot_len, dtype=np.int64)
-        is_sh = centers_h == hv.max(axis=1)
-        is_sl = centers_l == lv.min(axis=1)
-        swing_high_idx = j_idx[is_sh]
-        swing_high_val = centers_h[is_sh]
-        swing_low_idx = j_idx[is_sl]
-        swing_low_val = centers_l[is_sl]
-    else:
-        swing_high_idx = np.array([], dtype=int)
-        swing_high_val = np.array([], dtype=float)
-        swing_low_idx = np.array([], dtype=int)
-        swing_low_val = np.array([], dtype=float)
-
-    for i in range(n):
-        # Recent higher-low for long stops
-        if len(swing_low_idx) > 0:
-            right_idx = np.searchsorted(swing_low_idx, i) - 1
-            if right_idx >= 0 and swing_low_idx[right_idx] >= i - 40:
-                recent_hl[i] = swing_low_val[right_idx]
-
-        # Recent lower-high for short stops
-        if len(swing_high_idx) > 0:
-            right_idx = np.searchsorted(swing_high_idx, i) - 1
-            if right_idx >= 0 and swing_high_idx[right_idx] >= i - 40:
-                recent_lh[i] = swing_high_val[right_idx]
-
-    out = pd.DataFrame(index=bars_5m.index)
-    out["time_key"] = bars_5m["time_key"].values
-    out["pa_stop_long"] = recent_hl
-    out["pa_stop_short"] = recent_lh
-    return out
 
 
 # ── Bar-pattern supplement ──
@@ -1600,12 +1449,7 @@ def _causal_opening_range(df: pd.DataFrame, daily_atr: pd.Series) -> pd.DataFram
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.where(atr_daily > 0, or_range / atr_daily, np.nan)
 
-    # pa_or_position = (close - or_low) / or_range
-    safe_range = np.where((np.isfinite(or_range)) & (or_range > 1e-8), or_range, 1e-8)
-    or_position = np.where(np.isfinite(or_range), (close_arr - or_low) / safe_range, 0.5)
-
     result = pd.DataFrame(index=df.index)
-    result["pa_or_position"] = or_position
     result["or_breakout_up"] = breakout_up.astype(np.int8)
     result["or_breakout_down"] = breakout_down.astype(np.int8)
     result["or_volume_breakout"] = vol_breakout.astype(np.int8)
@@ -2399,20 +2243,6 @@ def _causal_parabolic_wedge(
 
 
 # ─────────────────────────────────────────────────────────────────
-# 13. Cross-Timeframe Features (15m / 30m / 1h)
-# ─────────────────────────────────────────────────────────────────
-
-def _resample_higher_tf(bars_5m: pd.DataFrame, period: str) -> pd.DataFrame:
-    """Resample 5m bars to a higher timeframe (15min, 30min, 1h)."""
-    df = bars_5m.set_index(pd.to_datetime(bars_5m["time_key"]))
-    resampled = df[["open", "high", "low", "close", "volume"]].resample(period, label="right", closed="right").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    ).dropna(subset=["open"])
-    resampled["time_key"] = resampled.index
-    return resampled.reset_index(drop=True)
-
-
-# ─────────────────────────────────────────────────────────────────
 # 14. Structure Features (HH/HL/LH/LL, swing range, break)
 # ─────────────────────────────────────────────────────────────────
 
@@ -2450,21 +2280,14 @@ def _structure_features(
     sh_leg_start = 0
     sl_leg_start = 0
 
-    prev_sh_val = np.nan
-    prev_sl_val = np.nan
-
     for i in range(n):
-        new_sh = False
-        new_sl = False
         while sh_ptr < len(swing_highs) and swing_highs[sh_ptr][0] <= i:
             _, swing_idx, val = swing_highs[sh_ptr]
             confirmed_sh.append((swing_idx, val))
-            new_sh = True
             sh_ptr += 1
         while sl_ptr < len(swing_lows) and swing_lows[sl_ptr][0] <= i:
             _, swing_idx, val = swing_lows[sl_ptr]
             confirmed_sl.append((swing_idx, val))
-            new_sl = True
             sl_ptr += 1
 
         cur_atr = atr_arr[i] if np.isfinite(atr_arr[i]) and atr_arr[i] > 0 else 1e-6
@@ -2783,8 +2606,6 @@ def _hmm_garch_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     garch_vol_ma_s = pd.Series(garch_vol).ewm(span=120, adjust=False, min_periods=20).mean()
     garch_vol_ma = garch_vol_ma_s.fillna(pd.Series(garch_vol)).to_numpy(dtype=float)
     garch_vol_ma = np.where(garch_vol_ma > eps, garch_vol_ma, eps)
-    garch_vol_ratio = garch_vol / garch_vol_ma
-    garch_vol_z = np.clip(garch_vol_ratio - 1.0, -4.0, 4.0)
 
     garch_shock = (log_ret * log_ret) / np.maximum(var, eps) - 1.0
     garch_shock = np.clip(garch_shock, -3.0, 6.0)
@@ -3040,6 +2861,90 @@ def _realized_volatility_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _straddle_focused_features(df_1m: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vol / range structure features for straddle-centric models (all causal on 1m bars).
+
+    ``pa_iv_rv_spread`` uses a bar-data proxy (range-based vol vs close-to-close RV), not exchange IV.
+    """
+    out = pd.DataFrame(index=df_1m.index)
+    out["time_key"] = df_1m["time_key"].values
+    if len(df_1m) == 0:
+        return out
+
+    c = df_1m["close"].astype(float)
+    h = df_1m["high"].astype(float)
+    l = df_1m["low"].astype(float)
+    v = df_1m["volume"].astype(float)
+    ret = c.pct_change().fillna(0)
+
+    if "pa_rv_cc_20" in df_1m.columns:
+        rv20 = pd.to_numeric(df_1m["pa_rv_cc_20"], errors="coerce").fillna(0.0)
+    else:
+        rv20 = ret.rolling(20, min_periods=2).std().fillna(0.0)
+    if "pa_rv_cc_10" in df_1m.columns:
+        rv10 = pd.to_numeric(df_1m["pa_rv_cc_10"], errors="coerce").fillna(0.0)
+    else:
+        rv10 = ret.rolling(10, min_periods=2).std().fillna(0.0)
+    if "pa_rv_parkinson_20" in df_1m.columns:
+        pk20 = pd.to_numeric(df_1m["pa_rv_parkinson_20"], errors="coerce").fillna(0.0)
+    else:
+        hl_ratio = np.log(h / l.replace(0, np.nan)).fillna(0.0)
+        pk20 = np.sqrt((1.0 / (4.0 * np.log(2.0))) * hl_ratio**2).rolling(20, min_periods=2).mean().fillna(0.0)
+
+    out["pa_iv_rv_spread"] = ((pk20 - rv20) / (rv20 + 1e-8)).clip(-5.0, 5.0).to_numpy(dtype=np.float64)
+
+    rv_mu = rv20.rolling(120, min_periods=20).mean()
+    rv_sd = rv20.rolling(120, min_periods=20).std().replace(0.0, np.nan)
+    out["pa_rv_zscore"] = ((rv20 - rv_mu) / (rv_sd + 1e-8)).fillna(0.0).to_numpy(dtype=np.float64)
+
+    out["pa_rv_acceleration"] = rv20.diff(5).diff(5).fillna(0.0).to_numpy(dtype=np.float64)
+
+    tp = (h + l + c) / 3.0
+    tp_std = tp.rolling(20, min_periods=5).std()
+    tp_ma = tp.rolling(20, min_periods=5).mean()
+    bb_w = (4.0 * tp_std / (tp_ma.replace(0, np.nan) + 1e-8)).fillna(0.0)
+    out["pa_bb_width_pctile"] = (
+        bb_w.rolling(120, min_periods=20)
+        .apply(lambda x: float(np.mean(x <= x[-1])) if len(x) > 0 else 0.5, raw=True)
+        .fillna(0.5)
+        .clip(0.0, 1.0)
+        .to_numpy(dtype=np.float64)
+    )
+
+    bar_rng = (h - l).astype(float)
+    atr5 = bar_rng.rolling(5, min_periods=1).mean()
+    atr20 = bar_rng.rolling(20, min_periods=1).mean()
+    out["pa_atr_ratio_5_20"] = (atr5 / (atr20 + 1e-8)).fillna(1.0).clip(0.0, 5.0).to_numpy(dtype=np.float64)
+
+    rv60 = ret.rolling(60, min_periods=10).std().fillna(0.0)
+    out["pa_rv_term_slope"] = (rv10 - rv60).to_numpy(dtype=np.float64)
+
+    med = rv20.rolling(60, min_periods=10).median()
+    sig_s = (rv20 > med).astype(np.int64)
+    if len(sig_s) == 0:
+        out["pa_vol_regime_duration"] = np.zeros(len(df_1m), dtype=np.float64)
+    else:
+        first = int(sig_s.iloc[0])
+        ch = sig_s.ne(sig_s.shift(fill_value=first)).cumsum()
+        dur = sig_s.groupby(ch).cumcount() + 1
+        out["pa_vol_regime_duration"] = (dur.astype(np.float64) / 200.0).clip(0.0, 1.0).to_numpy()
+
+    n_exp = max(3, int(os.environ.get("PA_REALIZED_VS_EXPECTED_BARS", "10")))
+    past_rng = (h - l).rolling(n_exp, min_periods=1).sum()
+    atr_n = bar_rng.rolling(n_exp, min_periods=1).mean() * float(n_exp)
+    out["pa_realized_vs_expected"] = (past_rng / (atr_n + 1e-8)).fillna(0.0).clip(0.0, 10.0).to_numpy(dtype=np.float64)
+
+    vm = v.rolling(60, min_periods=10).mean()
+    vs = v.rolling(60, min_periods=10).std().replace(0.0, np.nan)
+    out["pa_volume_zscore"] = ((v - vm) / (vs + 1e-8)).fillna(0.0).clip(-6.0, 6.0).to_numpy(dtype=np.float64)
+
+    c_roll = ret.rolling(20, min_periods=5).corr(v).fillna(0.0)
+    out["pa_volume_price_corr"] = c_roll.diff(5).fillna(0.0).clip(-2.0, 2.0).to_numpy(dtype=np.float64)
+
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────
 # 18. Intraday Time Structure Features
 # ─────────────────────────────────────────────────────────────────
@@ -3266,59 +3171,18 @@ def _pa_merged_htf_from_bars(
     if variant not in ("full", "structure"):
         raise ValueError(f"variant must be 'full' or 'structure', got {variant!r}")
     direction_htf = _derive_direction_5m(bars_htf)
-    ema20_htf = _ema(bars_htf["close"], 20)
 
-    bar_class = _classify_bars_5m(bars_htf, atr_htf)
     pullback = _pullback_counting_5m(bars_htf, direction_htf)
-    mag = _mag_bar_5m(bars_htf, ema20_htf)
-    inside = _inside_bars_5m(bars_htf)
     regime_raw = _market_regime_5m(bars_htf)
     twenty = _twenty_bar_rule_5m(bars_htf, direction_htf)
     pressure = _pressure_score_5m(bars_htf)
-    gaps = _gap_detection_5m(bars_htf, direction_htf)
-    signal_scores = _signal_bar_scoring_5m(bars_htf)
-    outside_eng = _outside_engulfing_5m(bars_htf)
-    climax = _climax_detection_5m(bars_htf)
-    momentum = _momentum_accel_5m(bars_htf)
-    gap_enh = _gap_enhanced_5m(bars_htf, direction_htf)
-    session = _day_session_phase(bars_htf)
-    vol_bo = _volume_breakout_5m(bars_htf)
-    prev_day = _prev_day_context(bars_htf)
-    open_pat = _opening_patterns(bars_htf)
 
     regime = regime_raw.copy()
     for c in twenty.columns:
         if c != "time_key":
             regime[c] = twenty[c].values
 
-    final_flag = _final_flag_5m(bars_htf, regime, inside)
-    channel_z = _channel_zones_5m(bars_htf, regime)
-    endless_pb = _endless_pullback_5m(bars_htf, direction_htf)
-    cycle = _market_cycle_5m(regime)
-    tr_mm = _tr_measured_move_5m(bars_htf, regime)
-    vol_climax = _volume_climax_exhaustion_5m(bars_htf, regime)
-
     swing_highs_5, swing_lows_5 = _causal_swings(bars_htf, 5)
-    swing_highs_3, swing_lows_3 = _causal_swings(bars_htf, 3)
-
-    stops = _causal_pa_stops(bars_htf, swing_highs=swing_highs_5, swing_lows=swing_lows_5)
-    sr = _causal_support_resistance(bars_htf, atr_htf, swing_highs=swing_highs_5, swing_lows=swing_lows_5)
-    mm = _causal_measured_move(bars_htf, swing_highs=swing_highs_5, swing_lows=swing_lows_5)
-    bo_strength = _causal_breakout_strength(bars_htf, regime)
-    trail_mom = _causal_trailing_momentum(bars_htf)
-    double_tb = _causal_double_top_bottom(
-        bars_htf, direction_htf, atr_htf, swing_highs=swing_highs_5, swing_lows=swing_lows_5
-    )
-    adv_triggers = _causal_advanced_triggers(
-        bars_htf, regime, mag, swing_highs=swing_highs_3, swing_lows=swing_lows_3
-    )
-    tbtl = _causal_tbtl(bars_htf, swing_highs=swing_highs_3, swing_lows=swing_lows_3)
-    triangle = _causal_triangle(bars_htf, swing_highs=swing_highs_3, swing_lows=swing_lows_3)
-    hs = _causal_head_shoulders(bars_htf, swing_highs=swing_highs_5, swing_lows=swing_lows_5)
-    para_wedge = _causal_parabolic_wedge(bars_htf, swing_highs=swing_highs_3, swing_lows=swing_lows_3)
-
-    mtr = _mtr_detection_5m(bars_htf, regime, pressure, double_tb)
-    ct_quality = _counter_trend_quality_5m(bars_htf, regime, signal_scores)
 
     struct_feats = _structure_features(bars_htf, atr_htf, swing_highs=swing_highs_5, swing_lows=swing_lows_5)
     ma_feats = _ma_relationship_features(bars_htf, atr_htf)
@@ -3398,6 +3262,14 @@ def _add_pa_features_multi_tf(
         micro = _mtf_micro_1m_features(result)
         micro_only = [c for c in micro.columns if c != "time_key"]
         result = pd.concat([result, micro[micro_only]], axis=1)
+        rv_1m = _realized_volatility_features(result[["time_key", "open", "high", "low", "close", "volume"]])
+        tmp_rv = pd.concat(
+            [result.reset_index(drop=True), rv_1m.drop(columns=["time_key"], errors="ignore")],
+            axis=1,
+        )
+        sd = _straddle_focused_features(tmp_rv)
+        sd_only = [c for c in sd.columns if c != "time_key"]
+        result = pd.concat([result, sd[sd_only]], axis=1)
 
     for tf in tf_list:
         if tf == "1min":
@@ -3469,7 +3341,7 @@ def add_pa_features(
     pbar = None
     if _show_pa_bar and _tqdm_pa is not None:
         pbar = _tqdm_pa(
-            total=9,
+            total=8,
             desc="PA add_pa_features",
             unit="stage",
             leave=False,
@@ -3504,119 +3376,23 @@ def add_pa_features(
         atr_pa = rng_pa.ewm(span=14, min_periods=5).mean()
 
         direction_pa = _derive_direction_5m(bars_pa)
-        ema20_pa = _ema(bars_pa["close"], 20)
         _tick()
 
-        # ── Clean features (imported from pa_rules.py) ──
-        bar_class = _classify_bars_5m(bars_pa, atr_pa)
         pullback = _pullback_counting_5m(bars_pa, direction_pa)
-        mag = _mag_bar_5m(bars_pa, ema20_pa)
-        inside = _inside_bars_5m(bars_pa)
         regime_raw = _market_regime_5m(bars_pa)
         twenty = _twenty_bar_rule_5m(bars_pa, direction_pa)
         pressure = _pressure_score_5m(bars_pa)
-        gaps = _gap_detection_5m(bars_pa, direction_pa)
-        signal_scores = _signal_bar_scoring_5m(bars_pa)
-        outside_eng = _outside_engulfing_5m(bars_pa)
-        climax = _climax_detection_5m(bars_pa)
-        momentum = _momentum_accel_5m(bars_pa)
-        gap_enh = _gap_enhanced_5m(bars_pa, direction_pa)
-        session = _day_session_phase(bars_pa)
-        vol_bo = _volume_breakout_5m(bars_pa)
-        prev_day = _prev_day_context(bars_pa)
-        open_pat = _opening_patterns(bars_pa)
         _tick()
 
-        # Build combined regime (regime_raw + twenty) for downstream consumers
         regime = regime_raw.copy()
         for c in twenty.columns:
             if c != "time_key":
                 regime[c] = twenty[c].values
 
-        final_flag = _final_flag_5m(bars_pa, regime, inside)
-        channel_z = _channel_zones_5m(bars_pa, regime)
-        endless_pb = _endless_pullback_5m(bars_pa, direction_pa)
-        cycle = _market_cycle_5m(regime)
-        tr_mm = _tr_measured_move_5m(bars_pa, regime)
-        vol_climax = _volume_climax_exhaustion_5m(bars_pa, regime)
-        _tick()
-
-        # ── Causal replacements (new implementations) ──
         swing_highs_5, swing_lows_5 = _causal_swings(bars_pa, 5)
-        swing_highs_3, swing_lows_3 = _causal_swings(bars_pa, 3)
-        _causal_specs = [
-            ("stops", lambda: _causal_pa_stops(bars_pa, swing_highs=swing_highs_5, swing_lows=swing_lows_5)),
-            (
-                "support_resistance",
-                lambda: _causal_support_resistance(
-                    bars_pa, atr_pa, swing_highs=swing_highs_5, swing_lows=swing_lows_5
-                ),
-            ),
-            ("measured_move", lambda: _causal_measured_move(bars_pa, swing_highs=swing_highs_5, swing_lows=swing_lows_5)),
-            ("breakout_strength", lambda: _causal_breakout_strength(bars_pa, regime)),
-            ("trailing_momentum", lambda: _causal_trailing_momentum(bars_pa)),
-            (
-                "double_top_bottom",
-                lambda: _causal_double_top_bottom(
-                    bars_pa, direction_pa, atr_pa, swing_highs=swing_highs_5, swing_lows=swing_lows_5
-                ),
-            ),
-            (
-                "advanced_triggers",
-                lambda: _causal_advanced_triggers(
-                    bars_pa, regime, mag, swing_highs=swing_highs_3, swing_lows=swing_lows_3
-                ),
-            ),
-            ("tbtl", lambda: _causal_tbtl(bars_pa, swing_highs=swing_highs_3, swing_lows=swing_lows_3)),
-            ("triangle", lambda: _causal_triangle(bars_pa, swing_highs=swing_highs_3, swing_lows=swing_lows_3)),
-            ("head_shoulders", lambda: _causal_head_shoulders(bars_pa, swing_highs=swing_highs_5, swing_lows=swing_lows_5)),
-            (
-                "parabolic_wedge",
-                lambda: _causal_parabolic_wedge(bars_pa, swing_highs=swing_highs_3, swing_lows=swing_lows_3),
-            ),
-        ]
-        _causal_pbar = None
-        if _show_pa_bar and _tqdm_pa is not None:
-            _causal_pbar = _tqdm_pa(
-                total=len(_causal_specs),
-                desc="PA5/9 causal",
-                unit="step",
-                leave=False,
-                position=1,
-                file=_tqdm_file,
-                mininterval=0.15,
-                dynamic_ncols=True,
-            )
-        try:
-            _causal_out = {}
-            for _lbl, _fn in _causal_specs:
-                if _causal_pbar is not None:
-                    _causal_pbar.set_postfix_str(_lbl[:24], refresh=False)
-                _causal_out[_lbl] = _fn()
-                if _causal_pbar is not None:
-                    _causal_pbar.update(1)
-        finally:
-            if _causal_pbar is not None:
-                _causal_pbar.close()
-
-        stops = _causal_out["stops"]
-        sr = _causal_out["support_resistance"]
-        mm = _causal_out["measured_move"]
-        bo_strength = _causal_out["breakout_strength"]
-        trail_mom = _causal_out["trailing_momentum"]
-        double_tb = _causal_out["double_top_bottom"]
-        adv_triggers = _causal_out["advanced_triggers"]
-        tbtl = _causal_out["tbtl"]
-        triangle = _causal_out["triangle"]
-        hs = _causal_out["head_shoulders"]
-        para_wedge = _causal_out["parabolic_wedge"]
         _tick()
 
-        # These depend on clean + causal features
-        mtr = _mtr_detection_5m(bars_pa, regime, pressure, double_tb)
-        ct_quality = _counter_trend_quality_5m(bars_pa, regime, signal_scores)
-
-        # ── New feature groups (v2) ──
+        # ── Feature groups merged into training frame ──
         struct_feats = _structure_features(
             bars_pa, atr_pa, swing_highs=swing_highs_5, swing_lows=swing_lows_5
         )
@@ -3627,6 +3403,11 @@ def add_pa_features(
 
         # ── Compute 1m specific features directly on result ──
         realized_vol_feats = _realized_volatility_features(result)
+        _tmp_rv = pd.concat(
+            [result.reset_index(drop=True), realized_vol_feats.drop(columns=["time_key"], errors="ignore")],
+            axis=1,
+        )
+        straddle_feats = _straddle_focused_features(_tmp_rv)
         intraday_time_feats = _intraday_time_features(result)
         realized_moments_feats = _realized_moments_features(result)
         vol_microstructure_feats = _volume_microstructure_features(result)
@@ -3653,6 +3434,7 @@ def add_pa_features(
 
         new_1m_parts = [
             realized_vol_feats.drop(columns=["time_key"], errors="ignore"),
+            straddle_feats.drop(columns=["time_key"], errors="ignore"),
             intraday_time_feats.drop(columns=["time_key"], errors="ignore"),
             realized_moments_feats.drop(columns=["time_key"], errors="ignore"),
             vol_microstructure_feats.drop(columns=["time_key"], errors="ignore"),

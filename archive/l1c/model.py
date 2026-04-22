@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from core.trainers.l1c.config import L1cConfig
+from archive.l1c.config import L1cConfig
 
 
 class TemporalPositionEncoding(nn.Module):

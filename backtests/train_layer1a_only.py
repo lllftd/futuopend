@@ -1,4 +1,9 @@
-"""Train L1a only (then refresh l1a_outputs.pkl from checkpoint). Run: PYTHONPATH=. python3 backtests/train_layer1a_only.py"""
+"""Train L1a only (then refresh l1a_outputs.pkl from checkpoint).
+
+Run: PYTHONPATH=. python3 backtests/train_layer1a_only.py
+Or use ./scripts/run_layer1a_gpu_fresh.sh — optional L1A_FAST=1 sets 2 L1a-only OOF segments + skip heavy cal
+metrics + OOF warmstart + larger materialize batches (see script header). TORCH_DEVICE=mps on Apple Silicon.
+"""
 from __future__ import annotations
 
 import os
@@ -15,6 +20,8 @@ from core.trainers.lgbm_utils import configure_training_runtime
 
 
 def main() -> None:
+    # Progress bars in Cursor / tee / logs: tqdm otherwise disables on non-TTY unless forced.
+    os.environ.setdefault("FORCE_TQDM", "1")
     configure_training_runtime()
     try:
         inter = torch.get_num_interop_threads()

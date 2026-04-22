@@ -5,10 +5,6 @@ from __future__ import annotations
 from core.trainers.l3.l3_env import env_bool, env_float, env_int, env_str
 
 
-def min_train_samples() -> int:
-    return env_int("L3_MIN_TRAIN_SAMPLES", 10, lo=2, hi=10_000_000)
-
-
 def calib_min_rows() -> int:
     return env_int("L3_CALIB_MIN_ROWS", 100, lo=10, hi=500_000)
 

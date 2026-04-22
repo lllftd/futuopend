@@ -11,9 +11,22 @@ from core import indicators as indicators_module
 from core import pa_rules as pa_rules_module
 from core.indicators import atr as compute_atr
 from core.pa_rules import add_pa_features
-from core.trainers.constants import PA_TIMEFRAMES_RAW
+from core.trainers.constants import LABELED_SUFFIX, PA_TIMEFRAMES_RAW
 
 PA_FEATURE_CACHE_SCHEMA = 2
+
+
+def _resolve_symbol_ohlc_csv(data_dir: str, symbol: str) -> str:
+    """Prefer raw ``{symbol}.csv``; else ``{symbol}{LABELED_SUFFIX}.csv`` (OHLC + labels)."""
+    raw = os.path.join(data_dir, f"{symbol}.csv")
+    if os.path.isfile(raw):
+        return raw
+    labeled = os.path.join(data_dir, f"{symbol}{LABELED_SUFFIX}.csv")
+    if os.path.isfile(labeled):
+        return labeled
+    raise FileNotFoundError(
+        f"Missing OHLC source for {symbol}: tried {raw} and {labeled}"
+    )
 
 
 def _pa_cache_dir(data_dir: str) -> str:
@@ -49,7 +62,7 @@ def load_or_build_pa_features(
     *,
     timeframe: str = "1min",
 ) -> pd.DataFrame:
-    raw_path = os.path.join(data_dir, f"{symbol}.csv")
+    raw_path = _resolve_symbol_ohlc_csv(data_dir, symbol)
     cache_path = _pa_cache_path(symbol, data_dir, timeframe)
     expected_meta = _pa_cache_meta(raw_path, timeframe)
 

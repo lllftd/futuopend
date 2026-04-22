@@ -50,6 +50,12 @@ def _load_labels(symbol: str) -> pd.DataFrame:
     optional_cols = [
         "decision_mfe_atr", "decision_mae_atr", "decision_peak_bar",
         "decision_theta_decay", "decision_net_edge_atr",
+        "decision_forward_range_atr",
+        "decision_forward_range_10_atr",
+        "decision_forward_range_15_atr",
+        "decision_forward_range_20_atr",
+        "decision_forward_range_30_atr",
+        "decision_range_ttp90_norm_30",
         "optimal_tp_atr", "optimal_sl_atr", "optimal_exit_bar", "optimal_net_edge_atr",
     ]
     path = os.path.join(DATA_DIR, f"{symbol}{LABELED_SUFFIX}.csv")
@@ -64,6 +70,11 @@ def _merge_pa_labels_for_symbol(symbol: str) -> pd.DataFrame:
     """Picklable worker: PA + labels merge (parallel per symbol via ProcessPoolExecutor)."""
     pa = _load_and_compute_pa(symbol)
     lbl = _load_labels(symbol)
+    # When PA is built from *_labeled_v2.csv, `pa` carries label columns too; merge would
+    # produce market_state_x / market_state_y and drop bare `market_state`.
+    overlap = (set(pa.columns) & set(lbl.columns)) - {"time_key"}
+    if overlap:
+        pa = pa.drop(columns=sorted(overlap), errors="ignore")
     merged = pd.merge(pa, lbl, on="time_key", how="inner")
     merged["symbol"] = symbol
     print(f"  [{symbol}] Merged {len(merged):,} rows", flush=True)
@@ -1009,10 +1020,10 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
 
     print("\n  === market_state distribution (from labels CSV, merged rows) ===")
     ms_num = pd.to_numeric(df["market_state"], errors="coerce")
-    for lbl_id in range(NUM_REGIME_CLASSES):
+    for lbl_id in range(HMM_NUM_CLASSES):
         cnt = int((ms_num == lbl_id).sum())
         pct = cnt / len(df) * 100
-        print(f"    {lbl_id} ({STATE_NAMES[lbl_id]:>13s}): {cnt:>9,}  ({pct:.1f}%)")
+        print(f"    {lbl_id} ({MARKET_STATE_NAMES[lbl_id]:>13s}): {cnt:>9,}  ({pct:.1f}%)")
     n_ms_nan = int(ms_num.isna().sum())
     if n_ms_nan:
         print(f"    NaN market_state rows: {n_ms_nan:,}")
@@ -1030,7 +1041,7 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     n_fill_b = 0
 
     if n_missing0:
-        prob_cols = [f"pa_hmm_prob_{STATE_NAMES[i]}" for i in range(NUM_REGIME_CLASSES)]
+        prob_cols = [f"pa_hmm_prob_{MARKET_STATE_NAMES[i]}" for i in range(HMM_NUM_CLASSES)]
         has_probs = all(c in df.columns for c in prob_cols)
         if has_probs:
             probs = df[prob_cols].apply(pd.to_numeric, errors="coerce")
@@ -1055,20 +1066,20 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
                 continue
 
             # Estimate per-symbol transition matrix with Laplace smoothing.
-            trans = np.ones((NUM_REGIME_CLASSES, NUM_REGIME_CLASSES), dtype=np.float64)
+            trans = np.ones((HMM_NUM_CLASSES, HMM_NUM_CLASSES), dtype=np.float64)
             if known.sum() >= 2:
                 prev_k = np.where(known[:-1] & known[1:])[0]
                 for p in prev_k:
                     a = int(arr[p])
                     b = int(arr[p + 1])
-                    if 0 <= a < NUM_REGIME_CLASSES and 0 <= b < NUM_REGIME_CLASSES:
+                    if 0 <= a < HMM_NUM_CLASSES and 0 <= b < HMM_NUM_CLASSES:
                         trans[a, b] += 1.0
             trans /= np.clip(trans.sum(axis=1, keepdims=True), 1e-12, np.inf)
 
             # Symbol prior from known labels.
-            prior = np.ones(NUM_REGIME_CLASSES, dtype=np.float64)
+            prior = np.ones(HMM_NUM_CLASSES, dtype=np.float64)
             known_vals = arr[known].astype(np.int64, copy=False)
-            prior_counts = np.bincount(known_vals, minlength=NUM_REGIME_CLASSES).astype(np.float64)
+            prior_counts = np.bincount(known_vals, minlength=HMM_NUM_CLASSES).astype(np.float64)
             prior += prior_counts
             prior /= np.clip(prior.sum(), 1e-12, np.inf)
 
@@ -1106,7 +1117,7 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
             f"{int(missing2.sum())}. Sample:\n{bad.to_string(index=False)}"
         )
 
-    df["state_label"] = state_raw.astype(np.int64).clip(0, NUM_REGIME_CLASSES - 1)
+    df["state_label"] = state_raw.astype(np.int64).clip(0, HMM_NUM_CLASSES - 1)
     if n_missing0:
         print(
             f"  state_label A+B impute: missing={n_missing0:,}  A(posterior)={n_fill_a:,}  B(markov)={n_fill_b:,}",
@@ -1114,13 +1125,14 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
         )
 
     feat_cols = _pa_feature_cols(df)
+    _excl = frozenset(PA_FEATURES_EXCLUDE_FROM_LGBM)
+    feat_cols = [c for c in feat_cols if c not in _excl]
     if prep_needs_tcn_derivatives(prep_targets):
         df = _compute_tcn_derived_features(df, feat_cols)
         feat_cols = _unique_cols(feat_cols + _tcn_derived_feature_names())
     else:
         print(
-            "  [prep] TCN-derived features skipped (layer targets omit l1c). "
-            "Do not use this cache for L1c unless you set PREPARED_DATASET_LAYER_TARGETS to include l1c.",
+            "  [prep] TCN-derived features skipped (add `tcn` or legacy `l1c` to PREPARED_DATASET_LAYER_TARGETS to enable).",
             flush=True,
         )
 
@@ -1131,7 +1143,10 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     if not enable_experimental_mamba:
         print("  Mamba-derived features skipped (experimental module; set ENABLE_EXPERIMENTAL_MAMBA=1 to enable).", flush=True)
     elif not prep_needs_mamba(prep_targets):
-        print("  Mamba-derived features skipped (PREPARED_DATASET_LAYER_TARGETS has no l1c).", flush=True)
+        print(
+            "  Mamba-derived features skipped (set targets to include `mamba` or legacy `l1c`, and ENABLE_EXPERIMENTAL_MAMBA=1).",
+            flush=True,
+        )
     elif disable_mamba:
         print("  Mamba-derived features skipped (DISABLE_MAMBA_FEATURES=1).", flush=True)
     elif os.path.exists(mamba_ckpt):
@@ -1142,7 +1157,10 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
 
     df = ensure_breakout_features(df)
     df = ensure_structure_context_features(df)
-    feat_cols = _unique_cols(feat_cols + list(BO_FEAT_COLS) + list(PA_CTX_FEATURES))
+    feat_cols = _unique_cols(
+        feat_cols + list(BO_FEAT_COLS) + list(PA_CTX_FEATURES) + list(PA_STRADDLE_FEATURES)
+    )
+    feat_cols = [c for c in feat_cols if c not in _excl]
 
     base_feats, hmm_feats, garch_feats, hsmm_feats, egarch_feats, tcn_feats, mamba_feats = _split_feature_groups(feat_cols)
     print(f"\n  Feature columns: {len(feat_cols)}")
@@ -1162,11 +1180,24 @@ def prepare_dataset(symbols: list[str] = ["QQQ", "SPY"]):
     print(f"    Test:        {CAL_END} → {TEST_END}  ({((df['time_key'] >= CAL_END) & (df['time_key'] < TEST_END)).sum():>9,} rows)")
     print(f"    Holdout:     >= {TEST_END}  ({(df['time_key'] >= TEST_END).sum():>9,} rows)  (not used in this run)")
 
-    print(f"\n  Regime supervision label distribution — state_label (= current market_state):")
-    for lbl_id, name in STATE_NAMES.items():
+    print(f"\n  Regime supervision label distribution — state_label (HMM / smoothed market_state, 6-class):")
+    for lbl_id in range(HMM_NUM_CLASSES):
+        name = MARKET_STATE_NAMES[lbl_id]
         cnt = (df["state_label"] == lbl_id).sum()
         pct = cnt / len(df) * 100
         print(f"    {lbl_id} ({name:>13s}): {cnt:>9,}  ({pct:.1f}%)")
+
+    from core.trainers.vol_regime_labels import compute_vol_regime_labels
+    from core.trainers.straddle_edge_labels import compute_straddle_edge_labels
+
+    df["vol_regime_label"] = compute_vol_regime_labels(df).astype(np.int64)
+    df["l1a_straddle_edge_target"] = compute_straddle_edge_labels(df).astype(np.float64)
+    print("\n  === vol_regime_label (L1a 5-class vol lifecycle) ===")
+    for lbl_id in range(NUM_REGIME_CLASSES):
+        name = REGIME_NOW_PROB_COLS[lbl_id]
+        cnt = int((df["vol_regime_label"] == lbl_id).sum())
+        pct = cnt / len(df) * 100
+        print(f"    {lbl_id} ({name:>16s}): {cnt:>9,}  ({pct:.1f}%)")
 
     if os.environ.get("PREP_SAVE_FINGERPRINT", "1").strip().lower() not in {"0", "false", "no", "off"}:
         fp_stats, fp_n = compute_train_window_stats(df, feat_cols, train_end=TRAIN_END)

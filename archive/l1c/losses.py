@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from core.trainers.l1c.config import L1cConfig
+from archive.l1c.config import L1cConfig
 
 
 class L1cRegressionLoss(nn.Module):

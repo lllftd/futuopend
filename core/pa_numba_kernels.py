@@ -428,6 +428,3 @@ def _causal_support_resistance_core_py(
 
     return nearest_resist, nearest_support, sr_position, retrace_50, at_50_retrace, round_num_dist
 
-
-NUMBA_AVAILABLE: bool = _HAVE_NUMBA
-

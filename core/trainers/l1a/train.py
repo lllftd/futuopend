@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import pickle
@@ -32,7 +33,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, Subset, TensorDataset
 from tqdm.auto import trange, tqdm
 
-from core.tcn_pa_state import FocalLoss, L1AGatedTemporalBlock, TemporalAttentionReadout
+from core.tcn_pa_state import L1AGatedTemporalBlock, TemporalAttentionReadout
 from core.trainers.feature_registry import (
     L1A_EXTRA_EXCLUDE_PREFIXES,
     l1_ctx_stagger_enabled,
@@ -50,10 +51,13 @@ from core.trainers.constants import (
     MODEL_DIR,
     NUM_REGIME_CLASSES,
     REGIME_NOW_PROB_COLS,
+    l1a_straddle_edge_head_enabled,
+    l1a_time_in_regime_head_enabled,
+    l1a_vol_trend_head_enabled,
 )
 
 from core.trainers.data_prep import _create_tcn_windows
-from core.trainers.lgbm_utils import _lgb_round_tqdm_enabled, _lgbm_n_jobs, _options_target_config, _tqdm_stream
+from core.trainers.lgbm_utils import _lgbm_n_jobs, _options_target_config, _tqdm_stream
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_arrays
 from core.trainers.val_metrics_extra import brier_binary, brier_multiclass, ece_binary, ece_multiclass_maxprob, pearson_corr
 from core.trainers.stack_v2_common import (
@@ -62,6 +66,7 @@ from core.trainers.stack_v2_common import (
     l1_expanding_oof_window_folds,
     l1_oof_folds_from_env,
     l1_oof_mode_from_env,
+    l1a_expand_oof_val_windows_from_env,
     l2_val_start_time,
     log_label_baseline,
     save_output_cache,
@@ -69,7 +74,12 @@ from core.trainers.stack_v2_common import (
     time_blocked_fold_masks,
 )
 from core.trainers.threshold_registry import attach_threshold_registry, threshold_entry
-from core.trainers.tcn_constants import DEVICE, SEQ_LEN
+from core.trainers.tcn_constants import DEVICE, SEQ_LEN as _TCN_SEQ_LEN_DEFAULT
+
+
+def _l1a_seq_len() -> int:
+    """Bars per sequence for L1a; set ``L1A_SEQ_LEN`` to slim without changing global ``TCN_SEQ_LEN``."""
+    return max(20, int(os.environ.get("L1A_SEQ_LEN", os.environ.get("TCN_SEQ_LEN", str(_TCN_SEQ_LEN_DEFAULT)))))
 
 
 @dataclass(frozen=True)
@@ -135,27 +145,28 @@ def _l1a_nb(device: torch.device) -> bool:
 
 
 def _l1a_progress_tqdm_enabled() -> bool:
-    """Batch/epoch tqdm for L1a. When stdout is not a TTY (Cursor, nohup, tee), still show bars unless disabled (see FORCE_TQDM)."""
+    """Epoch / fold / materialize tqdm for L1a. Independent of LightGBM TTY rules; logs to ``_tqdm_stream()`` (stderr by default)."""
     if os.environ.get("DISABLE_TQDM", "").strip().lower() in {"1", "true", "yes"}:
         return False
     if os.environ.get("L1A_DISABLE_TQDM", "").strip().lower() in {"1", "true", "yes"}:
         return False
-    if _lgb_round_tqdm_enabled():
-        return True
     raw = (os.environ.get("L1A_PROGRESS_TQDM", "1") or "1").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 
 def _l1a_batch_progress_enabled() -> bool:
-    """Train/val *per-batch* tqdm. Off by default: nested with OOF+epoch bars fights for one terminal row in Cursor."""
+    """Train/val per-batch tqdm (nested under epoch bar). Default off for speed; set L1A_TQDM_BATCH=1 to enable."""
     if not _l1a_progress_tqdm_enabled():
         return False
     raw = (os.environ.get("L1A_TQDM_BATCH", "0") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _bounded_scalar_cols() -> list[str]:
-    return ["l1a_transition_risk", "l1a_state_persistence"]
+    cols = ["l1a_transition_risk", "l1a_state_persistence"]
+    if l1a_straddle_edge_head_enabled():
+        cols.append("l1a_straddle_edge")
+    return cols
 
 
 def _l1a_embed_dim() -> int:
@@ -164,15 +175,18 @@ def _l1a_embed_dim() -> int:
 
 def l1a_output_columns_with_embed_dim(embed_dim: int) -> list[str]:
     d = max(4, int(embed_dim))
+    mid = [
+        "l1a_transition_risk",
+        "l1a_vol_forecast",
+        "l1a_vol_trend",
+        "l1a_time_in_regime",
+        "l1a_state_persistence",
+    ]
+    if l1a_straddle_edge_head_enabled():
+        mid.append("l1a_straddle_edge")
     return (
         list(L1A_REGIME_COLS)
-        + [
-            "l1a_transition_risk",
-            "l1a_vol_forecast",
-            "l1a_vol_trend",
-            "l1a_time_in_regime",
-            "l1a_state_persistence",
-        ]
+        + mid
         + [f"l1a_market_embed_{idx}" for idx in range(d)]
         + ["l1a_is_warm"]
     )
@@ -202,12 +216,47 @@ def _l1a_dataloader_workers(default: int) -> int:
     return max(0, min(workers, cap))
 
 
+def _l1a_configure_torch_backends(device: torch.device) -> None:
+    """Matmul precision + cuDNN benchmark (fixed conv shapes) — code-level throughput defaults."""
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    if device.type == "cuda":
+        if os.environ.get("L1A_CUDNN_BENCHMARK", "1").strip().lower() in {"0", "false", "no"}:
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.benchmark = True
+
+
+def _l1a_adamw_kwargs(device: torch.device) -> dict[str, Any]:
+    """Fused (CUDA) or multi-tensor foreach AdamW when supported; disable via L1A_ADAMW_FUSED=0 / L1A_ADAMW_FOREACH=0."""
+    kw: dict[str, Any] = {}
+    try:
+        params = inspect.signature(torch.optim.AdamW.__init__).parameters
+    except (ValueError, TypeError):
+        return kw
+    fused_on = (
+        device.type == "cuda"
+        and "fused" in params
+        and os.environ.get("L1A_ADAMW_FUSED", "1").strip().lower() not in {"0", "false", "no"}
+    )
+    if fused_on:
+        kw["fused"] = True
+    elif (
+        "foreach" in params
+        and os.environ.get("L1A_ADAMW_FOREACH", "1").strip().lower() not in {"0", "false", "no"}
+    ):
+        kw["foreach"] = True
+    return kw
+
+
 def _l1a_tcn_channels() -> list[int]:
     raw = os.environ.get("L1A_TCN_CHANNELS", "").strip()
     if raw:
         return [int(x.strip()) for x in raw.split(",") if x.strip()]
-    # Wider final map: aligns with load_l1a fallback [64,64,128]; use L1A_TCN_CHANNELS to slim.
-    return [64, 64, 128]
+    # Default 5 blocks → larger receptive field (dilations 1,2,4,8,16). Override: L1A_TCN_CHANNELS=64,64,64,128,128
+    return [64, 64, 64, 128, 128]
 
 
 def _l1a_tcn_kernel_size() -> int:
@@ -236,28 +285,6 @@ def _l1a_head_dropout() -> float:
     return float(os.environ.get("L1A_HEAD_DROPOUT", "0.3"))
 
 
-def _l1a_loss_weights() -> dict[str, float]:
-    embed = float(os.environ.get("L1A_EMBED_RECON_WEIGHT", "0.10"))
-    transition = float(os.environ.get("L1A_TRANSITION_WEIGHT", "0.10"))
-    vol = float(os.environ.get("L1A_VOL_WEIGHT", "0.25"))
-    regime = float(os.environ.get("L1A_REGIME_WEIGHT", "0.36"))
-    vol_trend = float(os.environ.get("L1A_VOL_TREND_WEIGHT", "0.07"))
-    time_ir = float(os.environ.get("L1A_TIME_IN_REGIME_WEIGHT", "0.12"))
-    total = max(regime + vol + transition + embed + vol_trend + time_ir, 1e-8)
-    return {
-        "regime": regime / total,
-        "vol": vol / total,
-        "transition": transition / total,
-        "embed_recon": embed / total,
-        "vol_trend": vol_trend / total,
-        "time_in_regime": time_ir / total,
-    }
-
-
-def _l1a_use_uncertainty_weighting() -> bool:
-    return os.environ.get("L1A_USE_UNCERTAINTY_WEIGHTING", "0").strip().lower() in {"1", "true", "yes"}
-
-
 def _l1a_uw_val_metric() -> str:
     raw = (os.environ.get("L1A_UW_VAL_METRIC", "geom") or "geom").strip().lower()
     if raw in {"geom", "uw_total", "legacy"}:
@@ -270,6 +297,7 @@ def _l1a_uw_lr_ratio() -> float:
 
 
 def _l1a_regime_aux_coef() -> float:
+    """Scales the hierarchical aux term: 5→2 low/high-vol CE on ``base_regime_logits`` (not full 5-way focal)."""
     return float(os.environ.get("L1A_REGIME_AUX_COEF", os.environ.get("L1A_REGIME_AUX_WEIGHT", "0.20")))
 
 
@@ -282,42 +310,61 @@ def _l1a_transition_persist_coef() -> float:
     )
 
 
-def _l1a_uw_init_log_vars(loss_weights: dict[str, float]) -> dict[str, float]:
-    """Match initial precision ~ manual loss_weights (Kendall log(σ²) init)."""
-    if not os.environ.get("L1A_UW_INIT_FROM_WEIGHTS", "1").strip().lower() in {"0", "false", "no"}:
-        pri = {
-            "regime": float(loss_weights["regime"]),
-            "transition": float(loss_weights["transition"]),
-            "volatility": float(loss_weights["vol"] + loss_weights["vol_trend"] + loss_weights["time_in_regime"]),
-            "embedding": float(loss_weights["embed_recon"]),
-        }
-        return {k: math.log(1.0 / max(v, 1e-8)) for k, v in pri.items()}
-    return {name: 0.0 for name in L1aMultiTaskUncertaintyWeights.TASK_ORDER}
-
-
 class L1aMultiTaskUncertaintyWeights(nn.Module):
-    """Kendall et al. homoscedastic uncertainty weighting (multi-task)."""
+    """Kendall et al. (2018) homoscedastic uncertainty weighting — one log-variance per L1a task."""
 
+    # cls: CE/BCE-scale losses use L/(2σ²)+log σ  →  exp(-log_var)*L + 0.5*log_var with log_var=log(σ²)
+    # reg: MSE-scale uses 1/(2σ²)*L + log σ  →  0.5*exp(-log_var)*L + 0.5*log_var
     TASK_TYPES: dict[str, str] = {
         "regime": "cls",
+        "regime_aux": "cls",
         "transition": "cls",
-        "volatility": "reg",
-        "embedding": "reg",
+        "vol": "reg",
+        "vol_trend": "reg",
+        "time_in_regime": "reg",
+        "embed_recon": "reg",
+        "straddle_edge": "reg",
     }
-    TASK_ORDER: tuple[str, ...] = ("regime", "transition", "volatility", "embedding")
+
+    @staticmethod
+    def build_task_order(
+        *,
+        straddle_edge: bool,
+        vol_trend_head: bool,
+        time_in_regime_head: bool,
+    ) -> tuple[str, ...]:
+        t: list[str] = [
+            "regime",
+            "regime_aux",
+            "transition",
+            "vol",
+        ]
+        if vol_trend_head:
+            t.append("vol_trend")
+        if time_in_regime_head:
+            t.append("time_in_regime")
+        t.append("embed_recon")
+        if straddle_edge:
+            t.append("straddle_edge")
+        return tuple(t)
 
     def __init__(
         self,
         *,
-        init_log_vars: dict[str, float] | None = None,
         device: torch.device,
+        straddle_edge: bool,
+        vol_trend_head: bool,
+        time_in_regime_head: bool,
     ):
         super().__init__()
-        init_log_vars = init_log_vars or {n: 0.0 for n in self.TASK_ORDER}
+        self.task_order: tuple[str, ...] = self.build_task_order(
+            straddle_edge=straddle_edge,
+            vol_trend_head=vol_trend_head,
+            time_in_regime_head=time_in_regime_head,
+        )
         params: dict[str, nn.Parameter] = {}
-        for name in self.TASK_ORDER:
-            v = float(init_log_vars.get(name, 0.0))
-            params[name] = nn.Parameter(torch.tensor([v], dtype=torch.float32, device=device))
+        for name in self.task_order:
+            params[name] = nn.Parameter(torch.zeros(1, dtype=torch.float32, device=device))
         self.log_vars = nn.ParameterDict(params)
 
     def weighted_loss(self, losses: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
@@ -327,27 +374,56 @@ class L1aMultiTaskUncertaintyWeights(nn.Module):
         dev = next(iter(losses.values())).device
         total = torch.zeros((), device=dev, dtype=torch.float32)
         diag: dict[str, float] = {}
-        for name in self.TASK_ORDER:
+        for name in self.task_order:
             if name not in losses:
                 continue
             log_var = self.log_vars[name].view(())
             raw = losses[name]
             prec = torch.exp(-log_var)
-            if self.TASK_TYPES[name] == "reg":
+            kind = self.TASK_TYPES[name]
+            if kind == "reg":
                 weighted = 0.5 * prec * raw + 0.5 * log_var
             else:
                 weighted = prec * raw + 0.5 * log_var
             total = total + weighted
             diag[f"uw_{name}_log_var"] = float(log_var.detach().item())
-            diag[f"uw_{name}_eff_weight"] = float(prec.detach().item())
+            diag[f"uw_{name}_precision"] = float(prec.detach().item())
+            diag[f"uw_{name}_sigma2"] = float(torch.exp(log_var).detach().item())
             diag[f"uw_{name}_raw"] = float(raw.detach().item())
             diag[f"uw_{name}_weighted"] = float(weighted.detach().item())
         return total, diag
 
 
-def _l1a_build_uw_module(device: torch.device, loss_weights: dict[str, float]) -> L1aMultiTaskUncertaintyWeights:
-    init = _l1a_uw_init_log_vars(loss_weights)
-    return L1aMultiTaskUncertaintyWeights(init_log_vars=init, device=device).to(device)
+def _l1a_build_uw_module(device: torch.device) -> L1aMultiTaskUncertaintyWeights:
+    return L1aMultiTaskUncertaintyWeights(
+        device=device,
+        straddle_edge=l1a_straddle_edge_head_enabled(),
+        vol_trend_head=l1a_vol_trend_head_enabled(),
+        time_in_regime_head=l1a_time_in_regime_head_enabled(),
+    ).to(device)
+
+
+def _l1a_forward_decoder_kw(
+    model: L1AMarketTCN,
+    y_vol_trend: torch.Tensor,
+    y_time_ir: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """When auxiliary heads are disabled, feed decoder from targets (train/val) or statics (materialize)."""
+    kw: dict[str, torch.Tensor] = {}
+    if model.vol_trend_head is None:
+        kw["decoder_vol_trend"] = y_vol_trend
+    if model.time_in_regime_head is None:
+        kw["decoder_time_in_regime"] = y_time_ir
+    return kw
+
+
+def _l1a_log_uw_auto_weights(uw: L1aMultiTaskUncertaintyWeights, *, prefix: str = "  [L1a]") -> None:
+    """Log σ² and precision exp(-log_var) per task after an epoch."""
+    for name in uw.task_order:
+        lv = float(uw.log_vars[name].detach().item())
+        s2 = float(math.exp(lv))
+        prec = float(math.exp(-lv))
+        print(f"{prefix} uw_task {name:16s}  σ²={s2:.4f}  prec={prec:.4f}", flush=True)
 
 
 def _l1a_optimizer(
@@ -356,14 +432,16 @@ def _l1a_optimizer(
     lr: float,
     wd: float,
 ) -> torch.optim.AdamW:
+    adam_kw = _l1a_adamw_kwargs(DEVICE)
     if uw is None:
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, **adam_kw)
     ratio = _l1a_uw_lr_ratio()
     return torch.optim.AdamW(
         [
             {"params": list(model.parameters()), "lr": lr, "weight_decay": wd},
             {"params": list(uw.parameters()), "lr": lr * ratio, "weight_decay": 0.0},
-        ]
+        ],
+        **adam_kw,
     )
 
 
@@ -383,20 +461,27 @@ def _l1a_regime_loss(
     *,
     device: torch.device,
 ) -> nn.Module:
-    y = np.asarray(regime_train_labels, dtype=np.int64).ravel()
-    counts_raw = np.bincount(y, minlength=NUM_REGIME_CLASSES).astype(np.float32)
-    present = counts_raw > 0
-    weights = np.ones(NUM_REGIME_CLASSES, dtype=np.float32)
-    if present.any():
-        inv = np.zeros(NUM_REGIME_CLASSES, dtype=np.float32)
-        inv[present] = counts_raw[present].sum() / counts_raw[present]
-        mean_inv = max(float(np.mean(inv[present])), 1e-8)
-        weights[present] = inv[present] / mean_inv
-        weights[~present] = 0.0
-    alpha = torch.tensor(weights, dtype=torch.float32, device=device)
-    gamma = float(os.environ.get("L1A_REGIME_FOCAL_GAMMA", "1.5"))
+    _ = regime_train_labels, device  # API stable for call sites; no per-class weights
     ls = float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1"))
-    return FocalLoss(alpha=alpha, gamma=gamma, reduction="mean", label_smoothing=ls)
+    return nn.CrossEntropyLoss(label_smoothing=ls)
+
+
+def _l1a_coarse_vol_regime_aux_loss(regime_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Hierarchical aux on base head: 5-class logits → 2-way low-vol vs high-vol CE.
+
+    Groups (vol lifecycle indices): {0,1} vol_compress + vol_breakout → coarse 0 (low);
+    {2,3,4} vol_trending + vol_exhaust + vol_mean_revert → coarse 1 (high).
+    Straddle-relevant split: long vs short straddle is mostly a low-vol / high-vol call.
+    """
+    coarse_target = (targets >= 2).long()
+    coarse_logits = torch.stack(
+        [
+            regime_logits[:, 0:2].logsumexp(dim=1),
+            regime_logits[:, 2:5].logsumexp(dim=1),
+        ],
+        dim=1,
+    )
+    return F.cross_entropy(coarse_logits, coarse_target)
 
 
 class _BCEFocalWithLogits(nn.Module):
@@ -742,12 +827,14 @@ def _build_l1a_targets(
     high = pd.to_numeric(df["high"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
     low = pd.to_numeric(df["low"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
     symbols = df["symbol"].to_numpy()
+    if "vol_regime_label" in df.columns:
+        vcol = pd.to_numeric(df["vol_regime_label"], errors="coerce")
+    else:
+        from core.trainers.vol_regime_labels import compute_vol_regime_labels
+
+        vcol = compute_vol_regime_labels(df).astype(np.float64)
     state = (
-        pd.to_numeric(df["state_label"], errors="coerce")
-        .groupby(df["symbol"])
-        .transform(lambda s: s.ffill().bfill())
-        .fillna(4.0)
-        .to_numpy(dtype=np.float64)
+        vcol.groupby(df["symbol"]).transform(lambda s: s.ffill().bfill()).fillna(4.0).to_numpy(dtype=np.float64)
     )
     state = np.clip(state, 0, NUM_REGIME_CLASSES - 1).astype(np.int64)
 
@@ -803,14 +890,28 @@ def _build_l1a_targets(
     cap = int(os.environ.get("L1A_TIME_IN_REGIME_CAP", "120"))
     time_in_regime = _time_in_regime_fraction(state, symbols, cap=cap)
 
+    if "l1a_straddle_edge_target" in df.columns:
+        straddle_edge = pd.to_numeric(df["l1a_straddle_edge_target"], errors="coerce").fillna(0.0).to_numpy(
+            dtype=np.float64
+        )
+    elif l1a_straddle_edge_head_enabled():
+        from core.trainers.straddle_edge_labels import compute_straddle_edge_labels
+
+        straddle_edge = compute_straddle_edge_labels(df).to_numpy(dtype=np.float64)
+    else:
+        straddle_edge = np.zeros(len(df), dtype=np.float64)
+    straddle_edge = np.clip(straddle_edge.astype(np.float32), -1.0, 1.0)
+
+    tgt = {
+        "regime": state,
+        "transition_risk": transition_risk.astype(np.float32),
+        "vol_forecast": vol_forecast.astype(np.float32),
+        "vol_trend": vol_trend,
+        "time_in_regime": time_in_regime,
+        "straddle_edge": straddle_edge,
+    }
     return (
-        {
-            "regime": state,
-            "transition_risk": transition_risk.astype(np.float32),
-            "vol_forecast": vol_forecast.astype(np.float32),
-            "vol_trend": vol_trend,
-            "time_in_regime": time_in_regime,
-        },
+        tgt,
         {
             "range_norm": range_meta,
             "vol_trend": vt_meta,
@@ -922,7 +1023,7 @@ class L1AMarketTCN(nn.Module):
         input_dim: int,
         channels: list[int] | None = None,
         *,
-        seq_len: int = SEQ_LEN,
+        seq_len: int | None = None,
         readout_type: str | None = None,
         min_attention_seq_len: int | None = None,
         tcn_kernel_size: int | None = None,
@@ -930,6 +1031,9 @@ class L1AMarketTCN(nn.Module):
         readout_dropout: float | None = None,
         head_dropout: float | None = None,
         embed_dim: int | None = None,
+        use_straddle_edge_head: bool | None = None,
+        use_vol_trend_head: bool | None = None,
+        use_time_in_regime_head: bool | None = None,
     ):
         super().__init__()
         if channels is None:
@@ -950,7 +1054,7 @@ class L1AMarketTCN(nn.Module):
         self.backbone = nn.Sequential(*layers)
         self.tcn_kernel_size = ks
         self.shared_dim = channels[-1]
-        self.seq_len = seq_len
+        self.seq_len = int(seq_len) if seq_len is not None else _l1a_seq_len()
         self.readout_type = (readout_type or _l1a_readout_type()).strip().lower()
         self.min_attention_seq_len = (
             int(min_attention_seq_len) if min_attention_seq_len is not None else _l1a_min_attention_seq_len()
@@ -968,8 +1072,20 @@ class L1AMarketTCN(nn.Module):
         self.base_regime_head = TaskHead(self.shared_dim, hd, NUM_REGIME_CLASSES, activation="identity", dropout=hd_drop)
         self.transition_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
         self.vol_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
-        self.vol_trend_head = TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
-        self.time_in_regime_head = TaskHead(self.shared_dim, hd_small, 1, activation="sigmoid", dropout=hd_drop)
+        if use_vol_trend_head is None:
+            use_vol_trend_head = l1a_vol_trend_head_enabled()
+        if use_time_in_regime_head is None:
+            use_time_in_regime_head = l1a_time_in_regime_head_enabled()
+        self.vol_trend_head = (
+            TaskHead(self.shared_dim, hd_small, 1, activation="identity", dropout=hd_drop)
+            if use_vol_trend_head
+            else None
+        )
+        self.time_in_regime_head = (
+            TaskHead(self.shared_dim, hd_small, 1, activation="sigmoid", dropout=hd_drop)
+            if use_time_in_regime_head
+            else None
+        )
         self.state_structure_decoder = StateStructureDecoder(
             self.shared_dim,
             NUM_REGIME_CLASSES,
@@ -982,6 +1098,17 @@ class L1AMarketTCN(nn.Module):
             nn.GELU(),
             nn.Linear(64, self.shared_dim),
         )
+        if use_straddle_edge_head is None:
+            use_straddle_edge_head = l1a_straddle_edge_head_enabled()
+        self.use_straddle_edge_head = bool(use_straddle_edge_head)
+        if self.use_straddle_edge_head:
+            self.straddle_edge_head = nn.Sequential(
+                nn.Linear(self.shared_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1),
+            )
+        else:
+            self.straddle_edge_head = None
 
     def shared_repr(self, x: torch.Tensor) -> torch.Tensor:
         h = self.backbone(x.transpose(1, 2))
@@ -990,14 +1117,30 @@ class L1AMarketTCN(nn.Module):
             return pooled
         return h[:, :, -1]
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        decoder_vol_trend: torch.Tensor | None = None,
+        decoder_time_in_regime: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         shared = self.shared_repr(x)
         embed = self.embed_head(shared)
         base_regime_logits = self.base_regime_head(shared)
         transition_logit = self.transition_head(shared).squeeze(-1)
         vol_value = self.vol_head(shared).squeeze(-1)
-        vol_trend_value = self.vol_trend_head(shared).squeeze(-1)
-        time_in_regime_value = self.time_in_regime_head(shared).squeeze(-1)
+        if self.vol_trend_head is not None:
+            vol_trend_value = self.vol_trend_head(shared).squeeze(-1)
+        elif decoder_vol_trend is not None:
+            vol_trend_value = decoder_vol_trend
+        else:
+            vol_trend_value = torch.zeros(shared.shape[0], device=shared.device, dtype=shared.dtype)
+        if self.time_in_regime_head is not None:
+            time_in_regime_value = self.time_in_regime_head(shared).squeeze(-1)
+        elif decoder_time_in_regime is not None:
+            time_in_regime_value = decoder_time_in_regime
+        else:
+            time_in_regime_value = torch.zeros(shared.shape[0], device=shared.device, dtype=shared.dtype)
         regime_logits, state_persistence_logit = self.state_structure_decoder(
             shared,
             base_regime_logits,
@@ -1005,7 +1148,7 @@ class L1AMarketTCN(nn.Module):
             vol_trend_value,
             time_in_regime_value,
         )
-        return {
+        out: dict[str, torch.Tensor] = {
             "regime_logits": regime_logits,
             "base_regime_logits": base_regime_logits,
             "transition_logit": transition_logit,
@@ -1017,6 +1160,9 @@ class L1AMarketTCN(nn.Module):
             "embed_recon": self.embed_decoder(embed),
             "shared_repr": shared,
         }
+        if self.straddle_edge_head is not None:
+            out["straddle_edge_value"] = self.straddle_edge_head(shared).squeeze(-1)
+        return out
 
 
 @dataclass
@@ -1043,16 +1189,14 @@ def _train_epoch(
     *,
     regime_loss: nn.Module,
     transition_loss: nn.Module,
-    loss_weights: dict[str, float],
     amp: L1aAmpSettings,
     amp_scaler: GradScaler | None,
-    uw_module: L1aMultiTaskUncertaintyWeights | None = None,
+    uw_module: L1aMultiTaskUncertaintyWeights,
     regime_aux_coef: float | None = None,
     persist_coef: float | None = None,
 ) -> float:
     model.train()
-    if uw_module is not None:
-        uw_module.train()
+    uw_module.train()
     total_loss = 0.0
     total_rows = 0
     mse = nn.MSELoss()
@@ -1061,6 +1205,9 @@ def _train_epoch(
     pcoef = float(_l1a_transition_persist_coef() if persist_coef is None else persist_coef)
     max_gn = float(os.environ.get("L1A_MAX_GRAD_NORM", "1.0"))
     nb = _l1a_nb(device)
+    se_on = l1a_straddle_edge_head_enabled()
+    vt_on = model.vol_trend_head is not None
+    tir_on = model.time_in_regime_head is not None
     it = loader
     if _l1a_batch_progress_enabled():
         it = tqdm(
@@ -1071,8 +1218,14 @@ def _train_epoch(
             mininterval=0.25,
             unit="batch",
             dynamic_ncols=True,
+            disable=False,
         )
-    for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in it:
+    for batch in it:
+        if se_on:
+            xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir, y_edge = batch
+            y_edge = y_edge.to(device, non_blocking=nb)
+        else:
+            xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir = batch
         xb = xb.to(device, non_blocking=nb)
         y_regime = y_regime.to(device, non_blocking=nb)
         y_transition = y_transition.to(device, non_blocking=nb)
@@ -1081,37 +1234,36 @@ def _train_epoch(
         y_time_ir = y_time_ir.to(device, non_blocking=nb)
         optimizer.zero_grad(set_to_none=True)
         with _l1a_autocast(amp):
-            out = model(xb)
+            dec_kw = _l1a_forward_decoder_kw(model, y_vol_trend, y_time_ir)
+            out = model(xb, **dec_kw)
             losses = {
                 "regime": regime_loss(out["regime_logits"], y_regime),
-                "regime_aux": regime_loss(out["base_regime_logits"], y_regime),
+                "regime_aux": _l1a_coarse_vol_regime_aux_loss(out["base_regime_logits"], y_regime),
                 "vol": mse(out["vol_value"], y_vol),
-                "vol_trend": mse(out["vol_trend_value"], y_vol_trend),
-                "time_in_regime": mse(out["time_in_regime_value"], y_time_ir),
                 "embed_recon": mse(out["embed_recon"], out["shared_repr"].detach()),
                 "transition": transition_loss(out["transition_logit"], y_transition),
                 "state_persistence": bce(out["state_persistence_logit"], 1.0 - y_transition),
             }
-            if uw_module is not None:
-                grouped = {
-                    "regime": losses["regime"],
-                    "transition": losses["transition"] + pcoef * losses["state_persistence"],
-                    "volatility": losses["vol"] + losses["vol_trend"] + losses["time_in_regime"],
-                    "embedding": losses["embed_recon"],
-                }
-                total_uw, _diag = uw_module.weighted_loss(grouped)
-                loss = total_uw + rac * loss_weights["regime"] * losses["regime_aux"]
-            else:
-                loss = (
-                    loss_weights["regime"] * losses["regime"]
-                    + rac * loss_weights["regime"] * losses["regime_aux"]
-                    + loss_weights["vol"] * losses["vol"]
-                    + loss_weights["vol_trend"] * losses["vol_trend"]
-                    + loss_weights["time_in_regime"] * losses["time_in_regime"]
-                    + loss_weights["embed_recon"] * losses["embed_recon"]
-                    + loss_weights["transition"] * losses["transition"]
-                    + pcoef * loss_weights["transition"] * losses["state_persistence"]
-                )
+            if vt_on:
+                losses["vol_trend"] = mse(out["vol_trend_value"], y_vol_trend)
+            if tir_on:
+                losses["time_in_regime"] = mse(out["time_in_regime_value"], y_time_ir)
+            if se_on:
+                losses["straddle_edge"] = mse(out["straddle_edge_value"], y_edge)
+            uw_in: dict[str, torch.Tensor] = {
+                "regime": losses["regime"],
+                "regime_aux": rac * losses["regime_aux"],
+                "transition": losses["transition"] + pcoef * losses["state_persistence"],
+                "vol": losses["vol"],
+                "embed_recon": losses["embed_recon"],
+            }
+            if vt_on:
+                uw_in["vol_trend"] = losses["vol_trend"]
+            if tir_on:
+                uw_in["time_in_regime"] = losses["time_in_regime"]
+            if se_on:
+                uw_in["straddle_edge"] = losses["straddle_edge"]
+            loss, _diag = uw_module.weighted_loss(uw_in)
         if amp_scaler is not None:
             amp_scaler.scale(loss).backward()
             amp_scaler.unscale_(optimizer)
@@ -1134,17 +1286,15 @@ def _eval_epoch(
     *,
     regime_loss: nn.Module,
     transition_loss: nn.Module,
-    loss_weights: dict[str, float],
     amp: L1aAmpSettings,
-    uw_module: L1aMultiTaskUncertaintyWeights | None = None,
-    val_metric: str = "legacy",
+    uw_module: L1aMultiTaskUncertaintyWeights,
+    val_metric: str = "geom",
     regime_aux_coef: float | None = None,
     persist_coef: float | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Return (metric_for_early_stop, diagnostics)."""
     model.eval()
-    if uw_module is not None:
-        uw_module.eval()
+    uw_module.eval()
     total_rows = 0
     sum_legacy = 0.0
     sum_regime = 0.0
@@ -1159,6 +1309,9 @@ def _eval_epoch(
     rac = float(_l1a_regime_aux_coef() if regime_aux_coef is None else regime_aux_coef)
     pcoef = float(_l1a_transition_persist_coef() if persist_coef is None else persist_coef)
     nb = _l1a_nb(device)
+    se_on = l1a_straddle_edge_head_enabled()
+    vt_on = model.vol_trend_head is not None
+    tir_on = model.time_in_regime_head is not None
     it = loader
     if _l1a_batch_progress_enabled():
         it = tqdm(
@@ -1169,9 +1322,15 @@ def _eval_epoch(
             mininterval=0.25,
             unit="batch",
             dynamic_ncols=True,
+            disable=False,
         )
     with torch.no_grad():
-        for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in it:
+        for batch in it:
+            if se_on:
+                xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir, y_edge = batch
+                y_edge = y_edge.to(device, non_blocking=nb)
+            else:
+                xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir = batch
             xb = xb.to(device, non_blocking=nb)
             y_regime = y_regime.to(device, non_blocking=nb)
             y_transition = y_transition.to(device, non_blocking=nb)
@@ -1179,55 +1338,63 @@ def _eval_epoch(
             y_vol_trend = y_vol_trend.to(device, non_blocking=nb)
             y_time_ir = y_time_ir.to(device, non_blocking=nb)
             with _l1a_autocast(amp):
-                out = model(xb)
+                dec_kw = _l1a_forward_decoder_kw(model, y_vol_trend, y_time_ir)
+                out = model(xb, **dec_kw)
                 n = len(xb)
                 l_reg = regime_loss(out["regime_logits"], y_regime)
-                l_aux = regime_loss(out["base_regime_logits"], y_regime)
+                l_aux = _l1a_coarse_vol_regime_aux_loss(out["base_regime_logits"], y_regime)
                 l_vol = mse(out["vol_value"], y_vol)
-                l_vt = mse(out["vol_trend_value"], y_vol_trend)
-                l_tir = mse(out["time_in_regime_value"], y_time_ir)
+                l_vt = mse(out["vol_trend_value"], y_vol_trend) if vt_on else None
+                l_tir = mse(out["time_in_regime_value"], y_time_ir) if tir_on else None
                 l_emb = mse(out["embed_recon"], out["shared_repr"].detach())
                 l_tr = transition_loss(out["transition_logit"], y_transition)
                 l_pers = bce(out["state_persistence_logit"], 1.0 - y_transition)
-                legacy = (
-                    loss_weights["regime"] * l_reg
-                    + rac * loss_weights["regime"] * l_aux
-                    + loss_weights["vol"] * l_vol
-                    + loss_weights["vol_trend"] * l_vt
-                    + loss_weights["time_in_regime"] * l_tir
-                    + loss_weights["embed_recon"] * l_emb
-                    + loss_weights["transition"] * l_tr
-                    + pcoef * loss_weights["transition"] * l_pers
-                )
+                l_se = mse(out["straddle_edge_value"], y_edge) if se_on else None
+                legacy = l_reg + rac * l_aux + l_vol + l_emb + l_tr + pcoef * l_pers
+                if l_vt is not None:
+                    legacy = legacy + l_vt
+                if l_tir is not None:
+                    legacy = legacy + l_tir
+                if se_on and l_se is not None:
+                    legacy = legacy + l_se
                 sum_legacy += float(legacy.item()) * n
                 sum_regime += float(l_reg.item()) * n
                 sum_transition += float((l_tr + pcoef * l_pers).item()) * n
                 sum_vol += float(l_vol.item()) * n
-                sum_vt += float(l_vt.item()) * n
-                sum_tir += float(l_tir.item()) * n
+                if l_vt is not None:
+                    sum_vt += float(l_vt.item()) * n
+                if l_tir is not None:
+                    sum_tir += float(l_tir.item()) * n
                 sum_emb += float(l_emb.item()) * n
-                if uw_module is not None:
-                    grouped = {
-                        "regime": l_reg,
-                        "transition": l_tr + pcoef * l_pers,
-                        "volatility": l_vol + l_vt + l_tir,
-                        "embedding": l_emb,
-                    }
-                    uwt, _ = uw_module.weighted_loss(grouped)
-                    sum_uw += float((uwt + rac * loss_weights["regime"] * l_aux).item()) * n
+                v_uw: dict[str, torch.Tensor] = {
+                    "regime": l_reg,
+                    "regime_aux": rac * l_aux,
+                    "transition": l_tr + pcoef * l_pers,
+                    "vol": l_vol,
+                    "embed_recon": l_emb,
+                }
+                if l_vt is not None:
+                    v_uw["vol_trend"] = l_vt
+                if l_tir is not None:
+                    v_uw["time_in_regime"] = l_tir
+                if se_on and l_se is not None:
+                    v_uw["straddle_edge"] = l_se
+                uwt, _ = uw_module.weighted_loss(v_uw)
+                sum_uw += float(uwt.item()) * n
                 total_rows += n
     denom = max(total_rows, 1)
     mean_legacy = sum_legacy / denom
     g_reg = max(sum_regime / denom, 1e-8)
     g_tr = max(sum_transition / denom, 1e-8)
-    g_vol = max((sum_vol + sum_vt + sum_tir) / denom, 1e-8)
+    vol_group = sum_vol + sum_vt + sum_tir
+    g_vol = max(vol_group / denom, 1e-8)
     g_emb = max(sum_emb / denom, 1e-8)
     geom = float(math.exp(0.25 * (math.log(g_reg) + math.log(g_tr) + math.log(g_vol) + math.log(g_emb))))
-    mean_uw = sum_uw / denom if uw_module is not None else mean_legacy
-    vm = val_metric if uw_module is not None else "legacy"
-    if vm == "uw_total" and uw_module is not None:
+    mean_uw = sum_uw / denom
+    vm = val_metric
+    if vm == "uw_total":
         stop = mean_uw
-    elif vm == "geom" and uw_module is not None:
+    elif vm == "geom":
         stop = geom
     else:
         stop = mean_legacy
@@ -1243,6 +1410,22 @@ def _eval_epoch(
     return float(stop), diag
 
 
+def _l1a_oof_warmstart_expanding_enabled() -> bool:
+    """Fold 2+ start from previous fold's ``state_dict`` (expanding OOF only; set ``L1A_OOF_WARMSTART=1``)."""
+    return os.environ.get("L1A_OOF_WARMSTART", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _l1a_warmstart_oof_max_epochs(base_max: int) -> int:
+    raw = os.environ.get("L1A_WARMSTART_OOF_MAX_EPOCHS", "").strip()
+    if raw:
+        return max(1, min(int(raw), int(base_max)))
+    return max(1, min(24, max(8, int(base_max) // 2)))
+
+
+def _l1a_warmstart_oof_lr_scale() -> float:
+    return float(os.environ.get("L1A_WARMSTART_OOF_LR_SCALE", "0.5"))
+
+
 def _l1a_early_stop_best_epoch(
     train_dl: DataLoader,
     val_dl: DataLoader,
@@ -1256,7 +1439,6 @@ def _l1a_early_stop_best_epoch(
     head_dropout: float,
     regime_loss: nn.Module,
     transition_loss: nn.Module,
-    loss_weights: dict[str, float],
     lr: float,
     wd: float,
     T0: int,
@@ -1265,15 +1447,15 @@ def _l1a_early_stop_best_epoch(
     patience: int,
     min_delta: float,
     desc: str,
-    use_uw: bool,
     uw_val_metric: str,
     amp: L1aAmpSettings,
+    init_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> Tuple[int, dict[str, torch.Tensor]]:
     amp_scaler = GradScaler(amp.device_type) if (amp.enabled and amp.dtype == torch.float16) else None
     model = L1AMarketTCN(
         n_feat,
         channels=channels,
-        seq_len=SEQ_LEN,
+        seq_len=_l1a_seq_len(),
         readout_type=_l1a_readout_type(),
         min_attention_seq_len=_l1a_min_attention_seq_len(),
         tcn_kernel_size=tcn_kernel_size,
@@ -1281,8 +1463,13 @@ def _l1a_early_stop_best_epoch(
         readout_dropout=readout_dropout,
         head_dropout=head_dropout,
         embed_dim=embed_dim,
+        use_straddle_edge_head=l1a_straddle_edge_head_enabled(),
+        use_vol_trend_head=l1a_vol_trend_head_enabled(),
+        use_time_in_regime_head=l1a_time_in_regime_head_enabled(),
     ).to(DEVICE)
-    uw = _l1a_build_uw_module(DEVICE, loss_weights) if use_uw else None
+    if init_state_dict is not None:
+        model.load_state_dict(init_state_dict, strict=True)
+    uw = _l1a_build_uw_module(DEVICE)
     optimizer = _l1a_optimizer(model, uw, lr, wd)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
     best_val = float("inf")
@@ -1293,7 +1480,7 @@ def _l1a_early_stop_best_epoch(
         max_epochs,
         desc=desc,
         unit="ep",
-        leave=False,
+        leave=True,
         file=_tqdm_stream(),
         mininterval=0.3,
         dynamic_ncols=True,
@@ -1307,7 +1494,6 @@ def _l1a_early_stop_best_epoch(
             DEVICE,
             regime_loss=regime_loss,
             transition_loss=transition_loss,
-            loss_weights=loss_weights,
             amp=amp,
             amp_scaler=amp_scaler,
             uw_module=uw,
@@ -1318,12 +1504,17 @@ def _l1a_early_stop_best_epoch(
             DEVICE,
             regime_loss=regime_loss,
             transition_loss=transition_loss,
-            loss_weights=loss_weights,
             amp=amp,
             uw_module=uw,
-            val_metric=uw_val_metric if use_uw else "legacy",
+            val_metric=uw_val_metric,
         )
         scheduler.step()
+        print(
+            f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_stop={va_stop:.4f} "
+            f"val_legacy_sum={va_diag.get('val_legacy_weighted', 0):.4f}",
+            flush=True,
+        )
+        _l1a_log_uw_auto_weights(uw)
         if hasattr(epoch_bar, "set_postfix"):
             epoch_bar.set_postfix(
                 train=f"{tr_loss:.4f}",
@@ -1415,9 +1606,19 @@ def _log_l1a_val_metrics(
     tr_t, tr_s = [], []
     persist_s: list[np.ndarray] = []
     emb_mse: list[np.ndarray] = []
+    se_on = l1a_straddle_edge_head_enabled()
+    vt_on = model.vol_trend_head is not None
+    tir_on = model.time_in_regime_head is not None
+    se_t: list[np.ndarray] = []
+    se_p: list[np.ndarray] = []
     nb = _l1a_nb(device)
     with torch.no_grad():
-        for xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir in val_dl:
+        for batch in val_dl:
+            if se_on:
+                xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir, y_edge = batch
+                y_edge = y_edge.to(device, non_blocking=nb)
+            else:
+                xb, y_regime, y_transition, y_vol, y_vol_trend, y_time_ir = batch
             xb = xb.to(device, non_blocking=nb)
             y_regime = y_regime.to(device, non_blocking=nb)
             y_transition = y_transition.to(device, non_blocking=nb)
@@ -1425,17 +1626,23 @@ def _log_l1a_val_metrics(
             y_vol_trend = y_vol_trend.to(device, non_blocking=nb)
             y_time_ir = y_time_ir.to(device, non_blocking=nb)
             with _l1a_autocast(amp):
-                out = model(xb)
+                dec_kw = _l1a_forward_decoder_kw(model, y_vol_trend, y_time_ir)
+                out = model(xb, **dec_kw)
+            if se_on:
+                se_t.append(y_edge.detach().cpu().numpy())
+                se_p.append(out["straddle_edge_value"].detach().float().cpu().numpy())
             y_true_r.append(y_regime.detach().cpu().numpy())
             regime_prob = torch.softmax(out["regime_logits"].float(), dim=1)
             y_prob_r.append(regime_prob.detach().cpu().numpy())
             y_pred_r.append(torch.argmax(regime_prob, dim=1).detach().cpu().numpy())
             vol_t.append(y_vol.detach().cpu().numpy())
             vol_p.append(out["vol_value"].detach().float().cpu().numpy())
-            vt_t.append(y_vol_trend.detach().cpu().numpy())
-            vt_p.append(out["vol_trend_value"].detach().float().cpu().numpy())
-            tir_t_fit.append(y_time_ir.detach().cpu().numpy())
-            tir_p_fit.append(out["time_in_regime_value"].detach().float().cpu().numpy())
+            if vt_on:
+                vt_t.append(y_vol_trend.detach().cpu().numpy())
+                vt_p.append(out["vol_trend_value"].detach().float().cpu().numpy())
+            if tir_on:
+                tir_t_fit.append(y_time_ir.detach().cpu().numpy())
+                tir_p_fit.append(out["time_in_regime_value"].detach().float().cpu().numpy())
             tr_t.append(y_transition.detach().cpu().numpy())
             tr_s.append(torch.sigmoid(out["transition_logit"].float()).detach().cpu().numpy())
             persist_s.append(torch.sigmoid(out["state_persistence_logit"].float()).detach().cpu().numpy())
@@ -1472,14 +1679,18 @@ def _log_l1a_val_metrics(
     rmse_v = float(np.sqrt(mean_squared_error(vt, vp)))
     r2_v = float(r2_score(vt, vp)) if len(np.unique(vt)) > 1 else float("nan")
     corr_v = pearson_corr(vt, vp)
-    vtt = np.concatenate(vt_t)
-    vtp = np.concatenate(vt_p)
-    mae_vt = float(mean_absolute_error(vtt, vtp))
-    corr_vt = pearson_corr(vtt, vtp)
-    tirt = _inverse_time_in_regime_target(np.concatenate(tir_t_fit))
-    tirpr = _inverse_time_in_regime_target(np.concatenate(tir_p_fit))
-    mae_tir = float(mean_absolute_error(tirt, tirpr))
-    corr_tir = pearson_corr(tirt, tirpr)
+    mae_vt = corr_vt = float("nan")
+    if vt_on and vt_t:
+        vtt = np.concatenate(vt_t)
+        vtp = np.concatenate(vt_p)
+        mae_vt = float(mean_absolute_error(vtt, vtp))
+        corr_vt = pearson_corr(vtt, vtp)
+    mae_tir = corr_tir = float("nan")
+    if tir_on and tir_t_fit:
+        tirt = _inverse_time_in_regime_target(np.concatenate(tir_t_fit))
+        tirpr = _inverse_time_in_regime_target(np.concatenate(tir_p_fit))
+        mae_tir = float(mean_absolute_error(tirt, tirpr))
+        corr_tir = pearson_corr(tirt, tirpr)
     emb_mean = float(np.mean(np.concatenate(emb_mse)))
     persist_pred = np.concatenate(persist_s) if persist_s else np.array([], dtype=np.float32)
     stay_target = 1.0 - np.concatenate(tr_t)
@@ -1528,14 +1739,35 @@ def _log_l1a_val_metrics(
         f"embed_recon_row_MSE={emb_mean:.6f}",
         flush=True,
     )
-    print(
-        f"  [L1a] vol_trend head:  MAE={mae_vt:.4f}  corr(y,p)={corr_vt:.4f}",
-        flush=True,
-    )
-    print(
-        f"  [L1a] time_in_regime head:  MAE={mae_tir:.4f}  corr(y,p)={corr_tir:.4f}",
-        flush=True,
-    )
+    if vt_on:
+        print(
+            f"  [L1a] vol_trend head:  MAE={mae_vt:.4f}  corr(y,p)={corr_vt:.4f}",
+            flush=True,
+        )
+    else:
+        print(
+            "  [L1a] vol_trend head: disabled (decoder + ``l1a_vol_trend`` use prep-derived targets)",
+            flush=True,
+        )
+    if tir_on:
+        print(
+            f"  [L1a] time_in_regime head:  MAE={mae_tir:.4f}  corr(y,p)={corr_tir:.4f}",
+            flush=True,
+        )
+    else:
+        print(
+            "  [L1a] time_in_regime head: disabled (decoder + ``l1a_time_in_regime`` use prep-derived targets)",
+            flush=True,
+        )
+    if se_on and se_t:
+        set_ = np.concatenate(se_t)
+        sep = np.concatenate(se_p)
+        mae_se = float(mean_absolute_error(set_, sep))
+        corr_se = pearson_corr(set_, sep)
+        print(
+            f"  [L1a] straddle_edge head:  MAE={mae_se:.4f}  corr(y,p)={corr_se:.4f}",
+            flush=True,
+        )
     print(
         f"  [L1a] state persistence head:  mean(persist)={persist_mean:.4f}  std(persist)={persist_std:.4f}  "
         f"mean(stay_target)={float(np.mean(stay_target)):.4f}  corr(stay,persist)={persist_corr:.4f}",
@@ -1806,7 +2038,17 @@ def materialize_l1a_outputs(
     X = np.nan_to_num((X - mean) / std, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     windows, end_idx = _build_symbol_windows(pd.concat([df[["symbol", "time_key"]], pd.DataFrame(X, columns=feature_cols)], axis=1), feature_cols, seq_len)
     ed = int(embed_dim) if embed_dim is not None else int(getattr(model, "embed_dim", _l1a_embed_dim()))
-    out_cols = l1a_output_columns_with_embed_dim(ed)
+    edge_out = bool(getattr(model, "use_straddle_edge_head", False))
+    mid_cols = [
+        "l1a_transition_risk",
+        "l1a_vol_forecast",
+        "l1a_vol_trend",
+        "l1a_time_in_regime",
+        "l1a_state_persistence",
+    ]
+    if edge_out:
+        mid_cols.append("l1a_straddle_edge")
+    out_cols = list(L1A_REGIME_COLS) + mid_cols + [f"l1a_market_embed_{idx}" for idx in range(ed)] + ["l1a_is_warm"]
     outputs = pd.DataFrame(
         {
             "symbol": df["symbol"].values,
@@ -1830,9 +2072,14 @@ def materialize_l1a_outputs(
     if len(end_idx) == 0:
         return outputs
 
+    prior_tgt, _ = _build_l1a_targets(df, fit_mask=None)
+    static_vt = np.asarray(prior_tgt["vol_trend"], dtype=np.float32)
+    static_tir_raw = np.asarray(prior_tgt["time_in_regime"], dtype=np.float64)
+    static_tir_fit = _transform_time_in_regime_target(static_tir_raw).astype(np.float32)
+
     ds = TensorDataset(torch.from_numpy(windows))
     infer_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
-    infer_bs = max(32, int(os.environ.get("L1A_MATERIALIZE_BATCH_SIZE", "1024")))
+    infer_bs = max(32, int(os.environ.get("L1A_MATERIALIZE_BATCH_SIZE", "2048")))
     dl_kwargs: dict[str, Any] = {
         "batch_size": infer_bs,
         "shuffle": False,
@@ -1852,28 +2099,54 @@ def materialize_l1a_outputs(
             mininterval=0.3,
             unit="batch",
             dynamic_ncols=True,
+            disable=False,
         )
     regime_rows: list[np.ndarray] = []
-    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol", "vol_trend", "time_ir", "persistence"]}
+    scalar_keys = ["transition", "vol", "vol_trend", "time_ir", "persistence"]
+    if edge_out:
+        scalar_keys.append("straddle_edge")
+    scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in scalar_keys}
     embeds: list[np.ndarray] = []
     amp_m = amp if amp is not None else _l1a_build_amp(device)[0]
     nb = _l1a_nb(device)
     model.eval()
+    w_off = 0
+    vt_head_on = model.vol_trend_head is not None
+    tir_head_on = model.time_in_regime_head is not None
     with torch.no_grad():
         for (xb,) in dl_it:
             xb = xb.to(device, non_blocking=nb)
+            rows = end_idx[w_off : w_off + len(xb)]
+            w_off += len(xb)
+            dec_kw: dict[str, torch.Tensor] = {}
+            if model.vol_trend_head is None:
+                dec_kw["decoder_vol_trend"] = torch.from_numpy(static_vt[rows]).to(
+                    device=device, dtype=torch.float32, non_blocking=nb
+                )
+            if model.time_in_regime_head is None:
+                dec_kw["decoder_time_in_regime"] = torch.from_numpy(static_tir_fit[rows]).to(
+                    device=device, dtype=torch.float32, non_blocking=nb
+                )
             with _l1a_autocast(amp_m):
-                out = model(xb)
+                out = model(xb, **dec_kw)
             regime_rows.append(torch.softmax(out["regime_logits"].float(), dim=1).detach().cpu().numpy())
             scalar_rows["transition"].append(torch.sigmoid(out["transition_logit"].float()).detach().cpu().numpy())
             scalar_rows["vol"].append(out["vol_value"].detach().float().cpu().numpy())
             clip_lo = float(os.environ.get("L1A_VOL_TREND_CLIP_LO", "-3"))
             clip_hi = float(os.environ.get("L1A_VOL_TREND_CLIP_HI", "3"))
-            scalar_rows["vol_trend"].append(
-                np.clip(out["vol_trend_value"].detach().float().cpu().numpy(), clip_lo, clip_hi)
-            )
-            scalar_rows["time_ir"].append(out["time_in_regime_value"].detach().float().cpu().numpy())
+            if vt_head_on:
+                scalar_rows["vol_trend"].append(
+                    np.clip(out["vol_trend_value"].detach().float().cpu().numpy(), clip_lo, clip_hi)
+                )
+            else:
+                scalar_rows["vol_trend"].append(static_vt[rows])
+            if tir_head_on:
+                scalar_rows["time_ir"].append(out["time_in_regime_value"].detach().float().cpu().numpy())
+            else:
+                scalar_rows["time_ir"].append(static_tir_fit[rows])
             scalar_rows["persistence"].append(torch.sigmoid(out["state_persistence_logit"].float()).detach().cpu().numpy())
+            if edge_out:
+                scalar_rows["straddle_edge"].append(out["straddle_edge_value"].detach().float().cpu().numpy())
             embeds.append(out["market_embed"].detach().float().cpu().numpy())
     regime = np.concatenate(regime_rows, axis=0)
     outputs.loc[end_idx, L1A_REGIME_COLS] = regime
@@ -1883,12 +2156,20 @@ def materialize_l1a_outputs(
     )
     outputs.loc[end_idx, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, v_hi)
     outputs.loc[end_idx, "l1a_vol_trend"] = np.concatenate(scalar_rows["vol_trend"], axis=0)
-    outputs.loc[end_idx, "l1a_time_in_regime"] = np.clip(
-        _inverse_time_in_regime_target(np.concatenate(scalar_rows["time_ir"], axis=0)), 0.0, 1.0
-    )
+    if tir_head_on:
+        tir_col = np.clip(
+            _inverse_time_in_regime_target(np.concatenate(scalar_rows["time_ir"], axis=0)), 0.0, 1.0
+        )
+    else:
+        tir_col = np.clip(static_tir_raw[end_idx].astype(np.float32), 0.0, 1.0)
+    outputs.loc[end_idx, "l1a_time_in_regime"] = tir_col
     outputs.loc[end_idx, "l1a_state_persistence"] = np.clip(
         np.concatenate(scalar_rows["persistence"], axis=0), 0.0, 1.0
     )
+    if edge_out:
+        outputs.loc[end_idx, "l1a_straddle_edge"] = np.clip(
+            np.concatenate(scalar_rows["straddle_edge"], axis=0), -1.0, 1.0
+        )
     embed_mat = np.concatenate(embeds, axis=0)
     if embed_mat.shape[1] != ed:
         raise RuntimeError(
@@ -1907,6 +2188,8 @@ def _l1a_overlay_expanding_oof_predictions(
     *,
     windows: np.ndarray,
     end_idx: np.ndarray,
+    prior_vol_trend: np.ndarray,
+    prior_time_in_regime: np.ndarray,
     n_feat: int,
     embed_dim: int,
     channels: list[int],
@@ -1919,15 +2202,21 @@ def _l1a_overlay_expanding_oof_predictions(
     """Replace L1a outputs on each fold's val windows with that fold's OOF model forward (CPU state)."""
     nb = _l1a_nb(DEVICE)
     ed = int(embed_dim)
+    edge_oof = l1a_straddle_edge_head_enabled()
+    vt_oof = l1a_vol_trend_head_enabled()
+    tir_oof = l1a_time_in_regime_head_enabled()
+    static_vt = np.asarray(prior_vol_trend, dtype=np.float32)
+    static_tir_raw = np.asarray(prior_time_in_regime, dtype=np.float64)
+    static_tir_fit = _transform_time_in_regime_target(static_tir_raw).astype(np.float32)
     embed_cols = [f"l1a_market_embed_{idx}" for idx in range(ed)]
-    infer_bs = max(32, int(os.environ.get("L1A_MATERIALIZE_BATCH_SIZE", "1024")))
+    infer_bs = max(32, int(os.environ.get("L1A_MATERIALIZE_BATCH_SIZE", "2048")))
     for state, w_va in zip(fold_states, fold_va_masks):
         if state is None or not np.any(w_va):
             continue
         model = L1AMarketTCN(
             n_feat,
             channels=channels,
-            seq_len=SEQ_LEN,
+            seq_len=_l1a_seq_len(),
             readout_type=_l1a_readout_type(),
             min_attention_seq_len=_l1a_min_attention_seq_len(),
             tcn_kernel_size=tcn_kernel_size,
@@ -1935,30 +2224,59 @@ def _l1a_overlay_expanding_oof_predictions(
             readout_dropout=readout_dropout,
             head_dropout=head_dropout,
             embed_dim=ed,
+            use_straddle_edge_head=edge_oof,
+            use_vol_trend_head=vt_oof,
+            use_time_in_regime_head=tir_oof,
         ).to(DEVICE)
         model.load_state_dict(state)
         model.eval()
         w_sel = windows[w_va].astype(np.float32, copy=False)
+        sub_end = end_idx[w_va]
         ds = TensorDataset(torch.from_numpy(w_sel))
         dl = DataLoader(ds, batch_size=infer_bs, shuffle=False, pin_memory=DEVICE.type == "cuda")
         regime_rows: list[np.ndarray] = []
-        scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in ["transition", "vol", "vol_trend", "time_ir", "persistence"]}
+        sk = ["transition", "vol", "vol_trend", "time_ir", "persistence"]
+        if edge_oof:
+            sk.append("straddle_edge")
+        scalar_rows: dict[str, list[np.ndarray]] = {k: [] for k in sk}
         embeds: list[np.ndarray] = []
+        vt_h = model.vol_trend_head is not None
+        tir_h = model.time_in_regime_head is not None
+        off = 0
         with torch.no_grad():
             for (xb,) in dl:
                 xb = xb.to(DEVICE, non_blocking=nb)
+                rows = sub_end[off : off + len(xb)]
+                off += len(xb)
+                dec_kw: dict[str, torch.Tensor] = {}
+                if model.vol_trend_head is None:
+                    dec_kw["decoder_vol_trend"] = torch.from_numpy(static_vt[rows]).to(
+                        device=DEVICE, dtype=torch.float32, non_blocking=nb
+                    )
+                if model.time_in_regime_head is None:
+                    dec_kw["decoder_time_in_regime"] = torch.from_numpy(static_tir_fit[rows]).to(
+                        device=DEVICE, dtype=torch.float32, non_blocking=nb
+                    )
                 with _l1a_autocast(amp):
-                    out = model(xb)
+                    out = model(xb, **dec_kw)
                 regime_rows.append(torch.softmax(out["regime_logits"].float(), dim=1).detach().cpu().numpy())
                 scalar_rows["transition"].append(torch.sigmoid(out["transition_logit"].float()).detach().cpu().numpy())
                 scalar_rows["vol"].append(out["vol_value"].detach().float().cpu().numpy())
                 clip_lo = float(os.environ.get("L1A_VOL_TREND_CLIP_LO", "-3"))
                 clip_hi = float(os.environ.get("L1A_VOL_TREND_CLIP_HI", "3"))
-                scalar_rows["vol_trend"].append(
-                    np.clip(out["vol_trend_value"].detach().float().cpu().numpy(), clip_lo, clip_hi)
-                )
-                scalar_rows["time_ir"].append(out["time_in_regime_value"].detach().float().cpu().numpy())
+                if vt_h:
+                    scalar_rows["vol_trend"].append(
+                        np.clip(out["vol_trend_value"].detach().float().cpu().numpy(), clip_lo, clip_hi)
+                    )
+                else:
+                    scalar_rows["vol_trend"].append(static_vt[rows])
+                if tir_h:
+                    scalar_rows["time_ir"].append(out["time_in_regime_value"].detach().float().cpu().numpy())
+                else:
+                    scalar_rows["time_ir"].append(static_tir_fit[rows])
                 scalar_rows["persistence"].append(torch.sigmoid(out["state_persistence_logit"].float()).detach().cpu().numpy())
+                if edge_oof:
+                    scalar_rows["straddle_edge"].append(out["straddle_edge_value"].detach().float().cpu().numpy())
                 embeds.append(out["market_embed"].detach().float().cpu().numpy())
         rows = end_idx[w_va]
         regime = np.concatenate(regime_rows, axis=0)
@@ -1967,12 +2285,20 @@ def _l1a_overlay_expanding_oof_predictions(
         v_hi = float(os.environ.get("L1A_VOL_FORECAST_MATERIALIZE_MAX", "5.0"))
         outputs.loc[rows, "l1a_vol_forecast"] = np.clip(np.concatenate(scalar_rows["vol"], axis=0), 0.0, v_hi)
         outputs.loc[rows, "l1a_vol_trend"] = np.concatenate(scalar_rows["vol_trend"], axis=0)
-        outputs.loc[rows, "l1a_time_in_regime"] = np.clip(
-            _inverse_time_in_regime_target(np.concatenate(scalar_rows["time_ir"], axis=0)), 0.0, 1.0
-        )
+        if tir_h:
+            tir_part = np.clip(
+                _inverse_time_in_regime_target(np.concatenate(scalar_rows["time_ir"], axis=0)), 0.0, 1.0
+            )
+        else:
+            tir_part = np.clip(static_tir_raw[rows].astype(np.float32), 0.0, 1.0)
+        outputs.loc[rows, "l1a_time_in_regime"] = tir_part
         outputs.loc[rows, "l1a_state_persistence"] = np.clip(
             np.concatenate(scalar_rows["persistence"], axis=0), 0.0, 1.0
         )
+        if edge_oof and "l1a_straddle_edge" in outputs.columns:
+            outputs.loc[rows, "l1a_straddle_edge"] = np.clip(
+                np.concatenate(scalar_rows["straddle_edge"], axis=0), -1.0, 1.0
+            )
         embed_mat = np.concatenate(embeds, axis=0)
         outputs.loc[rows, embed_cols] = embed_mat
         outputs.loc[rows, "l1a_is_warm"] = 1.0
@@ -1983,16 +2309,24 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     train_started_perf = time.perf_counter()
     print(f"  [L1a] training started at {train_started_at.strftime('%Y-%m-%d %H:%M:%S %z')}", flush=True)
     print(f"  [L1a] torch device={DEVICE} (set TORCH_DEVICE to override)", flush=True)
-    if DEVICE.type == "cuda" and os.environ.get("L1A_CUDNN_BENCHMARK", "1").strip().lower() in {
-        "0",
-        "false",
-        "no",
-    }:
-        torch.backends.cudnn.benchmark = False
+    _l1a_configure_torch_backends(DEVICE)
+    if _l1a_progress_tqdm_enabled():
+        print(
+            f"  [L1a] tqdm: epoch/fold/materialize on (L1A_PROGRESS_TQDM=1); "
+            f"per-batch={'on' if _l1a_batch_progress_enabled() else 'off'} (L1A_TQDM_BATCH, default off for speed); "
+            "L1A_DISABLE_TQDM=1 silences all",
+            flush=True,
+        )
     work = df.copy(deep=False)
     feature_cols = _select_l1a_feature_cols(work, feat_cols)
     print(
         f"  [L1a] ctx_stagger={l1_ctx_stagger_enabled()}  n_features={len(feature_cols)}",
+        flush=True,
+    )
+    print(
+        f"  [L1a] trainable auxiliary heads: vol_trend={l1a_vol_trend_head_enabled()}  "
+        f"time_in_regime={l1a_time_in_regime_head_enabled()}  "
+        f"(when off, decoder sees prep targets; ``l1a_vol_trend`` / ``l1a_time_in_regime`` are prep-derived)",
         flush=True,
     )
     splits = build_stack_time_splits(work["time_key"])
@@ -2002,7 +2336,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     l2_vs = l2_val_start_time()
     Xn, mean, std = _normalize_l1a_matrix(work, feature_cols, norm_mask)
     norm_df = pd.concat([work[["symbol", "time_key"]], pd.DataFrame(Xn, columns=feature_cols)], axis=1)
-    windows, end_idx = _build_symbol_windows(norm_df, feature_cols, SEQ_LEN)
+    windows, end_idx = _build_symbol_windows(norm_df, feature_cols, _l1a_seq_len())
     if len(end_idx) == 0:
         raise RuntimeError("L1a: no valid sequence windows were created.")
 
@@ -2067,14 +2401,17 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
 
     X_t = torch.from_numpy(windows.astype(np.float32, copy=False))
     time_ir_fit = _transform_time_in_regime_target(targets["time_in_regime"])
-    ds = TensorDataset(
+    ds_tensors: list[torch.Tensor] = [
         X_t,
         torch.from_numpy(targets["regime"][end_idx].astype(np.int64)),
         torch.from_numpy(targets["transition_risk"][end_idx].astype(np.float32)),
         torch.from_numpy(targets["vol_forecast"][end_idx].astype(np.float32)),
         torch.from_numpy(targets["vol_trend"][end_idx].astype(np.float32)),
         torch.from_numpy(time_ir_fit[end_idx].astype(np.float32)),
-    )
+    ]
+    if l1a_straddle_edge_head_enabled():
+        ds_tensors.append(torch.from_numpy(targets["straddle_edge"][end_idx].astype(np.float32)))
+    ds = TensorDataset(*ds_tensors)
     val_idx = np.flatnonzero(window_val_report).astype(np.int64, copy=False)
     cal_idx = np.flatnonzero(window_cal).astype(np.int64, copy=False)
     val_ds = Subset(ds, val_idx.tolist())
@@ -2086,6 +2423,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         batch_size = 512
     elif DEVICE.type == "cuda":
         batch_size = 2048
+    elif DEVICE.type == "mps":
+        batch_size = 1536
     else:
         batch_size = 1024
     loader_workers = _l1a_dataloader_workers(min(4, max(_lgbm_n_jobs(), 1)))
@@ -2105,7 +2444,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     val_dl = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     cal_dl = DataLoader(cal_ds, shuffle=False, **loader_kwargs)
     n_feat_l1a = len(feature_cols)
-    seq_steps_per_batch = int(batch_size) * int(SEQ_LEN)
+    seq_steps_per_batch = int(batch_size) * int(_l1a_seq_len())
     print(
         f"  [L1a] batch_size={batch_size}  (~{seq_steps_per_batch:,} seq steps/batch = batch×seq_len, "
         f"×{n_feat_l1a} feats); smaller L1A_BATCH_SIZE → noisier gradients, larger → smoother",
@@ -2153,7 +2492,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     out_cn = l1a_output_columns_with_embed_dim(embed_dim)
     print(f"  [L1a] output column count: {len(out_cn)} (expect {len(out_cn)})", flush=True)
     print(f"  [L1a] output columns: {out_cn}", flush=True)
-    print(f"  [L1a] seq input: seq_len={SEQ_LEN}  input_feats={len(feature_cols)}", flush=True)
+    print(f"  [L1a] seq input: seq_len={_l1a_seq_len()}  input_feats={len(feature_cols)}", flush=True)
     print(f"  [L1a] artifact dir: {MODEL_DIR}", flush=True)
     print(
         f"  [L1a] will write: {artifact_path(L1A_MODEL_FILE)} | {artifact_path(L1A_META_FILE)} | {artifact_path(L1A_OUTPUT_CACHE_FILE)}",
@@ -2168,8 +2507,9 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     log_label_baseline("l1a_vol_forecast", targets["vol_forecast"][end_idx][log_w_tr], task="reg")
     log_label_baseline("l1a_vol_trend", targets["vol_trend"][end_idx][log_w_tr], task="reg")
     log_label_baseline("l1a_time_in_regime", targets["time_in_regime"][end_idx][log_w_tr], task="reg")
+    if l1a_straddle_edge_head_enabled():
+        log_label_baseline("l1a_straddle_edge", targets["straddle_edge"][end_idx][log_w_tr], task="reg")
 
-    loss_weights = _l1a_loss_weights()
     ch = _l1a_tcn_channels()
     td = _l1a_tcn_dropout()
     rd = _l1a_readout_dropout()
@@ -2177,7 +2517,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     lr = float(os.environ.get("L1A_LR", "5e-4"))
     wd = float(os.environ.get("L1A_WEIGHT_DECAY", "1e-3"))
     Tm = max(1, int(os.environ.get("L1A_COS_T_MULT", "2")))
-    max_epochs = max(4, int(os.environ.get("L1A_MAX_EPOCHS", "8" if FAST_TRAIN_MODE else "12")))
+    max_epochs = max(4, int(os.environ.get("L1A_MAX_EPOCHS", "24")))
     t0_env = os.environ.get("L1A_COS_T0", "").strip()
     cos_auto = os.environ.get("L1A_COS_AUTO", "1").strip().lower() in {"1", "true", "yes"}
     if t0_env:
@@ -2202,7 +2542,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             f"third restart cycle would need ~{T0 + T0 * Tm + T0 * Tm * Tm} epochs to complete.",
             flush=True,
         )
-    patience = max(2, int(os.environ.get("L1A_PATIENCE", "4" if FAST_TRAIN_MODE else "6")))
+    patience = max(2, int(os.environ.get("L1A_PATIENCE", "10")))
     min_delta = float(os.environ.get("L1A_EARLY_STOP_MIN_DELTA", "5e-4"))
     l1_final_epochs_after_oof: int | None = None
     expanding_oof_fold_states: list[dict[str, torch.Tensor]] | None = None
@@ -2212,21 +2552,19 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     rf_steps = _l1a_tcn_receptive_field_steps(n_layers=len(ch), kernel_size=tcn_ks)
     print(
         f"  [L1a] TCN stack: channels={ch}  kernel={tcn_ks}  "
-        f"dilations=1..2^{len(ch) - 1}  receptive_field~{rf_steps} steps / seq_len={SEQ_LEN} "
-        f"({100.0 * rf_steps / max(SEQ_LEN, 1):.1f}% of sequence)",
+        f"dilations=1..2^{len(ch) - 1}  receptive_field~{rf_steps} steps / seq_len={_l1a_seq_len()} "
+        f"({100.0 * rf_steps / max(_l1a_seq_len(), 1):.1f}% of sequence)",
         flush=True,
     )
 
-    use_uw = _l1a_use_uncertainty_weighting()
     uw_val_metric = _l1a_uw_val_metric()
     uw_for_meta: L1aMultiTaskUncertaintyWeights | None = None
-    if use_uw:
-        print(
-            f"  [L1a] uncertainty weighting ON (Kendall); val early-stop metric={uw_val_metric!r}  "
-            f"aux regime_coef={_l1a_regime_aux_coef():g}  persist_coef={_l1a_transition_persist_coef():g}  "
-            f"uw_lr_ratio={_l1a_uw_lr_ratio():g}",
-            flush=True,
-        )
+    print(
+        f"  [L1a] multi-task loss: Kendall uncertainty (per-task log σ²); val early-stop metric={uw_val_metric!r}  "
+        f"regime_aux_coef={_l1a_regime_aux_coef():g}  persist_coef={_l1a_transition_persist_coef():g}  "
+        f"uw_lr_ratio={_l1a_uw_lr_ratio():g}",
+        flush=True,
+    )
 
     l1a_amp, l1a_train_scaler = _l1a_build_amp(DEVICE)
     if l1a_amp.enabled:
@@ -2250,7 +2588,14 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     if n_l1_oof >= 2:
         if l1_oof_mode_from_env() == "expanding":
             t_end = work["time_key"].to_numpy()[end_idx]
-            exp_folds = l1_expanding_oof_window_folds(t_end)
+            l1a_vw = l1a_expand_oof_val_windows_from_env()
+            if l1a_vw is not None:
+                print(
+                    f"  [L1a] expanding OOF: L1A_EXPAND_OOF_VAL_WINDOWS → {len(l1a_vw)} folds "
+                    f"(global L1_EXPAND_OOF_VAL_WINDOWS unchanged for L1b/L2).",
+                    flush=True,
+                )
+            exp_folds = l1_expanding_oof_window_folds(t_end, val_windows=l1a_vw)
             fold_pairs: list[tuple[np.ndarray, np.ndarray]] = []
             for w_tr, w_va in exp_folds:
                 w_tr_f = w_tr & window_pool
@@ -2272,8 +2617,22 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 w_tr_f[w_pool_idx[tr_sub]] = True
                 w_va_f[w_pool_idx[va_sub]] = True
                 fold_pairs.append((w_tr_f, w_va_f))
+        n_oof_fold = len(fold_pairs)
+        if (
+            l1_oof_mode_from_env() == "expanding"
+            and _l1a_oof_warmstart_expanding_enabled()
+            and len(fold_pairs) >= 2
+        ):
+            wme = _l1a_warmstart_oof_max_epochs(max_epochs)
+            print(
+                f"  [L1a] OOF warmstart: ON  folds 2..K load previous fold weights; "
+                f"max_epochs={wme} (cap vs base {max_epochs})  lr_scale={_l1a_warmstart_oof_lr_scale():g}  "
+                f"(L1A_WARMSTART_OOF_MAX_EPOCHS / L1A_WARMSTART_OOF_LR_SCALE; L1A_OOF_WARMSTART=0 to disable)",
+                flush=True,
+            )
         best_eps: list[int] = []
         fold_states: list[dict[str, torch.Tensor]] = []
+        prev_oof_state: dict[str, torch.Tensor] | None = None
         fold_loops = list(enumerate(fold_pairs))
         if _l1a_progress_tqdm_enabled():
             fold_loops = tqdm(
@@ -2285,6 +2644,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 file=_tqdm_stream(),
                 mininterval=0.5,
                 dynamic_ncols=True,
+                disable=False,
             )
         for fk, (w_tr_f, w_va_f) in fold_loops:
             regime_loss_f = _l1a_regime_loss(targets["regime"][end_idx][w_tr_f], device=DEVICE)
@@ -2295,6 +2655,22 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             val_ds_f = Subset(ds, va_idx.tolist())
             train_dl_f = DataLoader(train_ds_f, shuffle=True, **loader_kwargs)
             val_dl_f = DataLoader(val_ds_f, shuffle=False, **loader_kwargs)
+            fold_max_epochs = int(max_epochs)
+            fold_lr = float(lr)
+            init_sd: dict[str, torch.Tensor] | None = None
+            if (
+                fk > 0
+                and prev_oof_state is not None
+                and l1_oof_mode_from_env() == "expanding"
+                and _l1a_oof_warmstart_expanding_enabled()
+            ):
+                init_sd = prev_oof_state
+                fold_max_epochs = _l1a_warmstart_oof_max_epochs(max_epochs)
+                fold_lr = float(lr) * _l1a_warmstart_oof_lr_scale()
+                print(
+                    f"  [L1a] OOF fold {fk + 1}: warmstart  max_epochs={fold_max_epochs}  lr={fold_lr:.6g}",
+                    flush=True,
+                )
             be, st = _l1a_early_stop_best_epoch(
                 train_dl_f,
                 val_dl_f,
@@ -2307,22 +2683,22 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 head_dropout=hd_drop,
                 regime_loss=regime_loss_f,
                 transition_loss=transition_loss_f,
-                loss_weights=loss_weights,
-                lr=lr,
+                lr=fold_lr,
                 wd=wd,
                 T0=T0,
                 Tm=Tm,
-                max_epochs=max_epochs,
+                max_epochs=fold_max_epochs,
                 patience=patience,
                 min_delta=min_delta,
-                desc=f"[L1a] oof {fk + 1}/{n_l1_oof}",
-                use_uw=use_uw,
+                desc=f"[L1a] oof {fk + 1}/{n_oof_fold}",
                 uw_val_metric=uw_val_metric,
                 amp=l1a_amp,
+                init_state_dict=init_sd,
             )
             best_eps.append(be)
             fold_states.append(st)
-            print(f"  [L1a] OOF fold {fk + 1}/{n_l1_oof}: best_epoch={be}", flush=True)
+            prev_oof_state = st
+            print(f"  [L1a] OOF fold {fk + 1}/{n_oof_fold}: best_epoch={be}", flush=True)
         nr = int(np.clip(np.median(best_eps), 1, max_epochs))
         l1_final_epochs_after_oof = int(nr)
         print(f"  [L1a] OOF median best_epoch -> final_epochs={nr}", flush=True)
@@ -2337,7 +2713,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         model = L1AMarketTCN(
             len(feature_cols),
             channels=ch,
-            seq_len=SEQ_LEN,
+            seq_len=_l1a_seq_len(),
             readout_type=_l1a_readout_type(),
             min_attention_seq_len=_l1a_min_attention_seq_len(),
             tcn_kernel_size=tcn_ks,
@@ -2345,16 +2721,19 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             readout_dropout=rd,
             head_dropout=hd_drop,
             embed_dim=embed_dim,
+            use_straddle_edge_head=l1a_straddle_edge_head_enabled(),
+            use_vol_trend_head=l1a_vol_trend_head_enabled(),
+            use_time_in_regime_head=l1a_time_in_regime_head_enabled(),
         ).to(DEVICE)
         model = _l1a_maybe_compile(model)
-        uw_final = _l1a_build_uw_module(DEVICE, loss_weights) if use_uw else None
+        uw_final = _l1a_build_uw_module(DEVICE)
         optimizer = _l1a_optimizer(model, uw_final, lr, wd)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
         print(
             f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
             f"tcn_kernel={model.tcn_kernel_size}  tcn_channels={ch}  tcn_dropout={td}  "
             f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
-            f"final_epochs={nr} (OOF median)  loss_weights={loss_weights}",
+            f"final_epochs={nr} (OOF median)  loss=Kendall_UW",
             flush=True,
         )
         epoch_bar = trange(
@@ -2375,7 +2754,6 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 DEVICE,
                 regime_loss=regime_loss,
                 transition_loss=transition_loss,
-                loss_weights=loss_weights,
                 amp=l1a_amp,
                 amp_scaler=l1a_train_scaler,
                 uw_module=uw_final,
@@ -2384,6 +2762,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             if hasattr(epoch_bar, "set_postfix"):
                 epoch_bar.set_postfix(train=f"{tr_loss:.4f}", refresh=False)
             print(f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f}", flush=True)
+            _l1a_log_uw_auto_weights(uw_final)
         uw_for_meta = uw_final
     else:
         regime_loss = _l1a_regime_loss(targets["regime"][end_idx][window_train], device=DEVICE)
@@ -2393,7 +2772,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         model = L1AMarketTCN(
             len(feature_cols),
             channels=ch,
-            seq_len=SEQ_LEN,
+            seq_len=_l1a_seq_len(),
             readout_type=_l1a_readout_type(),
             min_attention_seq_len=_l1a_min_attention_seq_len(),
             tcn_kernel_size=tcn_ks,
@@ -2401,9 +2780,12 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             readout_dropout=rd,
             head_dropout=hd_drop,
             embed_dim=embed_dim,
+            use_straddle_edge_head=l1a_straddle_edge_head_enabled(),
+            use_vol_trend_head=l1a_vol_trend_head_enabled(),
+            use_time_in_regime_head=l1a_time_in_regime_head_enabled(),
         ).to(DEVICE)
         model = _l1a_maybe_compile(model)
-        uw = _l1a_build_uw_module(DEVICE, loss_weights) if use_uw else None
+        uw = _l1a_build_uw_module(DEVICE)
         optimizer = _l1a_optimizer(model, uw, lr, wd)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T0, T_mult=Tm)
         best_state: dict[str, torch.Tensor] | None = None
@@ -2424,7 +2806,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             f"  [L1a] readout={model.readout_type}  min_attention_seq_len={model.min_attention_seq_len}  "
             f"tcn_kernel={model.tcn_kernel_size}  tcn_channels={ch}  tcn_dropout={td}  "
             f"lr={lr}  weight_decay={wd}  cosine(T0={T0},T_mult={Tm})  "
-            f"max_epochs={max_epochs}  patience={patience}  min_delta={min_delta:g}  loss_weights={loss_weights}",
+            f"max_epochs={max_epochs}  patience={patience}  min_delta={min_delta:g}  loss=Kendall_UW",
             flush=True,
         )
         for epoch in epoch_bar:
@@ -2435,7 +2817,6 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 DEVICE,
                 regime_loss=regime_loss,
                 transition_loss=transition_loss,
-                loss_weights=loss_weights,
                 amp=l1a_amp,
                 amp_scaler=l1a_train_scaler,
                 uw_module=uw,
@@ -2446,10 +2827,9 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 DEVICE,
                 regime_loss=regime_loss,
                 transition_loss=transition_loss,
-                loss_weights=loss_weights,
                 amp=l1a_amp,
                 uw_module=uw,
-                val_metric=uw_val_metric if use_uw else "legacy",
+                val_metric=uw_val_metric,
             )
             scheduler.step()
             if hasattr(epoch_bar, "set_postfix"):
@@ -2461,14 +2841,14 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
                 )
             print(
                 f"  [L1a] epoch={epoch + 1:02d} train_loss={tr_loss:.4f} val_stop={va_stop:.4f} "
-                f"val_legacy={va_diag.get('val_legacy_weighted', 0):.4f}",
+                f"val_legacy_sum={va_diag.get('val_legacy_weighted', 0):.4f}",
                 flush=True,
             )
+            _l1a_log_uw_auto_weights(uw)
             if va_stop < (best_val - min_delta):
                 best_val = va_stop
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                if uw is not None:
-                    best_uw_state = {k: v.detach().cpu().clone() for k, v in uw.state_dict().items()}
+                best_uw_state = {k: v.detach().cpu().clone() for k, v in uw.state_dict().items()}
                 stale = 0
             else:
                 stale += 1
@@ -2477,7 +2857,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         if best_state is None:
             raise RuntimeError("L1a: training failed to produce a checkpoint.")
         model.load_state_dict(best_state)
-        if uw is not None and best_uw_state is not None:
+        if best_uw_state is not None:
             uw.load_state_dict(best_uw_state)
         uw_for_meta = uw
 
@@ -2502,7 +2882,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         feature_cols,
         mean=mean,
         std=std,
-        seq_len=SEQ_LEN,
+        seq_len=_l1a_seq_len(),
         device=DEVICE,
         embed_dim=model.embed_dim,
         cold_vol_default=lbl_atr_median_train,
@@ -2531,6 +2911,8 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
             expanding_oof_va_masks,
             windows=windows,
             end_idx=end_idx,
+            prior_vol_trend=targets["vol_trend"],
+            prior_time_in_regime=targets["time_in_regime"],
             n_feat=len(feature_cols),
             embed_dim=int(model.embed_dim),
             channels=ch,
@@ -2625,23 +3007,17 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
     os.makedirs(MODEL_DIR, exist_ok=True)
     torch.save(_l1a_state_dict_for_save(model), os.path.join(MODEL_DIR, L1A_MODEL_FILE))
     if uw_for_meta is not None:
-        uw_meta: dict[str, Any] = {
+        _to = uw_for_meta.task_order
+        uw_meta = {
             "enabled": True,
             "val_metric": str(uw_val_metric),
             "regime_aux_coef": float(_l1a_regime_aux_coef()),
             "persistence_coef": float(_l1a_transition_persist_coef()),
             "uw_lr_ratio": float(_l1a_uw_lr_ratio()),
-            "task_groups": dict(L1aMultiTaskUncertaintyWeights.TASK_TYPES),
-            "final_log_vars": {
-                n: float(uw_for_meta.log_vars[n].detach().item()) for n in L1aMultiTaskUncertaintyWeights.TASK_ORDER
-            },
-            "final_eff_weights": {
-                n: float(torch.exp(-uw_for_meta.log_vars[n]).detach().item())
-                for n in L1aMultiTaskUncertaintyWeights.TASK_ORDER
-            },
-            "init_from_loss_weights": bool(
-                not os.environ.get("L1A_UW_INIT_FROM_WEIGHTS", "1").strip().lower() in {"0", "false", "no"}
-            ),
+            "task_order": list(_to),
+            "task_types": {n: L1aMultiTaskUncertaintyWeights.TASK_TYPES[n] for n in _to},
+            "final_log_vars": {n: float(uw_for_meta.log_vars[n].detach().item()) for n in _to},
+            "final_precision": {n: float(torch.exp(-uw_for_meta.log_vars[n]).detach().item()) for n in _to},
         }
     else:
         uw_meta = {"enabled": False}
@@ -2649,7 +3025,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "schema_version": L1A_SCHEMA_VERSION,
         "l1a_ctx_stagger": l1_ctx_stagger_enabled(),
         "feature_cols": feature_cols,
-        "seq_len": SEQ_LEN,
+        "seq_len": _l1a_seq_len(),
         "readout_type": model.readout_type,
         "min_attention_seq_len": model.min_attention_seq_len,
         "mean": mean,
@@ -2660,15 +3036,27 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "output_cache_file": L1A_OUTPUT_CACHE_FILE,
         "transition_target_semantics": "probability of any regime change within decision_horizon_bars",
         "feature_contract_semantics": "L1a exports regime probabilities, volatility, time-in-regime, persistence, embeddings, and warm flag only; directional derived columns are intentionally excluded.",
-        "state_structure_semantics": "state_structure_decoder refines regime logits from shared state, transition risk, vol trend, and time-in-regime context; l1a_state_persistence estimates stay probability",
+        "state_structure_semantics": (
+            "state_structure_decoder refines regime logits from shared state, transition risk, vol trend, and "
+            "time-in-regime context (neural head outputs when trained, else prep-derived targets at train/infer); "
+            "l1a_state_persistence estimates stay probability"
+        ),
         "l1a_vol_trend_target": f"per-symbol range_norm[t]-range_norm[t-{os.environ.get('L1A_VOL_TREND_LAG', '5')}], clipped",
         "l1a_time_in_regime_target": (
-            f"min(run_length,cap)/cap from state_label runs; cap={os.environ.get('L1A_TIME_IN_REGIME_CAP', '120')}  "
+            f"min(run_length,cap)/cap from vol_regime_label runs; cap={os.environ.get('L1A_TIME_IN_REGIME_CAP', '120')}  "
             f"transform={_l1a_time_in_regime_transform()}"
+        ),
+        "l1a_regime_definition": "vol5",
+        "l1a_straddle_edge_head": bool(l1a_straddle_edge_head_enabled()),
+        "l1a_vol_trend_head": bool(l1a_vol_trend_head_enabled()),
+        "l1a_time_in_regime_head": bool(l1a_time_in_regime_head_enabled()),
+        "l1a_regime_aux_loss": (
+            "coarse_vol_5to2: CE on logsumexp groups of base_regime_logits — low-vol=classes 0-1, high-vol=2-4; "
+            "Kendall UW task regime_aux uses (L1A_REGIME_AUX_COEF × aux CE) as its scalar loss"
         ),
         "embed_dim": int(embed_dim),
         "l1a_state_arch": "tcn_plus_state_structure_decoder",
-        "loss_weights": loss_weights,
+        "l1a_multi_task_loss": "kendall_uncertainty_per_task",
         "tcn_channels": list(ch),
         "l1a_tcn_kernel_size": int(tcn_ks),
         "l1a_tcn_receptive_field_steps": int(rf_steps),
@@ -2692,6 +3080,7 @@ def train_l1a_market_encoder(df: pd.DataFrame, feat_cols: list[str]) -> L1ATrain
         "l1a_patience": int(patience),
         "l1a_early_stop_min_delta": float(min_delta),
         "l1a_regime_label_smoothing": float(os.environ.get("L1A_REGIME_LABEL_SMOOTHING", "0.1")),
+        "l1a_regime_class_weights": "none",
         "l1a_clip_mode": str(clip_meta.get("clip_mode", "mad_z")),
         "l1a_clip_alpha": float(clip_meta.get("clip_alpha", 0.01)),
         "l1a_clip_stats": {
@@ -2805,7 +3194,7 @@ def load_l1a_market_encoder() -> tuple[L1AMarketTCN, dict[str, Any]]:
     feature_cols = list(meta["feature_cols"])
     ch = meta.get("tcn_channels")
     if ch is None:
-        ch = [64, 64, 128]
+        ch = [64, 64, 64, 128, 128]
     else:
         ch = [int(x) for x in ch]
     td = float(meta.get("tcn_dropout", 0.15))
@@ -2816,7 +3205,7 @@ def load_l1a_market_encoder() -> tuple[L1AMarketTCN, dict[str, Any]]:
     model = L1AMarketTCN(
         len(feature_cols),
         channels=ch,
-        seq_len=int(meta.get("seq_len", SEQ_LEN)),
+        seq_len=int(meta.get("seq_len", _l1a_seq_len())),
         readout_type=str(meta.get("readout_type", _l1a_readout_type())),
         min_attention_seq_len=int(meta.get("min_attention_seq_len", _l1a_min_attention_seq_len())),
         tcn_kernel_size=tcn_ks_load,
@@ -2824,6 +3213,9 @@ def load_l1a_market_encoder() -> tuple[L1AMarketTCN, dict[str, Any]]:
         readout_dropout=rd,
         head_dropout=hd_drop,
         embed_dim=embed_dim,
+        use_straddle_edge_head=bool(meta.get("l1a_straddle_edge_head", False)),
+        use_vol_trend_head=bool(meta.get("l1a_vol_trend_head", True)),
+        use_time_in_regime_head=bool(meta.get("l1a_time_in_regime_head", True)),
     ).to(DEVICE)
     state = torch.load(os.path.join(MODEL_DIR, meta.get("model_file", L1A_MODEL_FILE)), map_location=DEVICE)
     try:
@@ -2846,7 +3238,7 @@ def infer_l1a_market_encoder(model: L1AMarketTCN, meta: dict[str, Any], df: pd.D
             work[col] = 0.0
     mean = np.asarray(meta["mean"], dtype=np.float32)
     std = np.asarray(meta["std"], dtype=np.float32)
-    seq_len = int(meta.get("seq_len", SEQ_LEN))
+    seq_len = int(meta.get("seq_len", _l1a_seq_len()))
     cold_raw = meta.get("lbl_atr_median_train")
     cold_vol = float(cold_raw) if cold_raw is not None and np.isfinite(float(cold_raw)) else None
     vraw = meta.get("l1a_vol_forecast_clip_hi")

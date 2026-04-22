@@ -2,7 +2,7 @@
 """Estimate share of L1c-style forward windows that cross a session gap (US RTH).
 
 Example:
-  python scripts/diagnose_l1c_crossday.py --symbols QQQ SPY --horizon 10
+  PYTHONPATH=. python archive/diagnose_l1c_crossday.py --symbols QQQ SPY --horizon 10
 """
 from __future__ import annotations
 

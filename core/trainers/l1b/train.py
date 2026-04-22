@@ -46,6 +46,7 @@ from core.trainers.feature_registry import l1_ctx_stagger_enabled, l1b_base_pref
 from core.trainers.lgbm_utils import (
     _tqdm_stream,
     _decision_edge_atr_array,
+    _decision_forward_range_atr_array,
     _lgb_round_tqdm_enabled,
     _lgb_train_callbacks_with_round_tqdm,
     _lgbm_n_jobs,
@@ -54,12 +55,20 @@ from core.trainers.lgbm_utils import (
 )
 from core.trainers.pipeline_train_logs import artifact_path, log_layer_banner, log_numpy_x_stats, log_time_key_split
 from core.trainers.val_metrics_extra import brier_binary
+from core.trainers.l1b.l1a_bridge import (
+    l1b_apply_honest_l1a_fit_mask,
+    l1b_baseline_align_to_l1a_pool_enabled,
+    l1b_l1a_feature_tier,
+    l1b_l1a_inputs_enabled,
+    l1b_should_use_shifted_expand_oof_windows,
+    l1b_use_honest_l1a_fit_pool,
+)
 from core.trainers.stack_v2_common import (
     build_stack_time_splits,
-    compute_cross_asset_context,
     l1_expanding_oof_row_folds,
     l1_oof_folds_from_env,
     l1_oof_mode_from_env,
+    l1b_expand_oof_val_windows,
     l2_val_start_time,
     log_label_baseline,
     save_output_cache,
@@ -86,22 +95,6 @@ L1B_LATENT_HEADS = [
 ]
 L1B_LATENT_EMBED_COLS = [col for col in L1B_LATENT_HEADS if col.startswith("l1b_latent_")]
 L1B_MODEL_HEADS: list[str] = []
-L1B_DIRECT_SEMANTIC_COLS = [
-    "l1b_breakout_quality",
-    "l1b_mean_reversion_setup",
-    "l1b_trend_strength",
-    "l1b_range_reversal_setup",
-    "l1b_failed_breakout_setup",
-    "l1b_setup_alignment",
-    "l1b_follow_through_score",
-    "l1b_liquidity_score",
-]
-L1B_RETAINED_DIRECT_SEMANTIC_COLS = [
-    "l1b_breakout_quality",
-]
-L1B_DIAGNOSTIC_ONLY_DIRECT_COLS = [
-    col for col in L1B_DIRECT_SEMANTIC_COLS if col not in L1B_RETAINED_DIRECT_SEMANTIC_COLS
-]
 L1B_SUPERVISED_REGRESSOR_COLS = ("l1b_edge_pred", "l1b_dq_pred")
 
 # Extra PA/BO columns appended only for L1b supervised heads (not exported to L2). Source col must exist on frame.
@@ -122,19 +115,11 @@ L1B_EXPORT_UNSUPERVISED_COLS = list(L1B_CLUSTER_COLS) + [
     "l1b_novelty_score",
     "l1b_regime_change_score",
 ]
-L1B_DIRECT_CONTEXT_COLS = [
-    "l1b_sector_relative_strength",
-    "l1b_correlation_regime",
-    "l1b_market_breadth",
-]
-# Direct condition semantics are split into retained tradeability exports and diagnostics-only rule heads.
-L1B_RULE_DIRECT_COLS = list(L1B_DIRECT_SEMANTIC_COLS)
-L1B_EXPORT_DETERMINISTIC_COLS: tuple[str, ...] = tuple(L1B_RETAINED_DIRECT_SEMANTIC_COLS)
+# Cache contract: cluster/latent summaries + staged edge/dq LGBM heads only (no rule-based direct columns).
 L1B_OUTPUT_COLS = (
     list(L1B_EXPORT_UNSUPERVISED_COLS)
     + list(L1B_SUPERVISED_REGRESSOR_COLS)
     + ["l1b_edge_candidate_tau"]
-    + list(L1B_EXPORT_DETERMINISTIC_COLS)
 )
 
 # HMM / GARCH / HSMM / EGARCH columns used by L1b (full set). ``compact`` mode keeps one informative column per family.
@@ -373,23 +358,6 @@ def _l1b_attach_atomic_supervised_columns(df: pd.DataFrame, base_feature_cols: l
     return added
 
 
-def _l1b_cross_context_reliable(df: pd.DataFrame) -> bool:
-    n_symbols = int(pd.Series(df["symbol"]).nunique(dropna=True))
-    n_rows = len(df)
-    return n_symbols >= 2 and n_rows >= 200
-
-
-def _col_f32(df: pd.DataFrame, name: str) -> np.ndarray:
-    """Read a numeric column as float32; missing column -> zeros (``df.get(..., 0.0)`` is a scalar and breaks ``fillna``)."""
-    if name not in df.columns:
-        return np.zeros(len(df), dtype=np.float32)
-    return pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-
-
-def _clip01(x: np.ndarray | float) -> np.ndarray:
-    return np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
-
-
 def _robust_clipped_zscore(
     x: np.ndarray,
     *,
@@ -474,6 +442,18 @@ def _env_float_clipped(key: str, default: float, *, lo: float, hi: float) -> flo
     raw = os.environ.get(key, "").strip()
     val = default if not raw else float(raw)
     return float(np.clip(val, lo, hi))
+
+
+def _l1b_supervised_target_mode() -> str:
+    """``forward_range`` (default): predict ``decision_forward_range_atr`` for L2 straddle alignment. ``staged_edge``: legacy |edge| from directional edge label."""
+    raw = (os.environ.get("L1B_SUPERVISED_TARGET_MODE", "forward_range") or "forward_range").strip().lower()
+    if raw in {"legacy", "staged_edge", "edge_abs", "directional_edge"}:
+        return "staged_edge"
+    if raw in {"forward_range", "range", "vol", "straddle", "realized_range"}:
+        return "forward_range"
+    raise ValueError(
+        f"L1B_SUPERVISED_TARGET_MODE={raw!r} invalid; use forward_range | staged_edge"
+    )
 
 
 def _fit_train_quantile_range(values: np.ndarray, fit_mask: np.ndarray, *, q_low: float = 0.05, q_high: float = 0.95) -> tuple[float, float]:
@@ -584,6 +564,77 @@ def _fit_l1b_latent_block(
         "novelty_hi": float(novelty_hi),
     }
     return out, meta
+
+
+def _fit_l1b_isolation_forest_novelty_train(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    train_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Train IsolationForest on tabular features; map ``-score_samples`` to ``[0,1]`` novelty (high = anomalous)."""
+    from sklearn.ensemble import IsolationForest
+
+    train = np.asarray(train_mask, dtype=bool).ravel()
+    n = len(df)
+    cols: list[np.ndarray] = []
+    for c in feature_cols:
+        if c not in df.columns:
+            cols.append(np.zeros(n, dtype=np.float64))
+        else:
+            cols.append(pd.to_numeric(df[c], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+    X = np.column_stack(cols) if cols else np.zeros((n, 1), dtype=np.float64)
+    X_train = X[train]
+    max_fit = min(131072, max(1, int(X_train.shape[0])))
+    if X_train.shape[0] > max_fit:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(X_train.shape[0], size=max_fit, replace=False)
+        X_fit = X_train[idx]
+    else:
+        X_fit = X_train
+    if X_fit.shape[0] < 80:
+        return np.zeros(n, dtype=np.float32), {"iforest_disabled": True, "reason": "insufficient_train_rows"}
+    n_est = 64 if FAST_TRAIN_MODE else 200
+    ms = int(np.clip(min(256, max(16, X_fit.shape[0])), 16, 256))
+    iso = IsolationForest(
+        n_estimators=n_est,
+        max_samples=ms,
+        contamination="auto",
+        random_state=42,
+        n_jobs=max(1, min(4, _lgbm_n_jobs())),
+    )
+    iso.fit(X_fit)
+    scores = iso.score_samples(X).astype(np.float64)
+    anom = -scores
+    lo, hi = _fit_train_quantile_range(anom.astype(np.float32), train_mask, q_low=0.05, q_high=0.95)
+    nov = np.clip((anom - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    meta_if: dict[str, Any] = {
+        "iforest_sklearn": iso,
+        "iforest_feature_cols": list(feature_cols),
+        "iforest_anom_lo": float(lo),
+        "iforest_anom_hi": float(hi),
+        "iforest_disabled": False,
+    }
+    return nov, meta_if
+
+
+def _apply_l1b_isolation_forest_novelty_infer(df: pd.DataFrame, if_meta: dict[str, Any]) -> np.ndarray | None:
+    if if_meta.get("iforest_disabled") or if_meta.get("iforest_sklearn") is None:
+        return None
+    iso = if_meta["iforest_sklearn"]
+    lo = float(if_meta.get("iforest_anom_lo", 0.0))
+    hi = float(if_meta.get("iforest_anom_hi", 1.0))
+    cols = list(if_meta.get("iforest_feature_cols") or [])
+    n = len(df)
+    parts: list[np.ndarray] = []
+    for c in cols:
+        if c not in df.columns:
+            parts.append(np.zeros(n, dtype=np.float64))
+        else:
+            parts.append(pd.to_numeric(df[c], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64))
+    X = np.column_stack(parts) if parts else np.zeros((n, 1), dtype=np.float64)
+    anom = (-iso.score_samples(X).astype(np.float64)).astype(np.float64)
+    return np.clip((anom - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
 
 
 def _apply_l1b_latent_block(
@@ -801,6 +852,25 @@ def _fit_l1b_unsupervised_block(
     latent_dim = min(4, max(2, len(feature_cols)))
     n_clusters = 5
     latent_outputs, latent_meta = _fit_l1b_latent_block(df, feature_cols, train_mask=train_mask)
+    ae_nov = latent_outputs["l1b_novelty_score"].to_numpy(dtype=np.float32, copy=False)
+    novelty_mode = (os.environ.get("L1B_NOVELTY_MODE", "blend") or "blend").strip().lower()
+    iforest_nov: np.ndarray | None = None
+    iforest_meta: dict[str, Any] = {"iforest_disabled": True}
+    if novelty_mode in {"iforest", "blend", "ae_if"}:
+        iforest_nov, iforest_meta = _fit_l1b_isolation_forest_novelty_train(df, feature_cols, train_mask=train_mask)
+    w_ae = _env_float_clipped("L1B_NOVELTY_BLEND_W_AE", 0.5, lo=0.0, hi=1.0)
+    w_if = _env_float_clipped("L1B_NOVELTY_BLEND_W_IF", 0.5, lo=0.0, hi=1.0)
+    if novelty_mode in {"ae", "autoencoder"}:
+        novelty = ae_nov
+    elif novelty_mode in {"iforest", "iso"}:
+        novelty = iforest_nov if iforest_nov is not None else ae_nov
+    else:
+        if iforest_nov is None or iforest_meta.get("iforest_disabled"):
+            novelty = ae_nov
+        else:
+            s = w_ae + w_if
+            novelty = ((w_ae * ae_nov + w_if * iforest_nov) / max(s, 1e-6)).astype(np.float32)
+    latent_outputs["l1b_novelty_score"] = novelty
     latent_cols = [f"l1b_latent_{i}" for i in range(latent_dim)]
     latent_train = latent_outputs.loc[np.asarray(train_mask, dtype=bool), latent_cols].to_numpy(dtype=np.float32, copy=False)
     centroids = _fit_l1b_kmeans(latent_train, n_clusters=n_clusters)
@@ -809,7 +879,6 @@ def _fit_l1b_unsupervised_block(
     cluster_temperature = float(max(np.median(nearest_train), 0.35))
     all_latent = latent_outputs[latent_cols].to_numpy(dtype=np.float32, copy=False)
     cluster_probs, _ = _cluster_probs_from_latent(all_latent, centroids, temperature=cluster_temperature)
-    novelty = latent_outputs["l1b_novelty_score"].to_numpy(dtype=np.float32, copy=False)
     regime_change_raw = _cluster_regime_change_score(df, cluster_probs)
     rc_lo, rc_hi = _fit_train_quantile_range(regime_change_raw, train_mask, q_low=0.05, q_high=0.95)
     regime_change = np.clip((regime_change_raw - rc_lo) / max(rc_hi - rc_lo, 1e-6), 0.0, 1.0).astype(np.float32)
@@ -832,6 +901,10 @@ def _fit_l1b_unsupervised_block(
         "latent_head_meta": latent_meta,
         "regime_change_lo": float(rc_lo),
         "regime_change_hi": float(rc_hi),
+        "novelty_mode": novelty_mode,
+        "novelty_blend_w_ae": float(w_ae),
+        "novelty_blend_w_if": float(w_if),
+        "iforest_meta": iforest_meta,
     }
     return out, meta
 
@@ -844,6 +917,23 @@ def _apply_l1b_unsupervised_block(
 ) -> pd.DataFrame:
     latent_meta = dict(unsup_meta.get("latent_head_meta") or {})
     latent_outputs = _apply_l1b_latent_block(df, latent_meta, on_substage=on_substage)
+    novelty_mode = str(unsup_meta.get("novelty_mode") or "blend").strip().lower()
+    ae_nov = latent_outputs["l1b_novelty_score"].to_numpy(dtype=np.float32, copy=False)
+    ifm = dict(unsup_meta.get("iforest_meta") or {})
+    if_n = _apply_l1b_isolation_forest_novelty_infer(df, ifm)
+    w_ae = float(unsup_meta.get("novelty_blend_w_ae", 0.5))
+    w_if = float(unsup_meta.get("novelty_blend_w_if", 0.5))
+    if novelty_mode in {"ae", "autoencoder"}:
+        pass
+    elif novelty_mode in {"iforest", "iso"}:
+        if if_n is not None:
+            latent_outputs["l1b_novelty_score"] = if_n
+    else:
+        if if_n is not None and not ifm.get("iforest_disabled"):
+            s = w_ae + w_if
+            latent_outputs["l1b_novelty_score"] = (
+                (w_ae * ae_nov + w_if * if_n) / max(s, 1e-6)
+            ).astype(np.float32)
     latent_cols = list(unsup_meta.get("latent_cols") or [])
     centroids = np.asarray(unsup_meta.get("cluster_centroids"), dtype=np.float32)
     cluster_temperature = float(unsup_meta.get("cluster_temperature", 1.0))
@@ -866,108 +956,28 @@ def _apply_l1b_unsupervised_block(
     return out
 
 
-def _build_l1b_direct_semantic_outputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
-    """Heuristic PA/BO condition composites; only a slim tradeability subset is exported."""
-    setup_long = _col_f32(df, "pa_ctx_setup_long")
-    setup_short = _col_f32(df, "pa_ctx_setup_short")
-    trend_long = _col_f32(df, "pa_ctx_setup_trend_long")
-    trend_short = _col_f32(df, "pa_ctx_setup_trend_short")
-    pullback_long = _col_f32(df, "pa_ctx_setup_pullback_long")
-    pullback_short = _col_f32(df, "pa_ctx_setup_pullback_short")
-    range_long = _col_f32(df, "pa_ctx_setup_range_long")
-    range_short = _col_f32(df, "pa_ctx_setup_range_short")
-    failed_breakout_long = _col_f32(df, "pa_ctx_setup_failed_breakout_long")
-    failed_breakout_short = _col_f32(df, "pa_ctx_setup_failed_breakout_short")
-    follow_long = _col_f32(df, "pa_ctx_follow_through_long")
-    follow_short = _col_f32(df, "pa_ctx_follow_through_short")
-    structure_veto = _col_f32(df, "pa_ctx_structure_veto")
-    premise_break_long = _col_f32(df, "pa_ctx_premise_break_long")
-    premise_break_short = _col_f32(df, "pa_ctx_premise_break_short")
-    vol_rvol = _col_f32(df, "pa_vol_rvol")
-    wick_imbalance = _col_f32(df, "bo_wick_imbalance")
-
-    breakout_quality = _clip01(
-        0.22 * np.clip(_col_f32(df, "bo_body_atr"), 0.0, 2.0) / 2.0
-        + 0.18 * np.clip(_col_f32(df, "bo_range_atr"), 0.0, 2.5) / 2.5
-        + 0.18 * np.clip(_col_f32(df, "bo_vol_spike"), 0.0, 2.0) / 2.0
-        + 0.14 * np.clip(_col_f32(df, "bo_close_extremity"), 0.0, 1.0)
-        + 0.12 * np.maximum(follow_long, follow_short)
-        + 0.10 * np.maximum(setup_long, setup_short)
-        - 0.10 * structure_veto
-        - 0.08 * np.maximum(premise_break_long, premise_break_short)
-    )
-    mean_reversion_setup = _clip01(np.maximum(range_long, range_short))
-    trend_strength = _clip01(np.maximum(trend_long, trend_short))
-    absorb_mx = np.maximum(_col_f32(df, "pa_vol_absorption_bull"), _col_f32(df, "pa_vol_absorption_bear"))
-    close_ext = _clip01(_col_f32(df, "bo_close_extremity"))
-    wick_abs = _clip01(np.abs(wick_imbalance))
-    failed_mx = np.maximum(failed_breakout_long, failed_breakout_short)
-    range_pressure = _clip01(_col_f32(df, "pa_ctx_range_pressure"))
-    reversal_micro = _clip01(
-        0.28 * absorb_mx
-        + 0.22 * close_ext
-        + 0.20 * failed_mx
-        + 0.18 * wick_abs
-        + 0.12 * range_pressure
-    )
-    range_reversal_setup = _clip01(
-        np.maximum(range_long, range_short) * (0.15 + 0.45 * failed_mx + 0.40 * reversal_micro)
-    )
-    failed_breakout_setup = _clip01(np.maximum(failed_breakout_long, failed_breakout_short))
-
-    long_continuation = np.maximum(trend_long, pullback_long) * follow_long * (1.0 - premise_break_long)
-    short_continuation = np.maximum(trend_short, pullback_short) * follow_short * (1.0 - premise_break_short)
-    long_reversal = np.maximum(range_long, failed_breakout_long) * (1.0 - 0.5 * structure_veto) * (1.0 - premise_break_long)
-    short_reversal = np.maximum(range_short, failed_breakout_short) * (1.0 - 0.5 * structure_veto) * (1.0 - premise_break_short)
-    setup_alignment = _clip01(np.maximum.reduce([long_continuation, short_continuation, long_reversal, short_reversal]))
-    follow_through_score = _clip01(np.maximum(follow_long, follow_short))
-    liquidity_score = _clip01(0.5 + 0.15 * vol_rvol - 0.10 * wick_imbalance)
-    return {
-        "l1b_breakout_quality": breakout_quality.astype(np.float32, copy=False),
-        "l1b_mean_reversion_setup": mean_reversion_setup.astype(np.float32, copy=False),
-        "l1b_trend_strength": trend_strength.astype(np.float32, copy=False),
-        "l1b_range_reversal_setup": range_reversal_setup.astype(np.float32, copy=False),
-        "l1b_failed_breakout_setup": failed_breakout_setup.astype(np.float32, copy=False),
-        "l1b_setup_alignment": setup_alignment.astype(np.float32, copy=False),
-        "l1b_follow_through_score": follow_through_score.astype(np.float32, copy=False),
-        "l1b_liquidity_score": liquidity_score.astype(np.float32, copy=False),
-    }
-
-
-def _compute_l1b_deterministic_outputs(
-    direct_outputs: dict[str, np.ndarray],
-    cross: pd.DataFrame,
-    *,
-    cross_context_reliable: bool,
-) -> pd.DataFrame:
-    """Columns merged into the L1b cache / L2 merge: slim deterministic export only."""
-    del cross_context_reliable
-    n_rows = len(cross.index)
-    out = pd.DataFrame(index=cross.index)
-    for col in L1B_EXPORT_DETERMINISTIC_COLS:
-        values = np.asarray(direct_outputs.get(col, np.zeros(n_rows, dtype=np.float32)), dtype=np.float32).ravel()
-        out[col] = values
-    return out
-
-
-def _l1b_rule_diagnostics_frame(
-    direct_outputs: dict[str, np.ndarray],
-    cross: pd.DataFrame,
-    *,
-    cross_context_reliable: bool,
-) -> pd.DataFrame:
-    """Direct condition heads + cross-asset context for train/val correlation logging."""
-    n_rows = len(cross.index)
-    out = pd.DataFrame(index=cross.index)
-    for col in L1B_RULE_DIRECT_COLS:
-        values = np.asarray(direct_outputs.get(col, np.zeros(n_rows, dtype=np.float32)), dtype=np.float32).ravel()
-        out[col] = values
-    for col in L1B_DIRECT_CONTEXT_COLS:
-        values = pd.to_numeric(cross[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-        if not cross_context_reliable:
-            values = np.zeros(n_rows, dtype=np.float32)
-        out[col] = values
-    return out
+def _l1b_oof_stitch_unsupervised_outputs(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    fold_masks: list[tuple[np.ndarray, np.ndarray]],
+    fit_pool: np.ndarray,
+) -> dict[str, np.ndarray]:
+    cols = list(L1B_UNSUPERVISED_COLS)
+    stitched = {col: np.full(len(df), np.nan, dtype=np.float32) for col in cols}
+    pool = np.asarray(fit_pool, dtype=bool).ravel()
+    for fk, (tr_m, va_m) in enumerate(fold_masks):
+        fit_tr = np.asarray(tr_m, dtype=bool).ravel() & pool
+        fit_va = np.asarray(va_m, dtype=bool).ravel() & pool
+        if int(np.sum(fit_tr)) < 80 or int(np.sum(fit_va)) < 20:
+            raise RuntimeError(
+                f"L1b unsup OOF fold {fk + 1}: insufficient rows "
+                f"(train={int(np.sum(fit_tr))}, val={int(np.sum(fit_va))})."
+            )
+        fold_out, _ = _fit_l1b_unsupervised_block(df, feature_cols, train_mask=fit_tr)
+        for col in cols:
+            arr = fold_out[col].to_numpy(dtype=np.float32, copy=False)
+            stitched[col][fit_va] = arr[fit_va]
+    return stitched
 
 
 def _corr1d(a: np.ndarray, b: np.ndarray) -> float:
@@ -976,73 +986,6 @@ def _corr1d(a: np.ndarray, b: np.ndarray) -> float:
     if np.std(a) < 1e-12 or np.std(b) < 1e-12:
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
-
-
-def _log_l1b_semantic_head_diagnostics(
-    work: pd.DataFrame,
-    outputs: pd.DataFrame,
-    *,
-    train_mask: np.ndarray,
-    val_mask: np.ndarray,
-) -> None:
-    """Train/val distribution and correlation with realized decision-window edge (ATR). Heads are rule-based [0,1] or [-1,1]."""
-    fwd = _decision_edge_atr_array(work).astype(np.float64)
-    label_ok = _l1b_edge_label_valid(work)
-    train = np.asarray(train_mask, dtype=bool).ravel()
-    val = np.asarray(val_mask, dtype=bool).ravel()
-    low_var_thr = float(os.environ.get("L1B_DIRECT_HEAD_LOW_STD_THR", "0.04"))
-    print(
-        "  [L1b] semantic head diagnostics (deterministic PA/BO rules; corr vs raw decision edge, finite labels only)",
-        flush=True,
-    )
-    print(
-        f"  [L1b] retained direct exports: {L1B_RETAINED_DIRECT_SEMANTIC_COLS}",
-        flush=True,
-    )
-    print(
-        f"  [L1b] diagnostics-only direct heads: {L1B_DIAGNOSTIC_ONLY_DIRECT_COLS}",
-        flush=True,
-    )
-
-    def _one_split(head: str, hv: np.ndarray, split: np.ndarray, name: str) -> None:
-        hv = np.asarray(hv, dtype=np.float64).ravel()
-        dist_m = split & np.isfinite(hv)
-        corr_m = split & label_ok & np.isfinite(hv) & np.isfinite(fwd)
-        n_d = int(np.sum(dist_m))
-        n_c = int(np.sum(corr_m))
-        if n_d < 1:
-            print(f"    [{name}] {head}: (no rows)", flush=True)
-            return
-        xs = hv[dist_m]
-        p5, p50, p95 = np.percentile(xs, [5.0, 50.0, 95.0]).tolist()
-        std = float(np.std(xs))
-        spread = float(p95 - p5)
-        cor = _corr1d(hv[corr_m], fwd[corr_m]) if n_c >= 30 else float("nan")
-        cor_s = f"{cor:.4f}" if np.isfinite(cor) else "nan"
-        audit = []
-        if head in L1B_RETAINED_DIRECT_SEMANTIC_COLS:
-            audit.append("export")
-        else:
-            audit.append("diag_only")
-        if std < low_var_thr:
-            audit.append(f"low_var<std{low_var_thr:g}")
-        audit_s = ",".join(audit)
-        print(
-            f"    [{name}] {head}: n_dist={n_d:,}  mean={float(np.mean(xs)):.4f}  std={std:.4f}  "
-            f"p5/p50/p95={p5:.4f}/{p50:.4f}/{p95:.4f}  p5_p95_range={spread:.4f}  "
-            f"corr(edge)_n={n_c:,}  corr={cor_s}  audit={audit_s}",
-            flush=True,
-        )
-
-    for group_name, cols in (("direct condition [0,1]", list(L1B_DIRECT_SEMANTIC_COLS)),):
-        print(f"  [L1b] — {group_name} —", flush=True)
-        for col in cols:
-            if col not in outputs.columns:
-                print(f"    [train] {col}: (missing column)", flush=True)
-                continue
-            hv = outputs[col].to_numpy(dtype=np.float64, copy=False)
-            _one_split(col, hv, train, "train")
-            _one_split(col, hv, val, "val")
 
 
 def _l1b_edge_dq_lgb_params() -> dict[str, Any]:
@@ -1316,6 +1259,8 @@ def _l1b_expanding_stack_edge_dq_preds(
     nr_cand: int,
     nr_qual: int,
     nr_dq: int,
+    *,
+    sample_weight_qual: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Out-of-fold edge candidate prob, edge quality, dq on each fold's val rows (expanding calendar)."""
     n = int(X.shape[0])
@@ -1324,6 +1269,7 @@ def _l1b_expanding_stack_edge_dq_preds(
     y_e = np.asarray(edge_tgt, dtype=np.float64).ravel()
     y_d = np.asarray(dq_tgt, dtype=np.float64).ravel()
     sw = np.asarray(sample_weight, dtype=np.float32).ravel()
+    sw_q = sw if sample_weight_qual is None else np.asarray(sample_weight_qual, dtype=np.float32).ravel()
     cand_acc = np.full(n, np.nan, dtype=np.float64)
     qual_acc = np.full(n, np.nan, dtype=np.float64)
     dq_acc = np.full(n, np.nan, dtype=np.float64)
@@ -1355,7 +1301,7 @@ def _l1b_expanding_stack_edge_dq_preds(
             )
         params_q = _l1b_edge_dq_lgb_params()
         dtq = lgb.Dataset(
-            X[fit_tr_q], label=y_e[fit_tr_q], weight=sw[fit_tr_q], feature_name=feature_cols, free_raw_data=False
+            X[fit_tr_q], label=y_e[fit_tr_q], weight=sw_q[fit_tr_q], feature_name=feature_cols, free_raw_data=False
         )
         b_q = lgb.train(params_q, dtq, num_boost_round=max(1, int(nr_qual)))
         qual_acc[fit_va_q] = b_q.predict(X[fit_va_q], num_iteration=int(nr_qual)).astype(np.float64)
@@ -1649,8 +1595,20 @@ def _fit_l1b_edge_dq_boosters(
     n_oof_folds: int = 1,
     l1_fit_mask: np.ndarray | None = None,
 ) -> tuple[dict[str, lgb.Booster], dict[str, str], dict[str, np.ndarray], dict[str, Any]]:
-    edge_signed = np.clip(_decision_edge_atr_array(work), -5.0, 5.0).astype(np.float64)
-    edge_tgt = np.abs(edge_signed).astype(np.float64)
+    supervised_tgt_mode = _l1b_supervised_target_mode()
+    print(f"  [L1b] supervised target mode: {supervised_tgt_mode}", flush=True)
+    edge_pred_hi = 5.0
+    edge_signed = np.zeros(len(work), dtype=np.float64)
+    if supervised_tgt_mode == "forward_range":
+        raw_fr = _decision_forward_range_atr_array(work)
+        edge_pred_hi = float(os.environ.get("L1B_FORWARD_RANGE_CLIP_HI", "15"))
+        edge_tgt = np.clip(raw_fr, 0.0, edge_pred_hi).astype(np.float64)
+        edge_label_ok = np.isfinite(raw_fr) & np.isfinite(edge_tgt)
+    else:
+        edge_signed = np.clip(_decision_edge_atr_array(work), -5.0, 5.0).astype(np.float64)
+        edge_tgt = np.abs(edge_signed).astype(np.float64)
+        edge_label_ok = _l1b_edge_label_valid(work)
+        edge_pred_hi = 5.0
     tm = np.asarray(train_mask, dtype=bool).ravel()
     fit = tm & np.isfinite(edge_tgt)
     fit_n = int(np.sum(fit))
@@ -1661,7 +1619,8 @@ def _fit_l1b_edge_dq_boosters(
         q = float(np.clip(float(os.environ.get("L1B_EDGE_CANDIDATE_TAU_Q", "0.70")), 0.50, 0.95))
         if np.any(fit):
             edge_candidate_tau = float(np.quantile(edge_tgt[fit], q))
-            edge_candidate_tau = float(np.clip(edge_candidate_tau, 0.01, 1.0))
+            tau_hi = float(edge_pred_hi) if supervised_tgt_mode == "forward_range" else 1.0
+            edge_candidate_tau = float(np.clip(edge_candidate_tau, 0.01, tau_hi))
         tau_meta = {
             "edge_candidate_tau_mode": "quantile",
             "edge_candidate_tau_method": "quantile",
@@ -1682,6 +1641,8 @@ def _fit_l1b_edge_dq_boosters(
         )
     else:
         edge_candidate_tau, tau_meta = _l1b_formula_edge_tau(edge_tgt[fit])
+        if supervised_tgt_mode == "forward_range":
+            edge_candidate_tau = float(np.clip(edge_candidate_tau, 0.05, float(edge_pred_hi)))
         print(
             f"  [L1b] edge candidate tau: mode={tau_meta.get('edge_candidate_tau_mode')}  "
             f"method={tau_meta.get('edge_candidate_tau_method')}  tau={edge_candidate_tau:.4f}  "
@@ -1715,10 +1676,10 @@ def _fit_l1b_edge_dq_boosters(
     if int(np.sum(ok_both)) > 50:
         c_ed = _corr1d(edge_tgt[ok_both], dq_tgt[ok_both])
         print(
-            f"  [L1b] edge vs dq_target train corr (finite rows n={int(np.sum(ok_both)):,})={c_ed:.4f}  dq_mode={mode!r}",
+            f"  [L1b] primary_supervision vs dq_target train corr (finite rows n={int(np.sum(ok_both)):,})={c_ed:.4f}  dq_mode={mode!r}",
             flush=True,
         )
-    if int(np.sum(tm & edge_label_ok & np.isfinite(edge_signed))) > 50:
+    if supervised_tgt_mode == "staged_edge" and int(np.sum(tm & edge_label_ok & np.isfinite(edge_signed))) > 50:
         c_sign = _corr1d(edge_tgt[tm & edge_label_ok], edge_signed[tm & edge_label_ok])
         print(
             f"  [L1b] edge opportunity target corr(|signed_edge|, signed_edge)={c_sign:.4f}  "
@@ -1726,7 +1687,11 @@ def _fit_l1b_edge_dq_boosters(
             flush=True,
         )
     log_label_baseline("l1b_edge_candidate", edge_candidate_tgt[tm & edge_label_ok], task="cls")
-    log_label_baseline("l1b_edge_target", edge_tgt[tm & edge_label_ok], task="reg")
+    log_label_baseline(
+        "l1b_forward_range_target" if supervised_tgt_mode == "forward_range" else "l1b_edge_target",
+        edge_tgt[tm & edge_label_ok],
+        task="reg",
+    )
     log_label_baseline("l1b_dq_target", dq_tgt[tm & dq_label_ok], task="reg")
     models: dict[str, lgb.Booster] = {}
     model_files: dict[str, str] = {}
@@ -1736,11 +1701,18 @@ def _fit_l1b_edge_dq_boosters(
     edge_quality_path = os.path.join(MODEL_DIR, L1B_EDGE_PRED_FILE)
     dq_path = os.path.join(MODEL_DIR, L1B_DQ_PRED_FILE)
     sw_uni = np.ones(len(work), dtype=np.float32)
+    tw = float(os.environ.get("L1B_FORWARD_RANGE_TAIL_WEIGHT", "1.0"))
+    if supervised_tgt_mode == "forward_range" and tw > 0.0:
+        sw_qual = _upper_tail_sample_weight(edge_tgt, fit_mask=tm, start_pct=0.72, alpha=float(tw)).astype(np.float32)
+    else:
+        sw_qual = sw_uni
     if use_oof:
         if l1_oof_mode_from_env() == "expanding":
-            fold_masks = l1_expanding_oof_row_folds(work["time_key"], fit_pool)
+            val_windows = l1b_expand_oof_val_windows() if l1b_should_use_shifted_expand_oof_windows() else None
+            fold_masks = l1_expanding_oof_row_folds(work["time_key"], fit_pool, val_windows=val_windows)
+            note = "  L1B_EXPAND_OOF_VAL_WINDOWS" if val_windows is not None else ""
             print(
-                f"  [L1b] expanding calendar OOF: {len(fold_masks)} folds (L1_OOF_MODE=expanding)",
+                f"  [L1b] expanding calendar OOF: {len(fold_masks)} folds (L1_OOF_MODE=expanding){note}",
                 flush=True,
             )
         else:
@@ -1763,7 +1735,7 @@ def _fit_l1b_edge_dq_boosters(
             fold_masks,
             fit_pool,
             edge_quality_row_ok,
-            sw_uni,
+            sw_qual,
         )
         nr_dq = _l1b_oof_median_rounds_regressor(
             "l1b_dq_pred",
@@ -1799,6 +1771,7 @@ def _fit_l1b_edge_dq_boosters(
             val_mask=val_mask,
             out_path=edge_quality_path,
             label_row_ok=edge_quality_row_ok,
+            sample_weight=sw_qual,
             num_boost_round_fixed=nr_qual,
         )
         models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
@@ -1832,6 +1805,7 @@ def _fit_l1b_edge_dq_boosters(
             val_mask=val_mask,
             out_path=edge_quality_path,
             label_row_ok=edge_quality_row_ok,
+            sample_weight=sw_qual,
         )
         models["l1b_dq_pred"] = _l1b_fit_lgb_regressor(
             "l1b_dq_pred",
@@ -1847,7 +1821,11 @@ def _fit_l1b_edge_dq_boosters(
     model_files["l1b_edge_quality_model"] = L1B_EDGE_PRED_FILE
     model_files["l1b_dq_pred"] = L1B_DQ_PRED_FILE
     edge_candidate_prob = np.clip(models["l1b_edge_candidate_model"].predict(X).astype(np.float64), 0.0, 1.0)
-    edge_quality_pred = np.clip(models["l1b_edge_quality_model"].predict(X).astype(np.float64), edge_candidate_tau, 5.0)
+    edge_quality_pred = np.clip(
+        models["l1b_edge_quality_model"].predict(X).astype(np.float64),
+        edge_candidate_tau,
+        float(edge_pred_hi),
+    )
     dq_pred_arr = np.clip(
         models["l1b_dq_pred"].predict(X).astype(np.float64),
         dq_clip_lo,
@@ -1869,14 +1847,15 @@ def _fit_l1b_edge_dq_boosters(
             nr_cand,
             nr_qual,
             nr_dq,
+            sample_weight_qual=sw_qual,
         )
         m_ce = np.isfinite(sc) & np.isfinite(sq)
         edge_candidate_prob[m_ce] = np.clip(sc[m_ce], 0.0, 1.0)
-        edge_quality_pred[m_ce] = np.clip(sq[m_ce], float(edge_candidate_tau), 5.0)
+        edge_quality_pred[m_ce] = np.clip(sq[m_ce], float(edge_candidate_tau), float(edge_pred_hi))
         m_dq = np.isfinite(sd)
         dq_pred_arr[m_dq] = np.clip(sd[m_dq], dq_clip_lo, dq_clip_hi)
         print("  [L1b] stitched expanding OOF edge/dq preds on cal rows (honest L1b for L2)", flush=True)
-    edge_tradeability = np.clip(edge_candidate_prob * edge_quality_pred, 0.0, 5.0)
+    edge_tradeability = np.clip(edge_candidate_prob * edge_quality_pred, 0.0, float(edge_pred_hi))
     preds = {
         "l1b_edge_pred": edge_tradeability.astype(np.float32),
         "l1b_dq_pred": dq_pred_arr.astype(np.float32),
@@ -1901,14 +1880,42 @@ def _fit_l1b_edge_dq_boosters(
             f"candidate_recall@0.5={candidate_recall:.4f}",
             flush=True,
         )
-    block_meta = {
-        "targets": {
-            "l1b_edge_candidate_model": f"1[clip(abs(edge),0..5) > {edge_candidate_tau:g}] opportunity candidate classifier",
-            "l1b_edge_quality_model": f"clip(abs(edge),0..5) ATR opportunity magnitude on candidate rows edge>{edge_candidate_tau:g}",
-            "l1b_edge_pred": f"P(edge>{edge_candidate_tau:g}) * E[abs(edge)|candidate] staged tradeability score",
+    t_hi = float(edge_pred_hi)
+    if supervised_tgt_mode == "forward_range":
+        targets_meta = {
+            "l1b_edge_candidate_model": (
+                f"1[decision_forward_range_atr > {edge_candidate_tau:g}] high forward-range candidate"
+            ),
+            "l1b_edge_quality_model": (
+                f"regress clipped forward_range_atr in [0,{t_hi:g}] on rows with range > {edge_candidate_tau:g}"
+            ),
+            "l1b_edge_pred": "P(candidate) × quality_pred — straddle-aligned tradeability (no directional return)",
             "l1b_dq_pred": dq_desc,
-        },
-        "edge_target_semantics": "staged tradeability score = opportunity probability times positive-edge magnitude; no directional sign",
+        }
+        edge_tgt_sem = (
+            "decision_forward_range_atr (label_v2), aligned with L2 range/straddle; "
+            "l1b_edge_pred = staged tradeability; dq = path-balance auxiliary"
+        )
+    else:
+        targets_meta = {
+            "l1b_edge_candidate_model": (
+                f"1[clip(abs(edge),0..5) > {edge_candidate_tau:g}] opportunity candidate classifier"
+            ),
+            "l1b_edge_quality_model": (
+                f"clip(abs(edge),0..5) ATR opportunity magnitude on candidate rows edge>{edge_candidate_tau:g}"
+            ),
+            "l1b_edge_pred": (
+                f"P(edge>{edge_candidate_tau:g}) * E[abs(edge)|candidate] staged tradeability score"
+            ),
+            "l1b_dq_pred": dq_desc,
+        }
+        edge_tgt_sem = (
+            "staged tradeability score = opportunity probability times positive-edge magnitude; no directional sign"
+        )
+    block_meta = {
+        "supervised_target_mode": supervised_tgt_mode,
+        "targets": targets_meta,
+        "edge_target_semantics": edge_tgt_sem,
         "edge_model_type": "staged_tradeability",
         "edge_candidate_tau": float(edge_candidate_tau),
         "edge_candidate_tau_mode": str(tau_meta.get("edge_candidate_tau_mode", "hybrid")),
@@ -1925,7 +1932,7 @@ def _fit_l1b_edge_dq_boosters(
         "edge_candidate_tau_statistical_principle": str(
             tau_meta.get("edge_candidate_tau_statistical_principle", "two_sided_significance_with_robust_scale")
         ),
-        "edge_pred_clip": [0.0, 5.0],
+        "edge_pred_clip": [0.0, t_hi],
         "dq_target_mode": mode,
         "dq_pred_clip": [dq_clip_lo, dq_clip_hi],
         "boost_rounds_env": "L1B_EDGE_DQ_BOOST_ROUNDS",
@@ -1996,6 +2003,19 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     X = work[feature_cols].to_numpy(dtype=np.float32, copy=False)
     splits = build_stack_time_splits(work["time_key"])
     l1_fit_mask = np.asarray(splits.train_mask | splits.cal_mask, dtype=bool)
+    if l1b_use_honest_l1a_fit_pool():
+        l1_fit_mask = l1b_apply_honest_l1a_fit_mask(work, l1_fit_mask)
+        if l1b_l1a_inputs_enabled() and l1b_l1a_feature_tier() != "none":
+            print(
+                f"  [L1b] L1a features: honest fit pool t>={TRAIN_END}  rows={int(np.sum(l1_fit_mask)):,}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  [L1b] baseline aligned to L1a pool (L1B_BASELINE_ALIGN_TO_L1A_POOL=1): "
+                f"t>={TRAIN_END}  rows={int(np.sum(l1_fit_mask)):,}",
+                flush=True,
+            )
     n_l1_oof = l1_oof_folds_from_env()
     l2_vs = l2_val_start_time()
     if n_l1_oof >= 2:
@@ -2017,22 +2037,14 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         val_mask = splits.l2_val_mask
         val_tune_mask = val_report_mask = val_mask
     unsup_mask = l1_fit_mask if n_l1_oof >= 2 else splits.train_mask
-    direct_outputs = _build_l1b_direct_semantic_outputs(work)
-    cross_context_reliable = _l1b_cross_context_reliable(work)
-    if cross_context_reliable:
-        cross = compute_cross_asset_context(work)
-        cross.index = work.index
-        cross = cross.rename(
-            columns={
-                "sector_relative_strength": "l1b_sector_relative_strength",
-                "correlation_regime": "l1b_correlation_regime",
-                "market_breadth": "l1b_market_breadth",
-            }
-        )
-    else:
-        cross = pd.DataFrame(index=work.index)
-        for _ctx in L1B_DIRECT_CONTEXT_COLS:
-            cross[_ctx] = np.float32(0.0)
+
+    oof_fold_display = int(n_l1_oof)
+    if (
+        n_l1_oof >= 2
+        and l1_oof_mode_from_env() == "expanding"
+        and l1b_should_use_shifted_expand_oof_windows()
+    ):
+        oof_fold_display = len(l1b_expand_oof_val_windows())
 
     log_layer_banner("[L1b] Tabular market descriptor")
     if n_l1_oof >= 2:
@@ -2043,7 +2055,11 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             val_mask,
             train_label=f"train+cal (t < {CAL_END})",
             val_label=f"train+cal (t < {CAL_END})",
-            extra_note=f"OOF: {n_l1_oof} contiguous time folds; tune/report masks slice the fit pool for diagnostics.",
+            extra_note=(
+                f"OOF: {oof_fold_display} folds (L1_OOF_MODE={l1_oof_mode_from_env()}); "
+                f"L1_OOF_FOLDS env={n_l1_oof} applies to blocked mode; "
+                f"expanding uses len(val_windows). Tune/report masks slice the fit pool."
+            ),
         )
         log_time_key_split(
             "L1b(tune/report)",
@@ -2072,26 +2088,11 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     print(f"  [L1b] artifact dir: {MODEL_DIR}", flush=True)
     print(f"  [L1b] will write meta/cache: {artifact_path(L1B_META_FILE)} | {artifact_path(L1B_OUTPUT_CACHE_FILE)}", flush=True)
     outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
-    outputs = pd.concat(
-        [
-            outputs,
-            _compute_l1b_deterministic_outputs(
-                direct_outputs,
-                cross,
-                cross_context_reliable=cross_context_reliable,
-            ),
-        ],
-        axis=1,
-    )
-    rule_diag = _l1b_rule_diagnostics_frame(
-        direct_outputs, cross, cross_context_reliable=cross_context_reliable
-    )
     print(
-        f"  [L1b] note: {len(L1B_RULE_DIRECT_COLS)} direct condition + {len(L1B_DIRECT_CONTEXT_COLS)} cross-asset ctx columns are logged as diagnostics; "
-        f"cache/L2 export is {len(L1B_OUTPUT_COLS)} cols (clusters + novelty/regime_change + staged edge/dq + retained tradeability heads).",
+        f"  [L1b] note: cache/L2 export is {len(L1B_OUTPUT_COLS)} cols "
+        f"(unsupervised + l1b_edge_pred/l1b_dq_pred/l1b_edge_candidate_tau; no rule-based direct heads).",
         flush=True,
     )
-    _log_l1b_semantic_head_diagnostics(work, rule_diag, train_mask=unsup_mask, val_mask=val_report_mask)
 
     prune_on = os.environ.get("L1B_AUTO_PRUNE", "").strip().lower() in {"1", "true", "yes"}
     prune_refit = os.environ.get("L1B_AUTO_PRUNE_REFIT", "").strip().lower() in {"1", "true", "yes"}
@@ -2102,6 +2103,8 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
     atomic_supervised: list[str] = []
     supervised_feature_cols: list[str] = []
     unsup_meta: dict[str, Any] = {}
+    unsup_oof_stitched = False
+    unsup_oof_rows = 0
     l1b_supervised_models: dict[str, lgb.Booster] = {}
     edge_dq_model_files: dict[str, str] = {}
     edge_dq_preds: dict[str, np.ndarray] = {}
@@ -2125,6 +2128,25 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             )
 
         unsup_outputs, unsup_meta = _fit_l1b_unsupervised_block(work, feature_cols, train_mask=unsup_mask)
+        if n_l1_oof >= 2:
+            if l1_oof_mode_from_env() == "expanding":
+                val_windows = l1b_expand_oof_val_windows() if l1b_should_use_shifted_expand_oof_windows() else None
+                unsup_fold_masks = l1_expanding_oof_row_folds(work["time_key"], l1_fit_mask, val_windows=val_windows)
+            else:
+                unsup_fold_masks = time_blocked_fold_masks(work["time_key"], l1_fit_mask, n_l1_oof, context="L1b unsup OOF")
+            stitched_unsup = _l1b_oof_stitch_unsupervised_outputs(work, feature_cols, unsup_fold_masks, l1_fit_mask)
+            unsup_oof_stitched = True
+            unsup_oof_rows = 0
+            for col, arr in stitched_unsup.items():
+                mask = np.isfinite(arr)
+                if np.any(mask):
+                    unsup_outputs.loc[mask, col] = arr[mask]
+                    unsup_oof_rows = max(unsup_oof_rows, int(np.sum(mask)))
+            print(
+                f"  [L1b] stitched {'expanding' if l1_oof_mode_from_env() == 'expanding' else 'blocked'} "
+                f"OOF unsupervised outputs on cal rows (rows={unsup_oof_rows:,})",
+                flush=True,
+            )
         if prune_pass > 0:
             outputs = _l1b_outputs_drop_for_refit(outputs)
         outputs = pd.concat([outputs, unsup_outputs.reset_index(drop=True)], axis=1)
@@ -2174,21 +2196,12 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
 
     print(f"  [L1b] cluster heads: {L1B_CLUSTER_COLS}", flush=True)
     print(f"  [L1b] latent heads (internal diagnostics): {L1B_LATENT_HEADS}", flush=True)
-    print(f"  [L1b] retained direct condition heads: {L1B_RETAINED_DIRECT_SEMANTIC_COLS}", flush=True)
-    print(f"  [L1b] diagnostics-only direct heads: {L1B_DIAGNOSTIC_ONLY_DIRECT_COLS}", flush=True)
-    print(f"  [L1b] rule diagnostic context heads: {L1B_DIRECT_CONTEXT_COLS}", flush=True)
     print(
         f"  [L1b] latent explained_variance_ratio="
         f"{np.round(np.asarray(unsup_meta['latent_head_meta']['explained_variance_ratio'], dtype=np.float32), 4).tolist()}  "
         f"cluster_temperature={float(unsup_meta['cluster_temperature']):.4f}",
         flush=True,
     )
-    if not cross_context_reliable:
-        print(
-            "  [L1b] cross-asset context unreliable for diagnostics (need ≥2 symbols & 200 rows); "
-            "rule_diag context columns zeroed (not exported to L1b cache).",
-            flush=True,
-        )
     _log_l1b_unsupervised_diagnostics(
         outputs,
         train_mask=unsup_mask,
@@ -2205,8 +2218,20 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
 
     meta = {
         "schema_version": L1B_SCHEMA_VERSION,
+        "l1b_l1a_inputs": l1b_l1a_inputs_enabled(),
+        "l1b_l1a_feature_tier": l1b_l1a_feature_tier(),
+        "l1b_l1a_feature_col_names": [c for c in feature_cols if str(c).startswith("l1a_")],
+        "l1b_baseline_align_to_l1a_pool": bool(l1b_baseline_align_to_l1a_pool_enabled()),
+        "l1b_expand_oof_shifted": bool(l1b_should_use_shifted_expand_oof_windows()),
+        "l1b_expanding_oof_fold_count": (
+            len(l1b_expand_oof_val_windows())
+            if l1b_should_use_shifted_expand_oof_windows() and l1_oof_mode_from_env() == "expanding"
+            else None
+        ),
         "l1_oof_folds": int(n_l1_oof),
         "l1_oof_enabled": bool(n_l1_oof >= 2),
+        "l1b_unsupervised_oof_stitched": bool(unsup_oof_stitched),
+        "l1b_unsupervised_oof_rows": int(unsup_oof_rows),
         "l1b_ortho_mode": (os.environ.get("L1B_ORTHO_MODE", "compact") or "compact").strip().lower(),
         "l1b_handcrafted_enabled": os.environ.get("L1B_HANDCRAFTED", "1").strip().lower()
         not in {"0", "false", "no", "off"},
@@ -2225,10 +2250,6 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "latent_output_cols": list(L1B_LATENT_EMBED_COLS),
         "internal_unsupervised_cols": list(L1B_UNSUPERVISED_COLS),
         "unsupervised_output_cols": list(L1B_EXPORT_UNSUPERVISED_COLS),
-        "direct_output_cols": sorted(L1B_EXPORT_DETERMINISTIC_COLS),
-        "deterministic_output_cols": list(L1B_EXPORT_DETERMINISTIC_COLS),
-        "diagnostic_only_direct_cols": list(L1B_DIAGNOSTIC_ONLY_DIRECT_COLS),
-        "rule_diagnostic_cols": sorted(L1B_RULE_DIRECT_COLS + L1B_DIRECT_CONTEXT_COLS),
         "deprecated_output_cols": [
             "l1b_pullback_setup",
             "l1b_failure_risk",
@@ -2239,6 +2260,12 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "l1b_latent_3",
             "l1b_follow_through_score",
             "l1b_liquidity_score",
+            "l1b_breakout_quality",
+            "l1b_mean_reversion_setup",
+            "l1b_trend_strength",
+            "l1b_range_reversal_setup",
+            "l1b_failed_breakout_setup",
+            "l1b_setup_alignment",
         ],
         "constant_output_values": {},
         "model_files": dict(edge_dq_model_files),
@@ -2248,10 +2275,9 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
             "l1b_dq_pred": list(supervised_feature_cols),
             "l1b_edge_pred": list(supervised_feature_cols),
         },
-        "cross_context_reliable": cross_context_reliable,
         "weak_supervision_semantics": (
-            "Legacy binary pullback/failure/shock scaffolding removed; exported L1b cache is clusters + novelty/regime_change + "
-            "staged l1b_edge_pred/l1b_dq_pred + retained tradeability heads only."
+            "Exported L1b cache: unsupervised (clusters + AE/IF novelty + regime_change) + "
+            "l1b_edge_pred/l1b_dq_pred/l1b_edge_candidate_tau from LGBM boosters; schema 1.24.0+."
         ),
         "unsupervised_semantics": (
             "exported unsupervised contract = soft cluster posteriors + novelty + regime-change; "
@@ -2261,9 +2287,9 @@ def train_l1b_market_descriptor(df: pd.DataFrame, feat_cols: list[str]) -> L1BTr
         "unsupervised_block_meta": unsup_meta,
         "supervised_edge_dq_block_meta": edge_dq_block_meta,
         "supervised_edge_dq_semantics": (
-            "Staged tradeability supervision: l1b_edge_pred = P(edge>tau) × positive-edge magnitude; "
-            "l1b_dq_pred = path-balance (mfe−mae)/(mfe+mae) in ±1 by default (env L1B_DQ_TARGET_MODE=legacy for mfe−mae). "
-            "Supervised inputs = tabular base + l1b_atom_* columns (not passed to L2)."
+            "Default L1B_SUPERVISED_TARGET_MODE=forward_range: l1b_edge_pred = P(high-range)×E[range|candidate] using "
+            "decision_forward_range_atr (L2-aligned). AE+IsolationForest novelty (L1B_NOVELTY_MODE=blend). "
+            "Legacy: set L1B_SUPERVISED_TARGET_MODE=staged_edge. DQ = path-balance unless L1B_DQ_TARGET_MODE=legacy."
         ),
         "output_cache_file": L1B_OUTPUT_CACHE_FILE,
     }
@@ -2372,7 +2398,7 @@ def infer_l1b_market_descriptor(
     edge_clip = dq_meta.get("edge_pred_clip", [0.0, 5.0])
     edge_lo, edge_hi = float(edge_clip[0]), float(edge_clip[1])
     unsup_meta = meta.get("unsupervised_block_meta") or {}
-    infer_steps = 3 if unsup_meta else 2
+    infer_steps = 2 if unsup_meta else 1
     own_pbar = None
     if infer_stage_pbar is None and _lgb_round_tqdm_enabled():
         own_pbar = tqdm(
@@ -2401,23 +2427,6 @@ def infer_l1b_market_descriptor(
 
     try:
         outputs = pd.DataFrame({"symbol": work["symbol"].values, "time_key": pd.to_datetime(work["time_key"])})
-        _sub("L1b · semantic")
-        direct_outputs = _build_l1b_direct_semantic_outputs(work)
-        # Exported L1b rows do not include cross-asset columns; deterministic merge only needs row index alignment.
-        cross_shell = pd.DataFrame(index=work.index)
-        outputs = pd.concat(
-            [
-                outputs,
-                _compute_l1b_deterministic_outputs(
-                    direct_outputs,
-                    cross_shell,
-                    cross_context_reliable=bool(meta.get("cross_context_reliable", True)),
-                ),
-            ],
-            axis=1,
-        )
-        if own_pbar is not None:
-            own_pbar.update(1)
         if unsup_meta:
             _sub("L1b · unsup")
             outputs = pd.concat(

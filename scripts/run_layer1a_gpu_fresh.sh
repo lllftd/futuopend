@@ -1,16 +1,46 @@
 #!/usr/bin/env bash
-# Train L1a from scratch on CUDA (same intent as run_layer1a_gpu_fresh.ps1).
+# Train L1a from scratch (CUDA by default; use TORCH_DEVICE=mps on Apple Silicon).
+# Same intent as run_layer1a_gpu_fresh.ps1.
 # Usage from repo root:
 #   ./scripts/run_layer1a_gpu_fresh.sh
 #   USE_PREPARED=1 ./scripts/run_layer1a_gpu_fresh.sh
 #   REBUILD_PREP=1 ./scripts/run_layer1a_gpu_fresh.sh
+#
+# Fast wall-clock preset (env-only; target under ~2h on MPS — tune to your machine):
+#   L1A_FAST=1 TORCH_DEVICE=mps ./scripts/run_layer1a_gpu_fresh.sh
+#   (Optional) USE_PREPARED=1 to reuse prepared_lgbm_dataset.pkl — skips long PA+prep when unchanged.
+#   Expanding OOF (default L1_OOF_MODE=expanding): fold count is len(L1_EXPAND_OOF_VAL_WINDOWS) or
+#   L1a-only override L1A_EXPAND_OOF_VAL_WINDOWS — NOT L1_OOF_FOLDS (that applies only when
+#   L1_OOF_MODE=blocked). The fast preset sets 2 L1a-only expanding segments + skips cal_full/oof_cal_full
+#   metric passes (L1A_SKIP_CAL_FULL_METRICS), enables OOF warmstart (L1A_OOF_WARMSTART), and raises
+#   L1A_MATERIALIZE_BATCH_SIZE for faster l1a_outputs materialization.
+#
+# Mid-term: shorter context L1A_SEQ_LEN=30 needs an L1b ablation before adopting in the stack.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="$ROOT"
+export FORCE_TQDM="${FORCE_TQDM:-1}"
 export TORCH_DEVICE="${TORCH_DEVICE:-cuda}"
 export L1A_AMP="${L1A_AMP:-1}"
+
+if [[ "${L1A_FAST:-}" == "1" ]]; then
+  : "${L1A_EXPAND_OOF_VAL_WINDOWS:=2022-07-01:2024-01-01,2024-01-01:2024-07-01}"
+  export L1A_EXPAND_OOF_VAL_WINDOWS
+  : "${L1A_SKIP_CAL_FULL_METRICS:=1}"
+  export L1A_SKIP_CAL_FULL_METRICS
+  : "${L1A_OOF_WARMSTART:=1}"
+  export L1A_OOF_WARMSTART
+  : "${L1A_MATERIALIZE_BATCH_SIZE:=2048}"
+  export L1A_MATERIALIZE_BATCH_SIZE
+fi
+
+# Expanding OOF only: fold 2+ warm-starts from previous fold (faster). Example:
+#   L1A_OOF_WARMSTART=1 L1A_WARMSTART_OOF_MAX_EPOCHS=24 L1A_WARMSTART_OOF_LR_SCALE=0.5 ./scripts/run_layer1a_gpu_fresh.sh
+# TCN stack: default is 5 blocks (larger RF). Slimmer: L1A_TCN_CHANNELS=48,48,96  or  legacy 3-block: 64,64,128
+# Fewer L1a OOF folds under expanding mode: set L1A_EXPAND_OOF_VAL_WINDOWS (not L1_OOF_FOLDS); or
+# L1_OOF_MODE=blocked L1_OOF_FOLDS=2 for legacy contiguous blocks inside train+cal.
 
 NCPU="$( (command -v nproc >/dev/null && nproc) || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
 NCPU="${NCPU:-8}"
@@ -53,5 +83,5 @@ done
 [[ -n "$PY" ]] || PY="python3"
 
 echo "Using: $PY"
-echo "TORCH_DEVICE=$TORCH_DEVICE L1A_AMP=$L1A_AMP TORCH_CPU_THREADS=$TORCH_CPU_THREADS L1A_DATALOADER_WORKERS=$L1A_DATALOADER_WORKERS"
+echo "TORCH_DEVICE=$TORCH_DEVICE L1A_AMP=$L1A_AMP L1A_FAST=${L1A_FAST:-0} TORCH_CPU_THREADS=$TORCH_CPU_THREADS L1A_DATALOADER_WORKERS=$L1A_DATALOADER_WORKERS"
 exec "$PY" -u "$ROOT/backtests/train_layer1a_only.py"

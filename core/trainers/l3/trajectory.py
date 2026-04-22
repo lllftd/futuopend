@@ -99,6 +99,42 @@ class L3TrajRollingState:
             seq[:sl] = np.stack(window, axis=0)
         return seq, sl
 
+    def append_step_straddle(
+        self,
+        pnl_pct: float,
+        hold: int,
+        ts: np.datetime64,
+        price_rel_prev: float,
+        price_rel_now: float,
+        underlying_abs_move: float,
+        iv_now: float,
+        vol_surprise: float,
+        regime_div: float,
+        vega: float,
+        theta_abs: float,
+    ) -> None:
+        self.peak_unreal = max(self.peak_unreal, float(pnl_pct))
+        v = l3_traj_step_features_straddle(
+            float(pnl_pct),
+            self.prev_unreal,
+            self.peak_unreal,
+            int(hold),
+            ts,
+            price_rel_prev,
+            price_rel_now,
+            underlying_abs_move,
+            iv_now,
+            vol_surprise,
+            regime_div,
+            float(vega),
+            float(theta_abs),
+            max_seq_ref=self.max_seq_ref,
+            mfe_scale=self.mfe_norm_scale,
+            mae_scale=self.mae_norm_scale,
+        )
+        self.hist.append(v)
+        self.prev_unreal = float(pnl_pct)
+
 
 def l3_traj_step_features(
     unreal: float,
@@ -152,6 +188,63 @@ def l3_traj_step_features(
             float(regime_div),
             float(np.clip(live_mfe / ms, 0.0, 1.0)),
             float(np.clip(live_mae / mas, 0.0, 1.0)),
+        ],
+        dtype=np.float32,
+    )
+
+
+def l3_traj_step_features_straddle(
+    pnl_pct: float,
+    prev_pnl_pct: float,
+    peak_pnl_pct: float,
+    hold: int,
+    ts: np.datetime64,
+    price_rel_prev: float,
+    price_rel_now: float,
+    underlying_abs_move: float,
+    iv_now: float,
+    vol_surprise: float,
+    regime_div: float,
+    vega: float,
+    theta_abs: float,
+    *,
+    max_seq_ref: int = 32,
+    mfe_scale: float = 5.0,
+    mae_scale: float = 5.0,
+) -> np.ndarray:
+    """Alternative sequence encoding for straddle simulator mode.
+
+    Keeps the same 12-dim contract as `l3_traj_step_features`.
+    """
+    pnl = float(pnl_pct)
+    pnl_delta = pnl - float(prev_pnl_pct)
+    pk = float(peak_pnl_pct)
+    pnl_vs_peak = 0.0 if pk <= -1e8 else (pk - pnl) / max(abs(pk), 1e-6)
+    hold_norm = min(int(hold), max_seq_ref) / float(max_seq_ref)
+    t = pd.Timestamp(ts)
+    ang = 2.0 * np.pi * (t.hour * 60 + t.minute) / (24.0 * 60.0)
+    sin_t = float(np.sin(ang))
+    cos_t = float(np.cos(ang))
+    price_rel_prev = float(price_rel_prev)
+    price_rel_now = float(price_rel_now)
+    bar_ret = price_rel_now - price_rel_prev
+    bar_range = float(underlying_abs_move)
+    ms = max(float(mfe_scale), 1e-6)
+    mas = max(float(mae_scale), 1e-6)
+    return np.asarray(
+        [
+            pnl,
+            pnl_delta,
+            float(pnl_vs_peak),
+            hold_norm,
+            sin_t,
+            cos_t,
+            float(bar_ret),
+            float(bar_range),
+            float(vol_surprise),
+            float(regime_div),
+            float(np.clip(abs(vega) / ms, 0.0, 1.0)),
+            float(np.clip(theta_abs / mas, 0.0, 1.0)),
         ],
         dtype=np.float32,
     )

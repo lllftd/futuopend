@@ -108,30 +108,3 @@ def log_layer_banner(layer: str) -> None:
 def artifact_path(*parts: str) -> str:
     return os.path.join(MODEL_DIR, *parts)
 
-
-def log_split_summary(
-    layer_name: str,
-    df: pd.DataFrame,
-    time_col: str,
-    X: np.ndarray,
-    *,
-    feature_groups: dict[str, list[str]] | None = None,
-) -> None:
-    """Generic one-shot summary (DataFrame rows + numpy X). Optional group column counts."""
-    print(f"\n{'=' * 50}", flush=True)
-    print(f"  {layer_name}", flush=True)
-    print(f"{'=' * 50}", flush=True)
-    print(f"  Samples:    {len(df):,}", flush=True)
-    t = pd.to_datetime(df[time_col])
-    print(f"  Time range: [{t.min()}, {t.max()}]", flush=True)
-    X = np.asarray(X)
-    print(f"  Features:   {X.shape[1]}  rows: {X.shape[0]:,}", flush=True)
-    if X.dtype != object:
-        xf = X.astype(np.float64, copy=False)
-        print(f"  NaN total:  {int(np.isnan(xf).sum()):,}", flush=True)
-        print(f"  Inf total:  {int(np.isinf(xf).sum()):,}", flush=True)
-    if feature_groups:
-        for gname, cols in feature_groups.items():
-            print(f"    {gname}: {len(cols)} cols", flush=True)
-    print("", flush=True)
-

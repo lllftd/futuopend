@@ -23,8 +23,26 @@ def pa_feature_cache_timeframe_key() -> str:
         return "mtf_" + "_".join(parts)
     return str(PA_TIMEFRAME).replace("/", "_")
 
-NUM_REGIME_CLASSES = 6
-STATE_NAMES: dict[int, str] = {
+def l1a_straddle_edge_head_enabled() -> bool:
+    """Extra regression head on shared_repr (straddle-centric L1a). Disable via L1A_STRADDLE_EDGE_HEAD=0."""
+    v = (os.environ.get("L1A_STRADDLE_EDGE_HEAD", "1") or "1").strip().lower()
+    return v not in {"0", "false", "no", "off"}
+
+
+def l1a_vol_trend_head_enabled() -> bool:
+    """Train a vol_trend readout head. Default off: ``l1a_vol_trend`` is prep-derived; enable via L1A_VOL_TREND_HEAD=1."""
+    v = (os.environ.get("L1A_VOL_TREND_HEAD", "0") or "0").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+
+def l1a_time_in_regime_head_enabled() -> bool:
+    """Train a time_in_regime readout head. Default off: ``l1a_time_in_regime`` is prep-derived; enable via L1A_TIME_IN_REGIME_HEAD=1."""
+    v = (os.environ.get("L1A_TIME_IN_REGIME_HEAD", "0") or "0").strip().lower()
+    return v in {"1", "true", "yes", "on"}
+
+
+# CSV / pa_hmm / market_state imputation — always 6 directional regimes (independent of L1a head).
+MARKET_STATE_NAMES: dict[int, str] = {
     0: "bull_conv",
     1: "bull_div",
     2: "bear_conv",
@@ -32,16 +50,23 @@ STATE_NAMES: dict[int, str] = {
     4: "range_conv",
     5: "range_div",
 }
-REGIME_NOW_PROB_COLS = [
-    "bull_conv",
-    "bull_div",
-    "bear_conv",
-    "bear_div",
-    "range_conv",
-    "range_div",
-]
+HMM_NUM_CLASSES = len(MARKET_STATE_NAMES)
+
+VOL_REGIME_NAMES: tuple[str, ...] = (
+    "vol_compress",
+    "vol_breakout",
+    "vol_trending",
+    "vol_exhaust",
+    "vol_mean_revert",
+)
+
+# L1a / stack regime probabilities: always 5-class vol lifecycle (HMM state_label stays 6-class for PA).
+NUM_REGIME_CLASSES = len(VOL_REGIME_NAMES)
+REGIME_NOW_PROB_COLS = list(VOL_REGIME_NAMES)
+RANGE_REGIME_INDICES = [0, 4]  # low-vol-ish: compress + mean-revert
+
 REGIME_PROB_COLS = REGIME_NOW_PROB_COLS
-RANGE_REGIME_INDICES = [4, 5]
+STATE_NAMES: dict[int, str] = {i: REGIME_NOW_PROB_COLS[i] for i in range(NUM_REGIME_CLASSES)}
 
 # Sequence-derived feature contracts reused by data prep.
 TCN_REGIME_FUT_PROB_COLS = ["tcn_barrier_hit_up", "tcn_barrier_hit_dn", "tcn_barrier_chop"]
@@ -64,8 +89,21 @@ CAL_END = "2024-07-01"
 TEST_END = "2025-01-01"
 
 # Expanding-window OOF validation segments [start, end) for L1; train for fold k is all rows with t < start_k.
+# Fold count in expanding mode is len(...) below; L1_OOF_FOLDS is used only when L1_OOF_MODE=blocked.
+# L1a-only: L1A_EXPAND_OOF_VAL_WINDOWS can shorten L1a OOF without changing L1b/L2 windows (see stack_v2_common).
 L1_EXPAND_OOF_VAL_WINDOWS: tuple[tuple[str, str], ...] = (
     ("2021-01-01", "2022-01-01"),
+    ("2022-01-01", "2023-01-01"),
+    ("2023-01-01", "2024-01-01"),
+    ("2024-01-01", "2024-07-01"),
+)
+# L1a-only override (faster fewer folds): env ``L1A_EXPAND_OOF_VAL_WINDOWS`` comma-separated start:end pairs,
+# e.g. two folds: 2022-07-01:2024-01-01,2024-01-01:2024-07-01 — see ``stack_v2_common.l1a_expand_oof_val_windows_from_env``.
+# L1b supervised OOF when L1a columns are in the L1b matrix: fit pool starts at TRAIN_END, so the first
+# L1_EXPAND_OOF_VAL_WINDOWS fold would have empty train. Use these shifted windows (3 folds) instead.
+# Baseline ablation vs full tier (same rows/folds): L1B_BASELINE_ALIGN_TO_L1A_POOL=1 with L1B_USE_L1A_FEATURES=0.
+# Env ablation: L1B_USE_L1A_FEATURES=1, L1B_L1A_FEATURE_TIER=scalar|full; see core/trainers/l1b/l1a_bridge.py.
+L1B_EXPAND_OOF_VAL_WINDOWS: tuple[tuple[str, str], ...] = (
     ("2022-01-01", "2023-01-01"),
     ("2023-01-01", "2024-01-01"),
     ("2024-01-01", "2024-07-01"),
@@ -90,14 +128,33 @@ PA_CTX_FEATURES = [
     "pa_ctx_setup_range_short",
     "pa_ctx_setup_failed_breakout_long",
     "pa_ctx_setup_failed_breakout_short",
-    "pa_ctx_setup_long",
-    "pa_ctx_setup_short",
-    "pa_ctx_follow_through_long",
-    "pa_ctx_follow_through_short",
     "pa_ctx_range_pressure",
     "pa_ctx_structure_veto",
     "pa_ctx_premise_break_long",
     "pa_ctx_premise_break_short",
+]
+
+# Straddle-centric PA (1m); computed in pa_rules._straddle_focused_features.
+PA_STRADDLE_FEATURES = [
+    "pa_iv_rv_spread",
+    "pa_rv_zscore",
+    "pa_rv_acceleration",
+    "pa_bb_width_pctile",
+    "pa_atr_ratio_5_20",
+    "pa_rv_term_slope",
+    "pa_vol_regime_duration",
+    "pa_realized_vs_expected",
+    "pa_volume_zscore",
+    "pa_volume_price_corr",
+]
+
+# Drop from LGBM feature list if still present in older caches (directional / OR location).
+PA_FEATURES_EXCLUDE_FROM_LGBM = [
+    "pa_ctx_setup_long",
+    "pa_ctx_setup_short",
+    "pa_ctx_follow_through_long",
+    "pa_ctx_follow_through_short",
+    "pa_or_position",
 ]
 
 PA_STATE_FEATURES = [
@@ -109,13 +166,13 @@ PA_STATE_FEATURES = [
     "pa_state_always_in_bias",
 ]
 
-REGIMES_6 = tuple(REGIME_NOW_PROB_COLS)
+REGIMES_6 = tuple(MARKET_STATE_NAMES[i] for i in range(HMM_NUM_CLASSES))
 
 # New dual-view stack schema versions
-L1A_SCHEMA_VERSION = "1.21.0"
-L1B_SCHEMA_VERSION = "1.21.0"
-L2_SCHEMA_VERSION = "1.39.0"
-L3_SCHEMA_VERSION = "1.19.0"
+L1A_SCHEMA_VERSION = "1.26.0"
+L1B_SCHEMA_VERSION = "1.24.0"
+L2_SCHEMA_VERSION = "1.46.4"
+L3_SCHEMA_VERSION = "1.21.0"
 
 # New artifact names
 L1A_MODEL_FILE = "l1a_market_tcn.pt"
@@ -138,8 +195,26 @@ L2_TRADE_GATE_CALIBRATOR_FILE = "l2_trade_gate_calibrator.pkl"
 L2_DIRECTION_CALIBRATOR_FILE = "l2_direction_calibrator.pkl"
 L2_MFE_FILE = "l2_mfe.txt"
 L2_MAE_FILE = "l2_mae.txt"
+L2_RANGE_FILE = "l2_range.txt"
+L2_RANGE10_FILE = "l2_range_10.txt"
+L2_RANGE20_FILE = "l2_range_20.txt"
+L2_TTP90_FILE = "l2_ttp90.txt"
 L2_META_FILE = "l2_decision_meta.pkl"
 L2_OUTPUT_CACHE_FILE = "l2_outputs.pkl"
+
+# VIXY 1m straddle features (aligned in L2 by time_key); disable via L2_USE_VIXY=0
+VIXY_DATA_PATH = os.path.join(DATA_DIR, "VIXY.csv")
+_L2_USE_VIXY_RAW = os.environ.get("L2_USE_VIXY", "1").strip().lower()
+L2_USE_VIXY = _L2_USE_VIXY_RAW not in {"0", "false", "no", "off"}
+
+# L2 straddle dynamic cost (optional): set L2_DYNAMIC_STRADDLE_COST=1.
+# Per-bar cost = base × clip(atr / rolling_quantile(atr), min_mult, max_mult), causal per symbol.
+# Env: L2_DYNAMIC_COST_LOOKBACK (default 390), L2_DYNAMIC_COST_REF_QUANTILE (default 0.7),
+# L2_DYNAMIC_COST_MIN_MULT / L2_DYNAMIC_COST_MAX_MULT, L2_DYNAMIC_ABS_MIN / L2_DYNAMIC_ABS_MAX.
+#
+# L2 straddle range-roll threshold (optional, overrides ATR-dynamic when on): L2_STRADDLE_RANGE_ROLL_COST=1
+# cost[i] = percentile_p( decision_forward_range_atr[i-L:i) ) — causal via shift(1).rolling.
+# Env: L2_RANGE_ROLL_LOOKBACK (1950), L2_RANGE_ROLL_PERCENTILE (50), L2_RANGE_ROLL_FLOOR/CAP (2/8).
 
 L3_EXIT_FILE = "l3_exit.txt"
 L3_VALUE_FILE = "l3_value.txt"
