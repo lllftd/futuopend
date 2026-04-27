@@ -35,7 +35,7 @@ def build_vixy_straddle_features(vixy_df: pd.DataFrame) -> pd.DataFrame:
     """
     纯波动/水平/加速特征，不含方向。
     输入: load_vixy_1m 的返回
-    输出: DataFrame，index 与输入一致，含 time_key + 25 列特征
+    输出: DataFrame，index 与输入一致，含 time_key + 一组 VIXY 代理特征
     """
     c = vixy_df["vixy_close"].values.astype(float)
     h = vixy_df["vixy_high"].values.astype(float)
@@ -61,6 +61,11 @@ def build_vixy_straddle_features(vixy_df: pd.DataFrame) -> pd.DataFrame:
     feats["vixy_level_ma1950_ratio"] = s / (ma1950 + 1e-8)
     feats["vixy_zscore_390"] = (s - ma390) / (std390 + 1e-8)
     feats["vixy_term_structure_slope"] = feats["vixy_level_ma60_ratio"] - feats["vixy_level_ma390_ratio"]
+    feats["vixy_ret_30"] = s.pct_change(30)
+    feats["vixy_ret_60"] = s.pct_change(60)
+    z60 = (s - s.rolling(60, min_periods=20).mean()) / (s.rolling(60, min_periods=20).std() + 1e-8)
+    feats["vixy_zscore_60"] = z60
+    feats["vixy_proxy_momentum_30"] = z60.diff(30)
 
     for w in [5, 15, 30, 60]:
         feats[f"vixy_abs_ret_{w}"] = s.pct_change(w).abs()
@@ -109,6 +114,10 @@ VIXY_FEATURE_COLS = [
     "vixy_level_ma1950_ratio",
     "vixy_zscore_390",
     "vixy_term_structure_slope",
+    "vixy_ret_30",
+    "vixy_ret_60",
+    "vixy_zscore_60",
+    "vixy_proxy_momentum_30",
     "vixy_abs_ret_5",
     "vixy_abs_ret_15",
     "vixy_abs_ret_30",

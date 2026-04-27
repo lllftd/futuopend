@@ -18,19 +18,19 @@ matplotlib.use("Agg")
 import pandas as pd
 from tqdm import tqdm
 
-from core.optimize_ce_zlsma_kama_rule import (
-    CE_LENGTHS,
-    CE_MULTIPLIERS,
-    RESULTS_DIR,
+from core.research.optimize_ce_zlsma_kama_rule import (
     RuleParams,
     apply_ce_features,
     build_base_features,
-    load_price_data,
     run_intraday_rule,
 )
-from research.refine_ce_zlsma_kama_rule import _refine_base_params
+from core.utils import load_price_data
+from archive.research.refine_ce_zlsma_kama_rule import _refine_base_params
 
+RESULTS_DIR = Path("results")
 OUTPUT_DIR = RESULTS_DIR / "ce_param_grid"
+CE_LENGTHS = (1, 2)
+CE_MULTIPLIERS = (1.5, 2.0)
 
 # Extend multipliers beyond global optimize (1.5, 2.0) to cover refine defaults (2.5 / 2.75) and nearby values.
 CE_MULTIPLIERS_GRID = tuple(sorted(set(CE_MULTIPLIERS + (2.25, 2.5, 2.75, 3.0))))

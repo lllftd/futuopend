@@ -21,7 +21,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from core.trainers.constants import TEST_END, TRAIN_END
+from core.training.common.constants import TEST_END, TRAIN_END
 
 os.environ.setdefault("OOS_END", str(TEST_END))
 os.environ.setdefault("OOS_START", str(TRAIN_END))

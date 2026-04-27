@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 env/
+env.sh
 
 # Local outputs and runtime artifacts
 results/
@@ -18,3 +19,7 @@ data/.pa_feature_cache/
 
 # IDE/runtime local folders
 .cursor/
+
+# Misnamed / stray cache dirs at repo root (Python uses __pycache__)
+.pycache/
+.pycache_tmp/

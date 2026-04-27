@@ -1,0 +1,20 @@
+volatilitymodel — 与模型/训练/回测/行情数据/产物相关的唯一主目录（可独立 git init）
+
+  目录内容
+  --------
+  data/                 行情与派生数据（约数十 GB 级；唯一天地）
+  core/、backtests/、scripts/、lgbm_models/、results/、logs/、live/、tests/、docs/ 等
+  archive/            历史实验、离线 data_tools/ 与 research/、L3 矩阵与空 reports/ 占位等
+  说明/笔记：docs/SETUP.txt、docs/parule.txt
+  根目录：run_*.py、requirements.txt、env.sh
+
+  futuopend
+  ---------
+  原 repo 仅保留 **.git / .gitignore / .venv**（无上述模型与数据路径的副本，也**无**符号链接）。
+  若仍用该目录作旧历史记录，训练与回测请在 **本目录** 进行；或把 git 远程迁到本仓后弃用 futuopend。
+
+  本目录自洽运行
+  --------------
+  source env.sh
+  cd ~/Desktop/volatilitymodel
+  ./scripts/training/run_train.sh layer1

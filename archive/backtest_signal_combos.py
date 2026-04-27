@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from core.indicators import add_chandelier_exit, kama, zlsma
-from smc import add_smc_signals
+from archive.smc import add_smc_signals
+from core.foundation.indicators import add_chandelier_exit, kama, zlsma
+from core.utils import MINUTES_PER_YEAR, calculate_max_drawdown, load_price_data
 
 
-DATA_DIR = Path("data")
 RESULTS_DIR = Path("results")
-MINUTES_PER_YEAR = 252 * 390
 SMC_RECENT_WINDOW = 10
 TREND_STRATEGIES = (
     "ce_reversal",
@@ -34,14 +39,6 @@ class BacktestResult:
     summary: dict[str, object]
     returns: pd.Series
     trade_returns: list[float]
-
-
-def load_price_data(symbol: str) -> pd.DataFrame:
-    path = DATA_DIR / f"{symbol}.csv"
-    df = pd.read_csv(path)
-    df["time_key"] = pd.to_datetime(df["time_key"])
-    df = df.sort_values("time_key").reset_index(drop=True)
-    return df
 
 
 def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -175,12 +172,6 @@ def build_strategy_signals(df: pd.DataFrame) -> tuple[dict[str, pd.Series], dict
         "ce_trend_smc_any": "CE plus trend filter plus any recent SMC event",
     }
     return strategies, descriptions
-
-
-def calculate_max_drawdown(equity_curve: pd.Series) -> float:
-    running_max = equity_curve.cummax()
-    drawdown = equity_curve / running_max - 1.0
-    return float(drawdown.min()) if not drawdown.empty else 0.0
 
 
 def run_strategy_backtest(df: pd.DataFrame, signal: pd.Series, symbol: str, strategy_name: str, description: str) -> BacktestResult:

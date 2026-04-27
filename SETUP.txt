@@ -1,0 +1,1 @@
+项目结构说明与笔记已放在 docs/ 目录，请打开同名的 docs/SETUP.txt 与 docs/parule.txt。

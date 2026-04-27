@@ -6,7 +6,7 @@ import pickle
 import lightgbm as lgb
 import numpy as np
 
-from core.trainers.constants import L2_META_FILE, MODEL_DIR
+from core.training.common.constants import L2_META_FILE, MODEL_DIR
 
 
 def main() -> None:

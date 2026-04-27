@@ -1,0 +1,20 @@
+[
+  {
+    "test_start": "2025-01-01",
+    "test_end": "2025-05-01",
+    "note": "TRUE_OOS: [2025-01-01, 2025-05-01) vs constants TEST_END=2025-01-01"
+  },
+  {
+    "test_start": "2025-05-01",
+    "test_end": "2025-09-01"
+  },
+  {
+    "test_start": "2025-09-01",
+    "test_end": "2026-01-01"
+  },
+  {
+    "test_start": "2026-01-01",
+    "test_end": "2026-04-17",
+    "note": "Through last bar 2026-04-16 16:00 in QQQ/SPY_labeled_v2; bump when data updates"
+  }
+]

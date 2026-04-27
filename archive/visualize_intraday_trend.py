@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from pathlib import Path
 
 import matplotlib
@@ -9,7 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from backtest_signal_combos import run_intraday_trend_batch_backtests
+from archive.backtest_signal_combos import run_intraday_trend_batch_backtests
 
 
 VISUALS_DIR = Path("results") / "visuals"

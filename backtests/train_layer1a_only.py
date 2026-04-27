@@ -1,8 +1,16 @@
 """Train L1a only (then refresh l1a_outputs.pkl from checkpoint).
 
 Run: PYTHONPATH=. python3 backtests/train_layer1a_only.py
-Or use ./scripts/run_layer1a_gpu_fresh.sh — optional L1A_FAST=1 sets 2 L1a-only OOF segments + skip heavy cal
+Or use ./scripts/training/run_layer1a_gpu_fresh.sh — optional L1A_FAST=1 sets 2 L1a-only OOF segments + skip heavy cal
 metrics + OOF warmstart + larger materialize batches (see script header). TORCH_DEVICE=mps on Apple Silicon.
+
+Resume after a run that finished val (l2_val + cal_full) but died during materialize: a train pass writes
+``lgbm_models/l1a_train_resume.pkl`` right before full-table materialize. Then:
+
+  L1A_MATERIALIZE_ONLY=1 PYTHONPATH=. python3 backtests/train_layer1a_only.py
+
+Same prepared dataset and ``L1_OOF_FOLDS`` / ``L1_OOF_MODE`` as the original run. (OOF_FOLDS>=2 / expanding
+not supported for resume yet.)
 """
 from __future__ import annotations
 
@@ -15,8 +23,8 @@ from backtests.train_pipeline import (
     _prepare_or_load_lgbm_dataset,
     setup_logger,
 )
-from core.trainers.l1a import train_l1a_market_encoder
-from core.trainers.lgbm_utils import configure_training_runtime
+from core.training.l1a import train_l1a_market_encoder
+from core.training.common.lgbm_utils import configure_training_runtime
 
 
 def main() -> None:

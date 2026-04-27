@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+if __package__ is None or __package__ == "":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from backtest_signal_combos import MINUTES_PER_YEAR, calculate_max_drawdown, load_price_data
-from core.indicators import add_chandelier_exit, kama, zlsma
+from archive.backtest_signal_combos import MINUTES_PER_YEAR, calculate_max_drawdown, load_price_data
+from core.foundation.indicators import add_chandelier_exit, kama, zlsma
 
 
 RESULTS_DIR = Path("results")

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from core.trainers.val_metrics_extra import pearson_corr
+from core.training.common.val_metrics_extra import pearson_corr
 
 
 def _safe_spearman(a: np.ndarray, b: np.ndarray) -> float:

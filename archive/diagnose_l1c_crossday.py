@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from core.trainers.constants import DATA_DIR
+from core.training.common.constants import DATA_DIR
 from core.utils.session import mark_session_boundaries
 
 
